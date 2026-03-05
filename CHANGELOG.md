@@ -5,12 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.1] - 2026-03-05
 
 ### Added
 
 - `keito time stop --discard` — abandon a running timer without saving, deletes the time entry
 - Richer JSON error output with `suggestion` and `details` fields for agent-friendly recovery hints
+
+### Fixed
+
+- Commit `Cargo.lock` so `rustsec/audit-check` can run in CI
+- Add retry logic to Homebrew tap job to handle GitHub CDN propagation delays
 
 ## [0.1.0] - 2026-03-05
 

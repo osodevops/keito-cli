@@ -86,9 +86,22 @@ jobs:
           BASE_URL="https://github.com/osodevops/keito-cli/releases/download/${GITHUB_REF_NAME}"
 
           # Download each binary tarball and compute SHA256
-          curl -fsSL "${BASE_URL}/keito-aarch64-apple-darwin.tar.gz" -o arm64.tar.gz
-          curl -fsSL "${BASE_URL}/keito-x86_64-apple-darwin.tar.gz" -o x86_64_mac.tar.gz
-          curl -fsSL "${BASE_URL}/keito-x86_64-unknown-linux-gnu.tar.gz" -o x86_64_linux.tar.gz
+          # Retry up to 5 times with 15s delay to allow CDN propagation
+          download_with_retry() {
+            local url="$1" output="$2"
+            for i in 1 2 3 4 5; do
+              if curl -fsSL "$url" -o "$output"; then
+                return 0
+              fi
+              echo "Attempt $i failed for $output, retrying in 15s..."
+              sleep 15
+            done
+            echo "Failed to download $output after 5 attempts"
+            return 1
+          }
+          download_with_retry "${BASE_URL}/keito-aarch64-apple-darwin.tar.gz" arm64.tar.gz
+          download_with_retry "${BASE_URL}/keito-x86_64-apple-darwin.tar.gz" x86_64_mac.tar.gz
+          download_with_retry "${BASE_URL}/keito-x86_64-unknown-linux-gnu.tar.gz" x86_64_linux.tar.gz
 
           SHA_ARM64=$(sha256sum arm64.tar.gz | awk '{print $1}')
           SHA_X86_64_MAC=$(sha256sum x86_64_mac.tar.gz | awk '{print $1}')
