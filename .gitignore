@@ -1,4 +1,6 @@
 /target
+/man
+/recordings
 *.swp
 *.swo
 .DS_Store

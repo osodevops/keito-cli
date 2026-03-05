@@ -7,6 +7,8 @@ license = "MIT"
 repository = "https://github.com/osodevops/keito-cli"
 keywords = ["keito", "time-tracking", "cli", "ai-agents", "billing"]
 categories = ["command-line-utilities"]
+homepage = "https://keito.ai"
+documentation = "https://keito.ai/docs/cli"
 
 [lib]
 name = "keito_cli"
@@ -16,8 +18,12 @@ path = "src/lib.rs"
 name = "keito"
 path = "src/main.rs"
 
+[[bin]]
+name = "gen-man"
+path = "src/bin/gen-man.rs"
+
 [dependencies]
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "string"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +37,7 @@ thiserror = "2"
 colored = "3"
 dialoguer = "0.11"
 atty = "0.2"
+clap_mangen = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "keito",
-    about = "Track billable time against the Keito platform",
+    about = "Track billable time against the Keito platform — https://keito.ai",
     long_about = "\
 Track billable time against the Keito platform.
 

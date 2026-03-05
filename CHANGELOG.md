@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `keito time stop --discard` — abandon a running timer without saving, deletes the time entry
 - Richer JSON error output with `suggestion` and `details` fields for agent-friendly recovery hints
+- README with install instructions, quick start, agent workflow, and full command reference
+- `gen-man` binary for generating man pages (`cargo run --bin gen-man`)
+- Agent integration guide at `docs/agent-guide.md`
+- VHS demo tape and recording script for terminal demos
+- Homepage URL in `--help` output
 
 ### Fixed
 
