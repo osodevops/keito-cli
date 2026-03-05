@@ -1,0 +1,44 @@
+[package]
+name = "keito-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for AI agents and humans to track billable time against the Keito platform"
+license = "MIT"
+repository = "https://github.com/osodevops/keito-cli"
+keywords = ["keito", "time-tracking", "cli", "ai-agents", "billing"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "keito_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keito"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tabled = "0.17"
+keyring = { version = "3", features = ["apple-native", "linux-native"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+thiserror = "2"
+colored = "3"
+dialoguer = "0.11"
+atty = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+wiremock = "0.6"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
