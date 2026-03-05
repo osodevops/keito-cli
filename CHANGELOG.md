@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.1.1] - 2026-03-05
+## [0.1.2] - 2026-03-05
 
 ### Added
 
@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Commit `Cargo.lock` so `rustsec/audit-check` can run in CI
-- Add retry logic to Homebrew tap job to handle GitHub CDN propagation delays
+- Use `gh release download` for Homebrew tap job (fixes private repo asset downloads)
 
 ## [0.1.0] - 2026-03-05
 
