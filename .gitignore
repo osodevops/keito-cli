@@ -1,6 +1,7 @@
 /target
 /man
-/recordings
+/tapes
+/scripts
 *.swp
 *.swo
 .DS_Store
