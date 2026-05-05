@@ -13,23 +13,26 @@ pub struct ResolvedAuth {
 }
 
 impl ResolvedAuth {
-    /// Resolve credentials from: CLI flag > env var > keyring > config
+    /// Resolve credentials from env vars, OS keyring, and config file.
     pub fn resolve(global: &GlobalFlags) -> Result<Self, AppError> {
         let config = AppConfig::load()?;
 
-        // API key: env > keyring
-        let (api_key, api_key_source) = Self::resolve_api_key()?;
+        // API key: env > keyring > config
+        let (api_key, api_key_source) = Self::resolve_api_key(&config)?;
 
-        // Workspace: CLI flag > env > config
-        let workspace_id: String = if let Some(ref ws) = global.workspace {
-            ws.clone()
-        } else if let Ok(ws) = std::env::var("KEITO_WORKSPACE_ID") {
-            ws
-        } else if let Some(ref ws) = config.workspace_id {
-            ws.clone()
+        // Account/workspace ID: CLI flag > env > config.
+        // Production v2 sends this value as the Keito-Account-Id header.
+        let workspace_id: String = if let Some(ref id) = global.workspace {
+            id.clone()
+        } else if let Some(id) =
+            non_empty_env("KEITO_ACCOUNT_ID").or_else(|| non_empty_env("KEITO_WORKSPACE_ID"))
+        {
+            id
+        } else if let Some(id) = config.resolved_account_id() {
+            id.to_string()
         } else {
             return Err(AppError::Config(
-                "No workspace ID configured. Set via --workspace, KEITO_WORKSPACE_ID env var, or run 'keito auth login'".into(),
+                "No account ID configured. Set via --workspace, KEITO_ACCOUNT_ID, KEITO_WORKSPACE_ID, account_id in config, or run 'keito auth login'. Find it in Keito under Settings > API & Developers > Company ID".into(),
             ));
         };
 
@@ -40,12 +43,10 @@ impl ResolvedAuth {
         })
     }
 
-    fn resolve_api_key() -> Result<(String, String), AppError> {
+    fn resolve_api_key(config: &AppConfig) -> Result<(String, String), AppError> {
         // 1. Environment variable
-        if let Ok(key) = std::env::var("KEITO_API_KEY") {
-            if !key.is_empty() {
-                return Ok((key, "environment variable".into()));
-            }
+        if let Some(key) = non_empty_env("KEITO_API_KEY") {
+            return Ok((key, "environment variable".into()));
         }
 
         // 2. OS keyring
@@ -57,8 +58,13 @@ impl ResolvedAuth {
             }
         }
 
+        // 3. Config file
+        if let Some(key) = config.api_key.as_deref().filter(|key| !key.is_empty()) {
+            return Ok((key.to_string(), "config file".into()));
+        }
+
         Err(AppError::Auth(
-            "No API key found. Set KEITO_API_KEY env var or run 'keito auth login'".into(),
+            "No API key found. Set KEITO_API_KEY, configure api_key in ~/.config/keito/config.toml, or run 'keito auth login'".into(),
         ))
     }
 
@@ -84,4 +90,8 @@ impl ResolvedAuth {
             .map_err(|e| AppError::Config(format!("Failed to delete key from keyring: {e}")))?;
         Ok(())
     }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }

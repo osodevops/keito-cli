@@ -19,7 +19,8 @@ and returns structured exit codes for programmatic error handling.",
     after_long_help = "\
 ENVIRONMENT VARIABLES:
   KEITO_API_KEY          API key (takes precedence over keyring and config)
-  KEITO_WORKSPACE_ID     Workspace ID (takes precedence over config file)
+  KEITO_ACCOUNT_ID       Company/account ID for Keito-Account-Id
+  KEITO_WORKSPACE_ID     Legacy alias for KEITO_ACCOUNT_ID
 
 CONFIG FILE:
   ~/.config/keito/config.toml
@@ -69,14 +70,15 @@ enabled automatically. Use this flag to force JSON output in a terminal."
 
 #[derive(Parser, Clone)]
 pub struct GlobalFlags {
-    /// Override workspace ID
+    /// Override account/company ID
     #[arg(
         long,
         global = true,
-        env = "KEITO_WORKSPACE_ID",
         long_help = "\
-Override the workspace ID for this invocation. Resolution order: \
-this flag > KEITO_WORKSPACE_ID env var > config file value."
+Override the account/company ID for this invocation. The value is sent as \
+Keito-Account-Id. Resolution order: this flag > KEITO_ACCOUNT_ID env var > \
+KEITO_WORKSPACE_ID env var > config account_id > config workspace_id. Find \
+this value in Keito under Settings > API & Developers > Company ID."
     )]
     pub workspace: Option<String>,
 
