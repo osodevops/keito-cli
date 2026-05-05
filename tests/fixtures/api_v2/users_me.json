@@ -1,0 +1,14 @@
+{
+  "id": "usr_1",
+  "first_name": "Test",
+  "last_name": "User",
+  "email": "test@test.com",
+  "timezone": "Europe/London",
+  "is_active": true,
+  "roles": ["member"],
+  "user_type": "human",
+  "company": {
+    "id": "co_test",
+    "name": "Test Co"
+  }
+}

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-05-05
+
+### Added
+
+- Production API v2 compatibility for `app.keito.ai`, including `/api/v2/users/me`, projects, tasks, time entries, and timer stop support.
+- Long-lived API key configuration with account/workspace defaults for agent and human CLI use.
+- Recursive man page generation and tests for all agent-facing commands.
+- Release gates modeled on `kafka-backup`: version guard, explicit release tag dispatch, pre-release tests, release smoke checks, staged assets, and final CI/release summary jobs.
+
+### Fixed
+
+- Homebrew release smoke test now matches the actual `keito --version` output.
+- Production field mapping now uses `account_id`, `spent_date`, nested project/task names, and v2 error envelopes.
+
 ## [0.1.2] - 2026-03-05
 
 ### Added

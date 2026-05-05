@@ -1,3 +1,4 @@
+use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use std::time::Duration;
@@ -141,42 +142,44 @@ impl KeitorClient {
     // ── API Methods ──
 
     pub async fn get_me(&self) -> Result<MeResponse, AppError> {
-        self.request_with_retry::<MeResponse>(reqwest::Method::GET, "/api/v2/me", None::<&()>)
+        self.request_with_retry::<MeResponse>(reqwest::Method::GET, "/api/v2/users/me", None::<&()>)
             .await
     }
 
     pub async fn list_projects(&self) -> Result<Vec<Project>, AppError> {
-        let resp: PaginatedResponse<Project> = self
+        let resp: ProjectsResponse = self
             .request_with_retry(
                 reqwest::Method::GET,
                 "/api/v2/projects?is_active=true&per_page=200",
                 None::<&()>,
             )
             .await?;
-        Ok(resp.data)
+        Ok(resp.projects)
     }
 
     pub async fn list_tasks(&self) -> Result<Vec<Task>, AppError> {
-        let resp: PaginatedResponse<Task> = self
+        let resp: TasksResponse = self
             .request_with_retry(
                 reqwest::Method::GET,
                 "/api/v2/tasks?is_active=true&per_page=200",
                 None::<&()>,
             )
             .await?;
-        Ok(resp.data)
+        Ok(resp.tasks)
     }
 
     pub async fn list_time_entries(&self, params: &str) -> Result<Vec<TimeEntry>, AppError> {
         let path = if params.is_empty() {
             "/api/v2/time_entries?per_page=200".to_string()
+        } else if params.contains("per_page=") {
+            format!("/api/v2/time_entries?{params}")
         } else {
             format!("/api/v2/time_entries?{params}&per_page=200")
         };
-        let resp: PaginatedResponse<TimeEntry> = self
+        let resp: TimeEntriesResponse = self
             .request_with_retry(reqwest::Method::GET, &path, None::<&()>)
             .await?;
-        Ok(resp.data)
+        Ok(resp.time_entries)
     }
 
     pub async fn create_time_entry(
@@ -187,6 +190,7 @@ impl KeitorClient {
             .await
     }
 
+    #[allow(dead_code)]
     pub async fn update_time_entry(
         &self,
         id: &str,
@@ -200,6 +204,88 @@ impl KeitorClient {
         .await
     }
 
+    pub async fn stop_time_entry(
+        &self,
+        id: &str,
+        notes: Option<&str>,
+    ) -> Result<TimeEntry, AppError> {
+        let path = format!("/api/v2/time_entries/{id}/stop");
+        if let Some(notes) = notes {
+            let req = StopTimeEntryRequest {
+                notes: Some(notes.to_string()),
+            };
+            self.request_with_retry(reqwest::Method::PATCH, &path, Some(&req))
+                .await
+        } else {
+            self.request_with_retry::<TimeEntry>(reqwest::Method::PATCH, &path, None::<&()>)
+                .await
+        }
+    }
+
+    pub async fn stop_time_entry_compat(
+        &self,
+        timer: &TimeEntry,
+        notes: Option<&str>,
+    ) -> Result<TimeEntry, AppError> {
+        match self.stop_time_entry(&timer.id, notes).await {
+            Ok(entry) => Ok(entry),
+            Err(err) if is_missing_stop_route(&err) => {
+                self.emulate_stop_time_entry(timer, notes).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn emulate_stop_time_entry(
+        &self,
+        timer: &TimeEntry,
+        notes: Option<&str>,
+    ) -> Result<TimeEntry, AppError> {
+        let project_id = timer.project_id.clone().ok_or_else(|| {
+            AppError::ServerError("Running timer response did not include project_id".into())
+        })?;
+        let task_id = timer.task_id.clone().ok_or_else(|| {
+            AppError::ServerError("Running timer response did not include task_id".into())
+        })?;
+
+        let started_at = timer.timer_started_at.or(timer.created_at).ok_or_else(|| {
+            AppError::ServerError("Running timer response did not include a start time".into())
+        })?;
+        let elapsed_seconds = (Utc::now() - started_at).num_seconds().max(60);
+        let elapsed_hours =
+            ((timer.hours.unwrap_or(0.0) + elapsed_seconds as f64 / 3600.0) * 100.0).round()
+                / 100.0;
+
+        let spent_date = timer
+            .spent_date
+            .unwrap_or_else(|| Utc::now().date_naive())
+            .to_string();
+
+        let stopped = self
+            .create_time_entry(&CreateTimeEntryRequest {
+                project_id,
+                task_id,
+                spent_date,
+                hours: Some(elapsed_hours),
+                notes: notes.map(str::to_string).or_else(|| {
+                    timer
+                        .notes
+                        .as_ref()
+                        .filter(|note| !note.is_empty())
+                        .cloned()
+                }),
+                billable: Some(timer.billable),
+                is_running: false,
+                source: Some("cli".into()),
+                metadata: timer.metadata.clone(),
+            })
+            .await?;
+
+        self.delete_time_entry(&timer.id).await?;
+
+        Ok(stopped)
+    }
+
     pub async fn delete_time_entry(&self, id: &str) -> Result<(), AppError> {
         self.request_with_retry_no_body(
             reqwest::Method::DELETE,
@@ -207,4 +293,13 @@ impl KeitorClient {
         )
         .await
     }
+}
+
+fn is_missing_stop_route(err: &AppError) -> bool {
+    matches!(
+        err,
+        AppError::NotFound(message)
+            if message.contains("This page could not be found")
+                || message.contains("<!DOCTYPE html")
+    )
 }

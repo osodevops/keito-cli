@@ -4,8 +4,7 @@ use clap::{Args, Subcommand};
 #[command(after_long_help = "\
 CREDENTIAL RESOLUTION ORDER:
   1. KEITO_API_KEY environment variable (highest priority)
-  2. OS keyring (stored by `keito auth login`)
-  3. ~/.config/keito/config.toml api_key field
+  2. config.toml api_key field
 
 Agents should prefer setting KEITO_API_KEY in the environment rather \
 than running `keito auth login`, which requires interactive input.")]
@@ -16,20 +15,25 @@ pub struct AuthCommand {
 
 #[derive(Subcommand)]
 pub enum AuthSubcommand {
-    /// Store API key and configure workspace (interactive, one-time setup)
+    /// Store API key and configure account ID (interactive, one-time setup)
     #[command(long_about = "\
-Store API key and configure workspace (interactive, one-time setup).
+Store API key and configure account ID (interactive, one-time setup).
 
-This command prompts for an API key and workspace ID, then stores them \
-securely in the OS keyring. For non-interactive / agent use, set the \
-KEITO_API_KEY and KEITO_WORKSPACE_ID environment variables instead.
+This command prompts for an API key and account/company ID, validates them \
+against the production v2 API, and stores them in the platform config file. \
+For non-interactive / agent use, set the KEITO_API_KEY and KEITO_ACCOUNT_ID \
+environment variables instead.
+
+Find the account/company ID in Keito under Settings > API & Developers > \
+Company ID.
 
 EXAMPLE:
   keito auth login              # interactive prompt
-  export KEITO_API_KEY=kto_xxx  # agent alternative (no login needed)")]
+  export KEITO_API_KEY=kto_xxx  # agent alternative (no login needed)
+  export KEITO_ACCOUNT_ID=co_xxx")]
     Login,
 
-    /// Remove stored credentials from keychain
+    /// Remove stored credentials from config
     Logout,
 
     /// Check authentication status and credential source
@@ -43,8 +47,9 @@ EXAMPLE (JSON):
   $ keito auth status --json
   {
     \"authenticated\": true,
-    \"source\": \"environment\",
-    \"workspace_id\": \"ws_abc123\"
+    \"api_key_source\": \"environment variable\",
+    \"account_id\": \"co_abc123\",
+    \"workspace_id\": \"co_abc123\"
   }
 
 EXIT CODES:
@@ -52,9 +57,9 @@ EXIT CODES:
   1   Not authenticated (no valid credentials found)")]
     Status,
 
-    /// Show current user identity and workspace info
+    /// Show current user identity and account info
     #[command(long_about = "\
-Show current user identity and workspace info.
+Show current user identity and account info.
 
 Calls the Keito API to return the user profile associated with the \
 current credentials.
@@ -62,11 +67,11 @@ current credentials.
 EXAMPLE (JSON):
   $ keito auth whoami --json
   {
-    \"user_id\": \"usr_abc123\",
-    \"name\": \"Jane Doe\",
+    \"id\": \"usr_abc123\",
+    \"first_name\": \"Jane\",
+    \"last_name\": \"Doe\",
     \"email\": \"jane@example.com\",
-    \"workspace_id\": \"ws_abc123\",
-    \"workspace_name\": \"Acme Corp\"
+    \"company\": { \"id\": \"co_abc123\", \"name\": \"Acme Corp\" }
   }")]
     Whoami,
 }

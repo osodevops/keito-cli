@@ -168,14 +168,14 @@ fn try_as_projects(arr: &[serde_json::Value]) -> Option<Vec<Project>> {
 
 fn try_as_tasks(arr: &[serde_json::Value]) -> Option<Vec<Task>> {
     let first = arr.first()?.as_object()?;
-    let is_task = (first.contains_key("is_billable")
+    let is_task = (first.contains_key("billable_by_default")
         && first.contains_key("name")
         && !first.contains_key("project_id")
         && !first.contains_key("is_active"))
         || (first.contains_key("is_active")
-            && first.contains_key("is_billable")
+            && first.contains_key("billable_by_default")
             && !first.contains_key("code")
-            && !first.contains_key("client_name"));
+            && !first.contains_key("client"));
     if is_task {
         serde_json::from_value(serde_json::Value::Array(arr.to_vec())).ok()
     } else {
@@ -188,6 +188,7 @@ fn try_as_time_entries(arr: &[serde_json::Value]) -> Option<Vec<TimeEntry>> {
     if first.contains_key("is_running")
         || first.contains_key("timer_started_at")
         || first.contains_key("hours")
+        || first.contains_key("spent_date")
     {
         serde_json::from_value(serde_json::Value::Array(arr.to_vec())).ok()
     } else {
@@ -197,7 +198,7 @@ fn try_as_time_entries(arr: &[serde_json::Value]) -> Option<Vec<TimeEntry>> {
 
 fn try_as_me(arr: &[serde_json::Value]) -> Option<Vec<MeResponse>> {
     let first = arr.first()?.as_object()?;
-    if first.contains_key("user") && first.contains_key("company") {
+    if first.contains_key("id") && first.contains_key("email") && first.contains_key("company") {
         serde_json::from_value(serde_json::Value::Array(arr.to_vec())).ok()
     } else {
         None
@@ -211,7 +212,7 @@ fn format_project_table(projects: &[Project]) -> String {
             id: p.id.clone(),
             name: p.name.clone(),
             code: p.code.clone().unwrap_or_default(),
-            client: p.client_name.clone().unwrap_or_default(),
+            client: p.client_name().unwrap_or_default().to_string(),
             billable: if p.is_billable { "Yes" } else { "No" }.into(),
             active: if p.is_active { "Yes" } else { "No" }.into(),
         })
@@ -225,7 +226,7 @@ fn format_task_table(tasks: &[Task]) -> String {
         .map(|t| TaskRow {
             id: t.id.clone(),
             name: t.name.clone(),
-            billable: if t.is_billable { "Yes" } else { "No" }.into(),
+            billable: if t.billable_by_default { "Yes" } else { "No" }.into(),
         })
         .collect();
     Table::new(rows).with(Style::rounded()).to_string()
@@ -236,9 +237,9 @@ fn format_time_entry_table(entries: &[TimeEntry]) -> String {
         .iter()
         .map(|e| TimeEntryRow {
             id: e.id.clone(),
-            date: e.date.map(|d| d.to_string()).unwrap_or_default(),
-            project: e.project_name.clone().unwrap_or_default(),
-            task: e.task_name.clone().unwrap_or_default(),
+            date: e.spent_date.map(|d| d.to_string()).unwrap_or_default(),
+            project: e.project_name().unwrap_or_default().to_string(),
+            task: e.task_name().unwrap_or_default().to_string(),
             duration: e.hours.map(format_duration).unwrap_or_else(|| {
                 if e.is_running {
                     "running...".into()
@@ -258,15 +259,15 @@ fn format_me_table(me_list: &[MeResponse]) -> String {
         let rows = vec![
             TableRow {
                 key: "User ID".into(),
-                value: me.user.id.clone(),
+                value: me.id.clone(),
             },
             TableRow {
                 key: "Name".into(),
-                value: me.user.name.clone(),
+                value: me.display_name(),
             },
             TableRow {
                 key: "Email".into(),
-                value: me.user.email.clone(),
+                value: me.email.clone(),
             },
             TableRow {
                 key: "Company".into(),

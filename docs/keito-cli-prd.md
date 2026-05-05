@@ -232,9 +232,9 @@ Every AI agent that performs billable work should track its time like any other 
 | Language | **Rust** | Single binary, fast startup, cross-platform, no runtime deps. Aligns with team expertise. |
 | CLI Framework | **clap** (Rust) | Derive macros for auto-generated help, completions, structured parsing |
 | HTTP Client | **reqwest** | Async, TLS built-in, well-maintained |
-| Config | **TOML** (~/.config/keito/config.toml) | Human-readable, Rust-native serde support |
+| Config | **TOML** (platform config dir) | Human-readable, Rust-native serde support |
 | Output | **tabled** (tables) + **serde_json** (JSON) | Dual output modes |
-| Auth storage | **keyring** crate (OS keychain) | Secure credential storage, fallback to env var |
+| Auth storage | **config file + env vars** | Long-lived API keys must work in agent and CI environments without hidden OS credential state |
 | Distribution | **Homebrew**, **cargo install**, GitHub releases (Linux/macOS/Windows binaries) | Covers all agent runtime environments |
 
 ---
@@ -560,25 +560,26 @@ keito auth login
 
 # Prompts for:
 # 1. Keito API key (from keito.ai/settings/api)
-# 2. Workspace ID (auto-detected if only one)
-# Stores in OS keychain via `keyring` crate
+# 2. Company/account ID
+# Stores api_key and account_id in the platform config file
 
 # For agent/CI environments:
 export KEITO_API_KEY=keit_xxxxxxxxxxxxx
-export KEITO_WORKSPACE_ID=ws_abc123
+export KEITO_ACCOUNT_ID=co_abc123
 
 # Verify:
 keito auth whoami --json
-# {"user_id": "usr_123", "name": "Agent: OpenClaw Ops", "workspace": "Acme Consulting", "role": "member"}
+# {"id": "usr_123", "first_name": "Agent", "company": {"id": "co_abc123", "name": "Acme Consulting"}}
 ```
 
 ### Configuration File
 
-Location: `~/.config/keito/config.toml`
+Location: platform config dir, for example `~/Library/Application Support/keito/config.toml` on macOS or `~/.config/keito/config.toml` on Linux.
 
 ```toml
-[default]
-workspace_id = "ws_abc123"
+api_key = "kto_xxxxxxxxxxxxx"
+account_id = "co_abc123"
+workspace_id = "co_abc123" # legacy alias
 default_output = "table"      # "table" | "json"
 timezone = "Europe/London"
 
@@ -598,11 +599,13 @@ default = "6m"               # Round to nearest 6 minutes (1/10 hour)
 
 ### Auth Precedence
 
-1. `--workspace` flag (highest)
-2. `KEITO_WORKSPACE_ID` env var
-3. Config file `workspace_id`
-4. API key from env: `KEITO_API_KEY`
-5. API key from OS keychain (lowest, human setup)
+1. `--workspace` flag (highest account override)
+2. `KEITO_ACCOUNT_ID` env var
+3. `KEITO_WORKSPACE_ID` env var (legacy alias)
+4. Config file `account_id`
+5. Config file `workspace_id` (legacy alias)
+6. API key from env: `KEITO_API_KEY`
+7. API key from config file `api_key`
 
 ---
 

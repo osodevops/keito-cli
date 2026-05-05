@@ -1,7 +1,10 @@
 [workspace]
-members = ["./"]
+members = ["cargo:."]
 
 [dist]
+cargo-dist-version = "0.30.2"
+allow-dirty = ["ci"]
+ci = "github"
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -9,5 +12,9 @@ targets = [
     "x86_64-pc-windows-msvc",
 ]
 installers = ["shell", "powershell", "homebrew"]
+install-path = "CARGO_HOME"
+hosting = "github"
+install-updater = false
 tap = "osodevops/homebrew-tap"
+formula = "keito"
 publish-jobs = ["homebrew"]

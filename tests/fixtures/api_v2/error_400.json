@@ -1,0 +1,4 @@
+{
+  "error": "bad request",
+  "error_description": "spent_date is required"
+}

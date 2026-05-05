@@ -9,13 +9,14 @@ mod types;
 use clap::Parser;
 use cli::Cli;
 use error::AppError;
+use std::io::IsTerminal;
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
     if let Err(e) = run(cli).await {
-        let json_mode = std::env::args().any(|a| a == "--json") || !atty::is(atty::Stream::Stdout);
+        let json_mode = std::env::args().any(|a| a == "--json") || !std::io::stdout().is_terminal();
         if json_mode {
             eprintln!("{}", e.to_json());
         } else {
@@ -27,7 +28,7 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), AppError> {
-    let output_mode = if cli.json || !atty::is(atty::Stream::Stdout) {
+    let output_mode = if cli.json || !std::io::stdout().is_terminal() {
         output::OutputMode::Json
     } else {
         output::OutputMode::Table

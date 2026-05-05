@@ -1,13 +1,21 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
   RUSTFLAGS: -D warnings
 
 jobs:
@@ -31,11 +39,14 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo check --all-targets
 
   test:
     name: Test
     runs-on: ${{ matrix.os }}
+    needs: [fmt, clippy]
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
@@ -43,6 +54,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+
+  release-smoke:
+    name: Release Smoke
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release
+      - name: Smoke test binary
+        run: |
+          ./target/release/keito --version | grep -E '^keito [0-9]+\.[0-9]+\.[0-9]+'
+          ./target/release/keito --help > /dev/null
+      - name: Verify generated man pages
+        run: |
+          cargo run --bin gen-man -- /tmp/keito-man
+          test -s /tmp/keito-man/keito.1
+          test -s /tmp/keito-man/keito-auth-login.1
+          test -s /tmp/keito-man/keito-time-stop.1
 
   audit:
     name: Security Audit
@@ -52,3 +84,21 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  ci-complete:
+    name: CI Complete
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, release-smoke, audit]
+    if: always()
+    steps:
+      - name: Check required jobs
+        run: |
+          if [ "${{ needs.fmt.result }}" != "success" ] || \
+             [ "${{ needs.clippy.result }}" != "success" ] || \
+             [ "${{ needs.test.result }}" != "success" ] || \
+             [ "${{ needs.release-smoke.result }}" != "success" ] || \
+             [ "${{ needs.audit.result }}" != "success" ]; then
+            echo "One or more required CI jobs failed"
+            exit 1
+          fi
+          echo "All required CI jobs passed"

@@ -44,10 +44,15 @@ fn projects_help_works() {
 
 #[test]
 fn whoami_without_auth_fails() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
     Command::cargo_bin("keito")
         .unwrap()
         .args(["auth", "whoami"])
+        .env("HOME", temp_dir.path())
+        .env("XDG_CONFIG_HOME", temp_dir.path().join("config"))
         .env_remove("KEITO_API_KEY")
+        .env_remove("KEITO_ACCOUNT_ID")
         .env_remove("KEITO_WORKSPACE_ID")
         .assert()
         .failure()
