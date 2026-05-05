@@ -35,13 +35,13 @@ Requires Rust 1.75+.
 keito auth login
 ```
 
-This prompts for your API key (`kto_...`) and workspace ID, then stores them securely in the OS keyring. Config is saved to `~/.config/keito/config.toml`.
+This prompts for your API key (`kto_...`) and account/company ID, validates them against the production v2 API, and stores them in the platform config file. On macOS this is `~/Library/Application Support/keito/config.toml`; on Linux this is typically `~/.config/keito/config.toml`. Find the Company ID in Keito under Settings > API & Developers > Company ID.
 
 For agent / CI use, set environment variables instead:
 
 ```sh
 export KEITO_API_KEY=kto_xxx
-export KEITO_WORKSPACE_ID=ws_abc123
+export KEITO_ACCOUNT_ID=co_abc123
 ```
 
 ## Quick Start
@@ -93,7 +93,7 @@ Exit codes tell you exactly what happened — no need to parse error messages. S
 - **Structured errors** — JSON errors include `suggestion` and `details` fields for agent recovery
 - **Exit codes 0–8** — every failure mode has a unique code for programmatic handling
 - **Name resolution** — use project names, codes, or IDs interchangeably (case-insensitive)
-- **OS keyring** — credentials stored securely via the system keychain
+- **Config-backed auth** — long-lived API keys are stored in a local `config.toml` for agent-friendly execution
 - **Retry logic** — 3× exponential backoff for network and server errors
 - **Cross-platform** — macOS, Linux, Windows
 
@@ -101,10 +101,10 @@ Exit codes tell you exactly what happened — no need to parse error messages. S
 
 | Command | Description |
 |---|---|
-| `keito auth login` | Store API key and configure workspace (interactive) |
-| `keito auth logout` | Remove stored credentials from keychain |
+| `keito auth login` | Store API key and configure account/company ID (interactive) |
+| `keito auth logout` | Remove stored credentials from config |
 | `keito auth status` | Check authentication status and credential source |
-| `keito auth whoami` | Show current user identity and workspace info |
+| `keito auth whoami` | Show current user identity and account info |
 | `keito time start` | Start a timer for a project and task |
 | `keito time stop` | Stop the currently running timer |
 | `keito time log` | Log a completed time entry with duration |
@@ -118,31 +118,40 @@ Run `keito <command> --help` for detailed usage, examples, and exit codes.
 
 ## Configuration
 
-Configuration file: `~/.config/keito/config.toml`
+Configuration file:
+
+- macOS: `~/Library/Application Support/keito/config.toml`
+- Linux: `~/.config/keito/config.toml`
+- Windows: `%APPDATA%\\keito\\config.toml`
 
 ```toml
 api_key = "kto_..."
-workspace_id = "ws_abc123"
+account_id = "co_abc123"
+workspace_id = "co_abc123" # legacy alias, kept for compatibility
 ```
 
 ### Credential Precedence
 
 1. `KEITO_API_KEY` environment variable (highest priority)
-2. OS keyring (stored by `keito auth login`)
-3. `api_key` in config file
+2. `api_key` in config file
 
-### Workspace Precedence
+### Account ID Precedence
+
+Find the Company ID in Keito under Settings > API & Developers > Company ID.
 
 1. `--workspace` CLI flag
-2. `KEITO_WORKSPACE_ID` environment variable
-3. `workspace_id` in config file
+2. `KEITO_ACCOUNT_ID` environment variable
+3. `KEITO_WORKSPACE_ID` environment variable (legacy alias)
+4. `account_id` in config file
+5. `workspace_id` in config file (legacy alias)
 
 ## Environment Variables
 
 | Variable | Description |
 |---|---|
-| `KEITO_API_KEY` | API key — takes precedence over keyring and config |
-| `KEITO_WORKSPACE_ID` | Workspace ID — takes precedence over config file |
+| `KEITO_API_KEY` | API key — takes precedence over config |
+| `KEITO_ACCOUNT_ID` | Company/account ID sent as `Keito-Account-Id` |
+| `KEITO_WORKSPACE_ID` | Legacy alias for `KEITO_ACCOUNT_ID` |
 
 ## Output Formats
 

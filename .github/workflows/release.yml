@@ -4,32 +4,78 @@ permissions:
   contents: write
 
 on:
+  workflow_dispatch:
   push:
     tags:
-      - v[0-9]+.*
+      - v*.*.*
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -D warnings
 
 jobs:
-  create-release:
+  pre-release-gate:
+    name: Pre-release Gate
     runs-on: ubuntu-latest
     steps:
+      - name: Verify release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" != "tag" || ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release workflow must run from a semver tag like v0.1.2; got ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
-      - name: Extract changelog
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Smoke test binary
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md > release_notes.md
+          ./target/release/keito --version | grep -E '^keito [0-9]+\.[0-9]+\.[0-9]+'
+          ./target/release/keito --help > /dev/null
 
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify generated man pages
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file release_notes.md
+          cargo run --bin gen-man -- /tmp/keito-man
+          test -s /tmp/keito-man/keito.1
+          test -s /tmp/keito-man/keito-auth-login.1
+          test -s /tmp/keito-man/keito-time-stop.1
 
-  upload-assets:
-    needs: create-release
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-assets:
+    name: Build ${{ matrix.target }}
+    needs: pre-release-gate
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
@@ -46,46 +92,97 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (unix)
+      - name: Package Unix
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../keito-${{ matrix.target }}.tar.gz keito
+          cd "target/${{ matrix.target }}/release"
+          tar czf "${GITHUB_WORKSPACE}/keito-${{ matrix.target }}.tar.gz" keito
 
-      - name: Package (windows)
+      - name: Package Windows
         if: runner.os == 'Windows'
-        shell: pwsh
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../keito-${{ matrix.target }}.zip keito.exe
+          cd "target/${{ matrix.target }}/release"
+          7z a "${GITHUB_WORKSPACE}/keito-${{ matrix.target }}.zip" keito.exe
 
-      - name: Upload assets
+      - name: Upload packaged asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: keito-${{ matrix.target }}
+          path: keito-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: keito-*
+          path: dist
+          merge-multiple: true
+
+      - name: Extract changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "::error::CHANGELOG.md has no release notes for ${VERSION}."
+            exit 1
+          fi
+
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          gh release upload "$GITHUB_REF_NAME" keito-${{ matrix.target }}.* --clobber
+          set -euo pipefail
+          ls -la dist
+
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file release_notes.md
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file release_notes.md \
+              dist/*
+          fi
 
   homebrew:
-    needs: upload-assets
+    name: Publish Homebrew Formula
+    needs: create-release
     runs-on: ubuntu-latest
     steps:
       - name: Update Homebrew tap
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
 
-          # Download release assets using gh CLI (handles private repo auth)
           gh release download "${GITHUB_REF_NAME}" \
             --repo "${{ github.repository }}" \
             --pattern "keito-aarch64-apple-darwin.tar.gz" \
@@ -99,14 +196,12 @@ jobs:
             --pattern "keito-x86_64-unknown-linux-gnu.tar.gz" \
             --output x86_64_linux.tar.gz
 
-          # Public download URLs for the formula (used after repo goes public)
           BASE_URL="https://github.com/osodevops/keito-cli/releases/download/${GITHUB_REF_NAME}"
 
           SHA_ARM64=$(sha256sum arm64.tar.gz | awk '{print $1}')
           SHA_X86_64_MAC=$(sha256sum x86_64_mac.tar.gz | awk '{print $1}')
           SHA_X86_64_LINUX=$(sha256sum x86_64_linux.tar.gz | awk '{print $1}')
 
-          # Generate the formula
           cat > keito.rb <<FORMULA
           class Keito < Formula
             desc "CLI for AI agents and humans to track billable time against Keito"
@@ -134,32 +229,51 @@ jobs:
             end
 
             test do
-              assert_match "keito-cli #{version}", shell_output("#{bin}/keito --version")
+              assert_match "keito #{version}", shell_output("#{bin}/keito --version")
             end
           end
           FORMULA
 
-          # Remove heredoc indentation
           sed -i 's/^          //' keito.rb
 
-          # Push to homebrew-tap
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/osodevops/homebrew-tap.git" tap
           cp keito.rb tap/Formula/keito.rb
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/keito.rb
-          git commit -m "keito ${VERSION}"
+          git diff --staged --quiet || git commit -m "keito ${VERSION}"
           git push
 
   scoop:
-    needs: upload-assets
+    name: Trigger Scoop Manifest Update
+    needs: create-release
     runs-on: ubuntu-latest
     steps:
+      # Requires osodevops/scoop-bucket to define an update-keito-manifest handler.
       - name: Trigger Scoop bucket update
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
           repository: osodevops/scoop-bucket
           event-type: update-keito-manifest
           client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}", "tag": "${{ github.ref_name }}"}'
+
+  release-complete:
+    name: Release Complete
+    runs-on: ubuntu-latest
+    needs: [pre-release-gate, build-assets, create-release, homebrew, scoop]
+    if: always()
+    steps:
+      - name: Check release jobs
+        shell: bash
+        run: |
+          if [ "${{ needs.pre-release-gate.result }}" != "success" ] || \
+             [ "${{ needs.build-assets.result }}" != "success" ] || \
+             [ "${{ needs.create-release.result }}" != "success" ] || \
+             [ "${{ needs.homebrew.result }}" != "success" ] || \
+             [ "${{ needs.scoop.result }}" != "success" ]; then
+            echo "One or more release jobs failed"
+            exit 1
+          fi
+          echo "Release completed"

@@ -23,16 +23,23 @@ Start a timer for a project and task.
 
 Creates a running time entry. Only one timer may be active at a time; \
 starting a second timer returns exit code 3 (conflict). The --project \
-and --task flags accept a name, code, or numeric ID (case-insensitive).
+and --task flags accept a name, code, or ID (case-insensitive).
+
+API EFFECT:
+  1. GET /api/v2/time_entries?is_running=true
+  2. POST /api/v2/time_entries with spent_date, is_running=true, source=cli
 
 EXAMPLE:
   $ keito time start --project \"Acme Website\" --task dev --json
   {
-    \"id\": \"te_abc123\",
+    \"status\": \"started\",
+    \"entry_id\": \"te_abc123\",
     \"project\": \"Acme Website\",
     \"task\": \"Development\",
-    \"started_at\": \"2025-01-15T09:00:00Z\",
-    \"is_running\": true
+    \"spent_date\": \"2026-03-04\",
+    \"billable\": true,
+    \"source\": \"cli\",
+    \"started_at\": \"2026-03-04T09:00:00Z\"
   }
 
 EXIT CODES:
@@ -71,24 +78,37 @@ global (not per-project). Use `keito projects tasks --json` to list."
     #[command(long_about = "\
 Stop the currently running timer.
 
-Patches the active time entry to set is_running = false. Returns the \
-completed entry with final duration.
+Stops the active running time entry through the production stop endpoint. \
+The API calculates elapsed duration server-side to avoid client clock races. \
+When --notes is supplied, notes replace the existing entry notes. Without \
+--notes, existing notes are preserved. Use --discard to delete the running \
+timer instead of saving it.
+
+API EFFECT:
+  1. GET /api/v2/time_entries?is_running=true
+  2. PATCH /api/v2/time_entries/{id}/stop
+     or DELETE /api/v2/time_entries/{id} when --discard is supplied
 
 EXAMPLE:
   $ keito time stop --json
   {
-    \"id\": \"te_abc123\",
+    \"status\": \"stopped\",
+    \"entry_id\": \"te_abc123\",
     \"project\": \"Acme Website\",
     \"task\": \"Development\",
-    \"duration\": 1.5,
-    \"is_running\": false
+    \"duration_hours\": 1.5,
+    \"duration\": \"1:30\",
+    \"spent_date\": \"2026-03-04\",
+    \"billable\": true,
+    \"source\": \"cli\"
   }
 
 EXIT CODES:
   0   Timer stopped (or discarded)
+  3   Conflict — timer is no longer running
   4   No running timer found")]
     Stop {
-        /// Append to or replace notes on the entry
+        /// Replace notes on the entry
         #[arg(long)]
         notes: Option<String>,
 
@@ -119,12 +139,16 @@ EXAMPLE:
   $ keito time log --project acme --task dev --duration 1:30 \\
       --date 2025-01-15 --notes \"Fixed auth bug\" --json
   {
-    \"id\": \"te_def456\",
+    \"status\": \"logged\",
+    \"entry_id\": \"te_def456\",
     \"project\": \"Acme Website\",
     \"task\": \"Development\",
-    \"duration\": 1.5,
+    \"duration_hours\": 1.5,
+    \"duration\": \"1:30\",
+    \"spent_date\": \"2025-01-15\",
     \"date\": \"2025-01-15\",
-    \"is_running\": false
+    \"billable\": true,
+    \"source\": \"cli\"
   }")]
     Log {
         /// Project name, code, or ID
@@ -163,7 +187,11 @@ Duration of the time entry. Accepts two formats:
 List time entries with optional filters.
 
 Returns time entries ordered by date descending. All filters are optional \
-and can be combined.
+and can be combined. JSON output uses production v2 field names such as \
+spent_date, billable, source, project, and task.
+
+API EFFECT:
+  GET /api/v2/time_entries with page, per_page, and optional filters
 
 EXAMPLES:
   keito time list --from 2025-01-01 --to 2025-01-31 --json
@@ -199,22 +227,30 @@ EXAMPLES:
     #[command(long_about = "\
 Show the currently running timer, if any.
 
-Returns the active time entry or exit code 4 if no timer is running. \
-Agents should call this before `time start` to avoid a conflict.
+Returns the active time entry summary, or {\"running\": false} if no timer is \
+running. Agents should call this before `time start` to avoid a conflict.
+
+API EFFECT:
+  GET /api/v2/time_entries?is_running=true
 
 EXAMPLE:
   $ keito time running --json
-  {
-    \"id\": \"te_abc123\",
-    \"project\": \"Acme Website\",
-    \"task\": \"Development\",
-    \"started_at\": \"2025-01-15T09:00:00Z\",
-    \"is_running\": true,
-    \"elapsed\": \"1:23:45\"
-  }
+  [
+    {
+      \"running\": true,
+      \"entry_id\": \"te_abc123\",
+      \"project\": \"Acme Website\",
+      \"task\": \"Development\",
+      \"spent_date\": \"2026-03-04\",
+      \"billable\": true,
+      \"source\": \"cli\",
+      \"started_at\": \"2026-03-04T09:00:00Z\",
+      \"elapsed_hours\": 1.5,
+      \"elapsed\": \"1:30\"
+    }
+  ]
 
 EXIT CODES:
-  0   Timer is running (entry returned)
-  4   No running timer")]
+  0   Command succeeded; inspect JSON running field")]
     Running,
 }

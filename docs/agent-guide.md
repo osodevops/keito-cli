@@ -8,7 +8,7 @@ Set two environment variables — no interactive login required:
 
 ```sh
 export KEITO_API_KEY=kto_your_api_key_here
-export KEITO_WORKSPACE_ID=ws_your_workspace_id
+export KEITO_ACCOUNT_ID=co_your_company_id
 ```
 
 Verify credentials:
@@ -20,8 +20,9 @@ keito auth status --json
 ```json
 {
   "authenticated": true,
-  "source": "environment",
-  "workspace_id": "ws_abc123"
+  "api_key_source": "environment variable",
+  "account_id": "co_abc123",
+  "workspace_id": "co_abc123"
 }
 ```
 
@@ -196,7 +197,8 @@ When finishing work, run:
 | Variable | Required | Description |
 |---|---|---|
 | `KEITO_API_KEY` | Yes | API key (`kto_...`) |
-| `KEITO_WORKSPACE_ID` | Yes | Workspace ID for multi-workspace accounts |
+| `KEITO_ACCOUNT_ID` | Yes | Company/account ID sent as `Keito-Account-Id` |
+| `KEITO_WORKSPACE_ID` | Legacy | Alias for `KEITO_ACCOUNT_ID` |
 
 ## JSON Output
 

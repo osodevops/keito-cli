@@ -1,7 +1,7 @@
 use chrono::{Local, Utc};
 use colored::Colorize;
 
-use crate::api::models::{CreateTimeEntryRequest, UpdateTimeEntryRequest};
+use crate::api::models::CreateTimeEntryRequest;
 use crate::api::KeitorClient;
 use crate::cli::time::{TimeCommand, TimeSubcommand};
 use crate::cli::GlobalFlags;
@@ -84,11 +84,13 @@ async fn start(
         .create_time_entry(&CreateTimeEntryRequest {
             project_id,
             task_id,
-            date: Some(Local::now().format("%Y-%m-%d").to_string()),
+            spent_date: Local::now().format("%Y-%m-%d").to_string(),
             hours: None,
             notes,
-            is_billable: billable,
+            billable,
             is_running: true,
+            source: Some("cli".into()),
+            metadata: None,
         })
         .await?;
 
@@ -96,8 +98,11 @@ async fn start(
         let out = serde_json::json!({
             "status": "started",
             "entry_id": entry.id,
-            "project": entry.project_name,
-            "task": entry.task_name,
+            "project": entry.project_name(),
+            "task": entry.task_name(),
+            "spent_date": entry.spent_date,
+            "billable": entry.billable,
+            "source": entry.source,
             "started_at": entry.timer_started_at,
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -105,8 +110,8 @@ async fn start(
         println!(
             "{} Timer started for {} / {}",
             "Started!".green().bold(),
-            entry.project_name.as_deref().unwrap_or("?"),
-            entry.task_name.as_deref().unwrap_or("?"),
+            entry.project_name().unwrap_or("?"),
+            entry.task_name().unwrap_or("?"),
         );
     }
 
@@ -137,46 +142,39 @@ async fn stop(
             let out = serde_json::json!({
                 "status": "discarded",
                 "entry_id": timer.id,
-                "project": timer.project_name,
-                "task": timer.task_name,
+                "project": timer.project_name(),
+                "task": timer.task_name(),
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
         } else {
             println!(
                 "{} Timer discarded for {} / {}",
                 "Discarded!".yellow().bold(),
-                timer.project_name.as_deref().unwrap_or("?"),
-                timer.task_name.as_deref().unwrap_or("?"),
+                timer.project_name().unwrap_or("?"),
+                timer.task_name().unwrap_or("?"),
             );
         }
 
         return Ok(());
     }
 
-    let elapsed_hours = timer.timer_started_at.map(|started| {
-        let elapsed = Utc::now() - started;
-        elapsed.num_seconds() as f64 / 3600.0
-    });
-
     let entry = client
-        .update_time_entry(
-            &timer.id,
-            &UpdateTimeEntryRequest {
-                is_running: Some(false),
-                notes,
-                hours: elapsed_hours,
-            },
-        )
+        .stop_time_entry_compat(&timer, notes.as_deref())
         .await?;
 
     if mode == OutputMode::Json {
         let out = serde_json::json!({
             "status": "stopped",
             "entry_id": entry.id,
-            "project": entry.project_name,
-            "task": entry.task_name,
+            "project": entry.project_name(),
+            "task": entry.task_name(),
             "duration_hours": entry.hours,
             "duration": entry.hours.map(format_duration),
+            "spent_date": entry.spent_date,
+            "billable": entry.billable,
+            "source": entry.source,
+            "started_at": timer.timer_started_at,
+            "stopped_at": entry.updated_at,
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
     } else {
@@ -184,8 +182,8 @@ async fn stop(
             "{} Timer stopped — {} for {} / {}",
             "Stopped!".green().bold(),
             entry.hours.map(format_duration).unwrap_or_default(),
-            entry.project_name.as_deref().unwrap_or("?"),
-            entry.task_name.as_deref().unwrap_or("?"),
+            entry.project_name().unwrap_or("?"),
+            entry.task_name().unwrap_or("?"),
         );
     }
 
@@ -231,11 +229,13 @@ async fn log_entry(
         .create_time_entry(&CreateTimeEntryRequest {
             project_id,
             task_id,
-            date: Some(date_str),
+            spent_date: date_str,
             hours: Some(hours),
             notes,
-            is_billable: billable,
+            billable,
             is_running: false,
+            source: Some("cli".into()),
+            metadata: None,
         })
         .await?;
 
@@ -243,11 +243,14 @@ async fn log_entry(
         let out = serde_json::json!({
             "status": "logged",
             "entry_id": entry.id,
-            "project": entry.project_name,
-            "task": entry.task_name,
+            "project": entry.project_name(),
+            "task": entry.task_name(),
             "duration_hours": entry.hours,
             "duration": entry.hours.map(format_duration),
-            "date": entry.date,
+            "spent_date": entry.spent_date,
+            "date": entry.spent_date,
+            "billable": entry.billable,
+            "source": entry.source,
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
     } else {
@@ -255,8 +258,8 @@ async fn log_entry(
             "{} Logged {} for {} / {}",
             "Logged!".green().bold(),
             entry.hours.map(format_duration).unwrap_or_default(),
-            entry.project_name.as_deref().unwrap_or("?"),
-            entry.task_name.as_deref().unwrap_or("?"),
+            entry.project_name().unwrap_or("?"),
+            entry.task_name().unwrap_or("?"),
         );
     }
 
@@ -272,13 +275,13 @@ async fn list(
     project: Option<String>,
     task: Option<String>,
     limit: u32,
-    _page: u32,
+    page: u32,
 ) -> Result<(), AppError> {
     let auth = ResolvedAuth::resolve(global)?;
     let config = AppConfig::load()?;
     let client = KeitorClient::new(&auth, &config.api_base_url())?;
 
-    let mut params = vec![format!("per_page={limit}")];
+    let mut params = vec![format!("per_page={limit}"), format!("page={page}")];
 
     if let Some(ref from) = from {
         params.push(format!("from={from}"));
@@ -341,9 +344,12 @@ async fn running(global: &GlobalFlags, mode: OutputMode) -> Result<(), AppError>
             entries.push(serde_json::json!({
                 "running": true,
                 "entry_id": entry.id,
-                "project": entry.project_name,
-                "task": entry.task_name,
+                "project": entry.project_name(),
+                "task": entry.task_name(),
                 "started_at": entry.timer_started_at,
+                "spent_date": entry.spent_date,
+                "billable": entry.billable,
+                "source": entry.source,
                 "elapsed_hours": elapsed,
                 "elapsed": elapsed.map(format_duration),
             }));
@@ -358,8 +364,8 @@ async fn running(global: &GlobalFlags, mode: OutputMode) -> Result<(), AppError>
             println!(
                 "{} {} / {} — {} elapsed",
                 "Running:".green().bold(),
-                entry.project_name.as_deref().unwrap_or("?"),
-                entry.task_name.as_deref().unwrap_or("?"),
+                entry.project_name().unwrap_or("?"),
+                entry.task_name().unwrap_or("?"),
                 elapsed.unwrap_or_else(|| "?".into()),
             );
         }

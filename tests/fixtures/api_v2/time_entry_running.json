@@ -1,0 +1,41 @@
+{
+  "time_entries": [
+    {
+      "id": "te_running",
+      "user": { "id": "usr_1", "name": "Test User" },
+      "project": { "id": "p1", "name": "Project A" },
+      "task": { "id": "t1", "name": "Development" },
+      "user_id": "usr_1",
+      "project_id": "p1",
+      "task_id": "t1",
+      "spent_date": "2026-03-04",
+      "hours": 0,
+      "notes": "in progress",
+      "is_running": true,
+      "timer_started_at": "2026-03-04T09:00:00Z",
+      "started_time": "09:00",
+      "ended_time": null,
+      "is_locked": false,
+      "is_closed": false,
+      "is_billed": false,
+      "billable": true,
+      "budgeted": true,
+      "billable_rate": 150,
+      "cost_rate": null,
+      "source": "cli",
+      "metadata": { "tool": "keito-cli" },
+      "created_at": "2026-03-04T09:00:00Z",
+      "updated_at": "2026-03-04T09:00:00Z"
+    }
+  ],
+  "per_page": 200,
+  "total_pages": 1,
+  "total_entries": 1,
+  "page": 1,
+  "links": {
+    "first": "/api/v2/time_entries?page=1&per_page=200",
+    "next": null,
+    "previous": null,
+    "last": "/api/v2/time_entries?page=1&per_page=200"
+  }
+}
