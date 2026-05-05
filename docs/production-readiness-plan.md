@@ -4,7 +4,7 @@ Date: 2026-05-04
 
 ## Summary
 
-`keito-cli` is a solid alpha implementation for the PRD's core concept, but it is not production-ready against the current Keito production API. The main blocker is API contract drift: the CLI was built and tested against a mocked shape that does not match the production `app.keito.ai` v2 API.
+`keito-cli` now has production-compatible coverage for the core auth, project/task discovery, and time-entry timer workflows against the current Keito `app.keito.ai` v2 API. The remaining work in this plan tracks PRD features beyond the core timer flow and release hardening.
 
 Validated sources:
 
@@ -35,7 +35,7 @@ Implemented commands:
 - `keito time start|stop|log|list|running`
 - Global `--json`, `--workspace`, `--quiet`, `--verbose`
 
-Generated man pages cover top-level command groups, but do not currently include individual subcommand man pages such as `keito-time-start(1)`.
+Generated man pages cover top-level command groups and individual subcommands such as `keito-time-start(1)`.
 
 ## Production Blockers
 
@@ -47,17 +47,14 @@ Generated man pages cover top-level command groups, but do not currently include
 | Create time entry date | Fixed to send `spent_date` | Requires `spent_date` | Keep request tests current. |
 | Billable field | Fixed to send `billable` on create | Expects `billable` | Add update/edit commands when needed. |
 | Time entry response names | Fixed to read nested names and `spent_date` | Returns nested `project`, `task`, `spent_date` | Keep rendering tests current. |
-| Stop timer | Fixed to call `PATCH /api/v2/time_entries/{id}/stop` | Local app route added; deploy to production | Smoke-test after deploy with a real running timer. |
+| Stop timer | Fixed to call `PATCH /api/v2/time_entries/{id}/stop` | Endpoint deployed and live-smoke-tested on 2026-05-05 | Keep regression coverage for start/running/stop. |
 | Source/metadata | Create sends `source=cli`; metadata field exists | API supports `source` and `metadata` | Add CLI flags, auto-detection, validation. |
 | Tests | Production-shaped fixtures for auth/projects/tasks/time | Production uses Harvest-style contract | Extend fixtures for expenses and edit/delete. |
 
 ## PRD Gaps
 
-P0 gaps before production:
+Remaining P0 gaps before the broader PRD is complete:
 
-- Production API compatibility for all existing commands, pending deployment of the new stop endpoint.
-- Auth login flow aligned with `users/me` and real company response shape.
-- Timer stop semantics supported by the API and CLI.
 - Agent tagging: `--source`, `--agent-id`, `--session-id`, `--metadata`.
 - Agent auto-detection from `OPENCLAW_AGENT_ID`, `CLAUDE_SESSION_ID`, `CODEX_SESSION_ID`, and `CURSOR_AGENT`.
 - Safe JSON error behavior for production 400/401/403/404/409/429/5xx responses.
@@ -103,7 +100,16 @@ Implemented locally:
 - Updated CLI `time stop` to use the stop endpoint.
 - Added recursive man-page generation and tests for agent-facing command pages.
 
-Remaining: deploy the app route and smoke-test `keito time start`, `keito time running`, and `keito time stop` against production with real credentials.
+Live verified on 2026-05-05:
+
+- `keito time start --project "Website Redesign" --task "Development"`
+- `keito time running`
+- duplicate `keito time start` conflict handling with exit code 3
+- `keito time stop --notes "..."`
+- `keito time stop --discard`
+- no-running `keito time stop --json` handling with exit code 4
+- `keito time log --duration 0:15`
+- `keito time list --limit 5`
 
 ### Phase 3 - Add Agent-Native Metadata
 

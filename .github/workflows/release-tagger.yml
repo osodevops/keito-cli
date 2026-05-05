@@ -94,7 +94,7 @@ jobs:
           dispatch_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           gh workflow run release.yml --ref main --field "tag=${RELEASE_TAG}"
 
-          for attempt in {1..30}; do
+          for _ in {1..30}; do
             run_url="$(
               gh run list \
                 --workflow release.yml \

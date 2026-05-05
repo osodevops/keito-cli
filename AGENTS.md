@@ -83,11 +83,16 @@ Current production time-entry fields use Harvest-style snake case:
 - `source` accepts `web`, `cli`, `api`, or `agent`.
 - `metadata` must be a JSON object and is limited to 4KB.
 
-## Known Readiness Gaps
+## Production Validation
 
-The current CLI has been updated for the production v2 auth/projects/tasks/time-entry list/create/stop response shapes. Remaining production-readiness gaps:
+The current CLI has been updated for the production v2 auth/projects/tasks/time-entry list/create/stop response shapes. A live production smoke test on 2026-05-05 verified:
 
-- The sibling production app repo has a local `PATCH /api/v2/time_entries/{id}/stop` route, but it must be deployed before production smoke testing `keito time stop`.
+- `keito auth status` and `keito auth whoami` against `https://app.keito.ai`.
+- `keito projects list`, `keito projects show`, and `keito projects tasks`.
+- `keito time start`, `keito time running`, duplicate-start conflict handling, `keito time stop`, `keito time stop --discard`, no-running stop handling, `keito time log`, and `keito time list`.
+
+Remaining product gaps:
+
 - Time entries default to `source=cli`; agent metadata flags, source selection, auto-detection, offline queue, sync, reports, clients, config commands, completions, and time edit/delete are PRD items that are not implemented in the CLI yet.
 
 When fixing production compatibility, update both the Rust models/client and the mock tests so tests assert the real production envelope and field names.

@@ -238,6 +238,7 @@ Clap/help content tasks:
 - `cargo test --all-targets` passes in `keito-cli`.
 - `cargo clippy --all-targets -- -D warnings` passes in `keito-cli`.
 - Platform app route tests for the stop endpoint pass.
+- Live production smoke test passes for auth, project/task discovery, timer start, running status, duplicate-start conflict, stop, discard, no-running stop handling, manual log, and list.
 - `cargo run --bin gen-man` emits every required command and subcommand man page.
 - Man-page completeness checks pass.
 - README, `docs/agent-guide.md`, `AGENTS.md`, and `docs/production-task-plan.md` agree with the generated man pages.

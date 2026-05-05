@@ -1,8 +1,11 @@
 /target
 /man
-/tapes
+/tapes/*
+!/tapes/
+!/tapes/*.tape
 /scripts
 *.swp
 *.swo
 .DS_Store
 .env
+recordings/time-start-stop.gif
