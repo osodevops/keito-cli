@@ -39,7 +39,7 @@ jobs:
           git diff --name-only "$BASE_REF"...HEAD > changed-files.txt
           cat changed-files.txt
 
-          if ! grep -Eq '^(src/|Cargo\.toml$|Cargo\.lock$|dist-workspace\.toml$)' changed-files.txt; then
+          if ! grep -Eq '^(src/|dist-workspace\.toml$)' changed-files.txt; then
             echo "No release-impacting changes detected; version bump not required."
             exit 0
           fi
