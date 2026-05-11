@@ -47,6 +47,33 @@ impl MeResponse {
     }
 }
 
+// -- Clients --
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Client {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub currency: Option<String>,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub is_active: bool,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateClientRequest {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+}
+
 // -- Projects --
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +108,24 @@ impl Project {
     pub fn client_name(&self) -> Option<&str> {
         self.client.as_ref().map(|client| client.name.as_str())
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateProjectRequest {
+    pub client_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_billable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bill_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_ids: Option<Vec<String>>,
 }
 
 // -- Tasks --
@@ -181,6 +226,10 @@ pub struct CreateTimeEntryRequest {
     pub billable: Option<bool>,
     pub is_running: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -190,6 +239,12 @@ pub struct CreateTimeEntryRequest {
 #[allow(dead_code)]
 pub struct UpdateTimeEntryRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_running: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
@@ -197,6 +252,10 @@ pub struct UpdateTimeEntryRequest {
     pub hours: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
@@ -221,6 +280,21 @@ pub struct PaginationLinks {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectsResponse {
     pub projects: Vec<Project>,
+    #[serde(default)]
+    pub per_page: Option<u64>,
+    #[serde(default)]
+    pub total_pages: Option<u64>,
+    #[serde(default)]
+    pub total_entries: Option<u64>,
+    #[serde(default)]
+    pub page: Option<u64>,
+    #[serde(default)]
+    pub links: Option<PaginationLinks>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientsResponse {
+    pub clients: Vec<Client>,
     #[serde(default)]
     pub per_page: Option<u64>,
     #[serde(default)]
@@ -297,6 +371,8 @@ mod tests {
             notes: Some("test".into()),
             billable: Some(true),
             is_running: false,
+            started_time: Some("09:00".into()),
+            ended_time: Some("10:30".into()),
             source: Some("cli".into()),
             metadata: None,
         };
@@ -304,6 +380,8 @@ mod tests {
         let value = serde_json::to_value(req).unwrap();
         assert_eq!(value["spent_date"], "2026-03-04");
         assert_eq!(value["billable"], true);
+        assert_eq!(value["started_time"], "09:00");
+        assert_eq!(value["ended_time"], "10:30");
         assert!(value.get("date").is_none());
         assert!(value.get("is_billable").is_none());
     }

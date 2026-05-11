@@ -1,6 +1,6 @@
 use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use reqwest::Client;
+use reqwest::Client as HttpClient;
 use std::time::Duration;
 
 use crate::api::error::map_status_to_error;
@@ -9,7 +9,7 @@ use crate::config::ResolvedAuth;
 use crate::error::AppError;
 
 pub struct KeitorClient {
-    client: Client,
+    client: HttpClient,
     base_url: String,
 }
 
@@ -27,7 +27,7 @@ impl KeitorClient {
                 .map_err(|_| AppError::Auth("Invalid workspace ID format".into()))?,
         );
 
-        let client = Client::builder()
+        let client = HttpClient::builder()
             .default_headers(headers.clone())
             .timeout(Duration::from_secs(30))
             .build()
@@ -146,24 +146,63 @@ impl KeitorClient {
             .await
     }
 
+    pub async fn list_clients(&self) -> Result<Vec<Client>, AppError> {
+        let path = path_with_query(
+            "/api/v2/clients",
+            &[("is_active", "true"), ("per_page", "200")],
+        );
+        let resp: ClientsResponse = self
+            .request_with_retry(reqwest::Method::GET, &path, None::<&()>)
+            .await?;
+        Ok(resp.clients)
+    }
+
+    pub async fn create_client(&self, req: &CreateClientRequest) -> Result<Client, AppError> {
+        self.request_with_retry(reqwest::Method::POST, "/api/v2/clients", Some(req))
+            .await
+    }
+
     pub async fn list_projects(&self) -> Result<Vec<Project>, AppError> {
-        let resp: ProjectsResponse = self
-            .request_with_retry(
-                reqwest::Method::GET,
-                "/api/v2/projects?is_active=true&per_page=200",
-                None::<&()>,
+        self.list_projects_for_client(None).await
+    }
+
+    pub async fn list_projects_for_client(
+        &self,
+        client_id: Option<&str>,
+    ) -> Result<Vec<Project>, AppError> {
+        let path = if let Some(client_id) = client_id {
+            path_with_query(
+                "/api/v2/projects",
+                &[
+                    ("is_active", "true"),
+                    ("per_page", "200"),
+                    ("client_id", client_id),
+                ],
             )
+        } else {
+            path_with_query(
+                "/api/v2/projects",
+                &[("is_active", "true"), ("per_page", "200")],
+            )
+        };
+        let resp: ProjectsResponse = self
+            .request_with_retry(reqwest::Method::GET, &path, None::<&()>)
             .await?;
         Ok(resp.projects)
     }
 
+    pub async fn create_project(&self, req: &CreateProjectRequest) -> Result<Project, AppError> {
+        self.request_with_retry(reqwest::Method::POST, "/api/v2/projects", Some(req))
+            .await
+    }
+
     pub async fn list_tasks(&self) -> Result<Vec<Task>, AppError> {
+        let path = path_with_query(
+            "/api/v2/tasks",
+            &[("is_active", "true"), ("per_page", "200")],
+        );
         let resp: TasksResponse = self
-            .request_with_retry(
-                reqwest::Method::GET,
-                "/api/v2/tasks?is_active=true&per_page=200",
-                None::<&()>,
-            )
+            .request_with_retry(reqwest::Method::GET, &path, None::<&()>)
             .await?;
         Ok(resp.tasks)
     }
@@ -276,6 +315,8 @@ impl KeitorClient {
                 }),
                 billable: Some(timer.billable),
                 is_running: false,
+                started_time: timer.started_time.clone(),
+                ended_time: timer.ended_time.clone(),
                 source: Some("cli".into()),
                 metadata: timer.metadata.clone(),
             })
@@ -292,6 +333,16 @@ impl KeitorClient {
             &format!("/api/v2/time_entries/{id}"),
         )
         .await
+    }
+}
+
+fn path_with_query(path: &str, query: &[(&str, &str)]) -> String {
+    let url = reqwest::Url::parse_with_params(&format!("https://keito.local{path}"), query)
+        .expect("static API path should be a valid URL");
+
+    match url.query() {
+        Some(query) => format!("{}?{}", url.path(), query),
+        None => url.path().to_string(),
     }
 }
 

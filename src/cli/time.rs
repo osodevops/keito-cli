@@ -134,6 +134,7 @@ DURATION FORMATS:
   1:30   → 1 hour 30 minutes (HH:MM)
   0:15   → 15 minutes
   0.25   → 15 minutes
+  --duration-seconds 5400 → 1 hour 30 minutes
 
 EXAMPLE:
   $ keito time log --project acme --task dev --duration 1:30 \\
@@ -167,9 +168,97 @@ Duration of the time entry. Accepts two formats:
   Decimal hours: 1.5 (= 1h 30m), 0.25 (= 15m)
   HH:MM format:  1:30 (= 1h 30m), 0:15 (= 15m)"
         )]
-        duration: String,
+        duration: Option<String>,
+
+        /// Duration in whole seconds
+        #[arg(long = "duration-seconds", conflicts_with = "duration")]
+        duration_seconds: Option<u64>,
 
         /// Date of work (YYYY-MM-DD, default: today)
+        #[arg(long)]
+        date: Option<String>,
+
+        /// Start time of work (HH:MM)
+        #[arg(long = "started-time")]
+        started_time: Option<String>,
+
+        /// End time of work (HH:MM)
+        #[arg(long = "ended-time")]
+        ended_time: Option<String>,
+
+        /// Description of work performed
+        #[arg(long)]
+        notes: Option<String>,
+
+        /// Override billable status
+        #[arg(long)]
+        billable: Option<bool>,
+
+        /// Source to store on the time entry: web, cli, api, or agent
+        #[arg(long, default_value = "cli")]
+        source: String,
+
+        /// JSON metadata object to store on the time entry
+        #[arg(long)]
+        metadata: Option<String>,
+
+        /// Agent session ID to store in metadata.session_id
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
+
+        /// Agent identifier to store in metadata.agent_id
+        #[arg(long = "agent-id")]
+        agent_id: Option<String>,
+
+        /// Agent type to store in metadata.agent_type
+        #[arg(long = "agent-type")]
+        agent_type: Option<String>,
+
+        /// Skill name to store in metadata.skill
+        #[arg(long)]
+        skill: Option<String>,
+    },
+
+    /// Create or update a completed agent session entry
+    #[command(long_about = "\
+Create or update a completed agent session time entry.
+
+This is intended for agent lifecycle hooks. The command records a completed \
+entry with source=agent by default and metadata.session_id set to the supplied \
+session ID. If an entry for the same session ID already exists on the target \
+date/source, it is updated instead of duplicated.
+
+EXAMPLE:
+  keito time session-record --project acme --task dev \\
+    --session-id codex-123 --duration-seconds 5400 \\
+    --started-at 2026-05-11T09:00:00Z --ended-at 2026-05-11T10:30:00Z \\
+    --skill keito-agent --json")]
+    SessionRecord {
+        /// Project name, code, or ID
+        #[arg(long)]
+        project: String,
+
+        /// Task name or ID
+        #[arg(long)]
+        task: String,
+
+        /// Stable agent session ID used for idempotent upsert behavior
+        #[arg(long = "session-id")]
+        session_id: String,
+
+        /// Duration in whole seconds
+        #[arg(long = "duration-seconds")]
+        duration_seconds: u64,
+
+        /// RFC3339 session start timestamp
+        #[arg(long = "started-at")]
+        started_at: Option<String>,
+
+        /// RFC3339 session end timestamp
+        #[arg(long = "ended-at")]
+        ended_at: Option<String>,
+
+        /// Date of work (YYYY-MM-DD, default: local date from started-at or today)
         #[arg(long)]
         date: Option<String>,
 
@@ -180,6 +269,26 @@ Duration of the time entry. Accepts two formats:
         /// Override billable status
         #[arg(long)]
         billable: Option<bool>,
+
+        /// Source to store on the time entry: web, cli, api, or agent
+        #[arg(long, default_value = "agent")]
+        source: String,
+
+        /// JSON metadata object to store on the time entry
+        #[arg(long)]
+        metadata: Option<String>,
+
+        /// Agent identifier to store in metadata.agent_id
+        #[arg(long = "agent-id")]
+        agent_id: Option<String>,
+
+        /// Agent type to store in metadata.agent_type
+        #[arg(long = "agent-type")]
+        agent_type: Option<String>,
+
+        /// Skill name to store in metadata.skill
+        #[arg(long)]
+        skill: Option<String>,
     },
 
     /// List time entries with optional filters
@@ -195,6 +304,7 @@ API EFFECT:
 
 EXAMPLES:
   keito time list --from 2025-01-01 --to 2025-01-31 --json
+  keito time list --today --source agent --json
   keito time list --project acme --limit 10 --json
   keito time list --task dev --page 2 --json")]
     List {
@@ -206,6 +316,10 @@ EXAMPLES:
         #[arg(long)]
         to: Option<String>,
 
+        /// Use today's local date for both --from and --to
+        #[arg(long)]
+        today: bool,
+
         /// Filter by project name or ID
         #[arg(long)]
         project: Option<String>,
@@ -213,6 +327,10 @@ EXAMPLES:
         /// Filter by task name or ID
         #[arg(long)]
         task: Option<String>,
+
+        /// Filter by source: web, cli, api, or agent
+        #[arg(long)]
+        source: Option<String>,
 
         /// Max entries to return (default: 50)
         #[arg(long, default_value = "50")]
