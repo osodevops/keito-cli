@@ -3,7 +3,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn write_test_config(home: &Path, api_url: &str) {
@@ -153,6 +153,50 @@ fn clients_help_works() {
         .assert()
         .success()
         .stdout(predicate::str::contains("list"));
+}
+
+#[tokio::test]
+async fn clients_list_sends_account_header_against_mock_api() {
+    let server = MockServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_test_config(temp_dir.path(), &server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/clients"))
+        .and(query_param("is_active", "true"))
+        .and(query_param("per_page", "200"))
+        .and(header("Authorization", "Bearer kto_test_key"))
+        .and(header("Keito-Account-Id", "co_test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "clients": [{
+                "id": "c1",
+                "name": "Client A",
+                "currency": "USD",
+                "address": null,
+                "is_active": true,
+                "created_at": "2026-05-12T08:00:00Z",
+                "updated_at": "2026-05-12T08:00:00Z"
+            }],
+            "per_page": 200,
+            "total_pages": 1,
+            "total_entries": 1,
+            "page": 1,
+            "links": {
+                "first": "/api/v2/clients?page=1&per_page=200",
+                "next": null,
+                "previous": null,
+                "last": "/api/v2/clients?page=1&per_page=200"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    command_with_mock_config(temp_dir.path(), &server.uri())
+        .args(["--json", "clients", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""id": "c1""#));
 }
 
 #[test]
