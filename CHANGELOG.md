@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.6] - 2026-05-12
+
+### Changed
+
+- Pin the Agent Skill installer package to `skills@1.5.6` instead of resolving a floating installer tag.
+- Clarify CLI help and README wording so the skill remains GitHub-sourced and npm is only used for the pinned installer hop.
+
 ## [0.1.5] - 2026-05-12
 
 ### Added
