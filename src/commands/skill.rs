@@ -291,9 +291,32 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
     }
 
     let path_var = std::env::var_os("PATH")?;
+    let names = executable_names(binary);
     std::env::split_paths(&path_var)
-        .map(|dir| dir.join(binary))
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
         .find(|path| path.is_file())
+}
+
+fn executable_names(binary: &str) -> Vec<String> {
+    #[cfg(not(windows))]
+    {
+        vec![binary.to_string()]
+    }
+    #[cfg(windows)]
+    {
+        let mut names = vec![binary.to_string()];
+        if Path::new(binary).extension().is_none() {
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            names.extend(
+                pathext
+                    .split(';')
+                    .filter(|ext| !ext.is_empty())
+                    .map(|ext| format!("{binary}{ext}")),
+            );
+        }
+        names
+    }
 }
 
 fn print_status(status: &SkillStatus, doctor: bool) {

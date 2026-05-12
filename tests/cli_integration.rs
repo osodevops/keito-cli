@@ -38,8 +38,11 @@ fn command_with_mock_config(home: &Path, api_url: &str) -> Command {
 }
 
 fn prepend_path(cmd: &mut Command, dir: &Path) {
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    cmd.env("PATH", format!("{}:{current_path}", dir.display()));
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(current_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current_path));
+    }
+    cmd.env("PATH", std::env::join_paths(paths).unwrap());
 }
 
 fn write_fake_skill_tools(home: &Path) -> std::path::PathBuf {
@@ -242,6 +245,7 @@ fn skill_help_works() {
 }
 
 #[test]
+#[cfg(unix)]
 fn skill_install_configures_agent_hooks_with_fake_skills_cli() {
     let temp_dir = tempfile::tempdir().unwrap();
     let bin = write_fake_skill_tools(temp_dir.path());
