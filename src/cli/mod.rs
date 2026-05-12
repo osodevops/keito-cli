@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod clients;
 pub mod projects;
 pub mod time;
 
@@ -19,6 +20,7 @@ and returns structured exit codes for programmatic error handling.",
     after_long_help = "\
 ENVIRONMENT VARIABLES:
   KEITO_API_KEY          API key (takes precedence over config)
+  KEITO_API_URL          API base URL override
   KEITO_ACCOUNT_ID       Company/account ID for Keito-Account-Id
   KEITO_WORKSPACE_ID     Legacy alias for KEITO_ACCOUNT_ID
 
@@ -92,9 +94,12 @@ this value in Keito under Settings > API & Developers > Company ID."
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Manage authentication (login, logout, status, whoami)
     Auth(auth::AuthCommand),
+    /// Browse clients
+    Clients(clients::ClientsCommand),
     /// Track time entries (start, stop, log, list, running)
     Time(time::TimeCommand),
     /// Browse projects and tasks

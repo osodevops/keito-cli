@@ -36,6 +36,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 
     match cli.command {
         cli::Command::Auth(cmd) => commands::auth::run(cmd, &cli.global, output_mode).await,
+        cli::Command::Clients(cmd) => commands::clients::run(cmd, &cli.global, output_mode).await,
         cli::Command::Time(cmd) => commands::time::run(cmd, &cli.global, output_mode).await,
         cli::Command::Projects(cmd) => commands::projects::run(cmd, &cli.global, output_mode).await,
     }

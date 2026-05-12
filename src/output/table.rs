@@ -1,7 +1,7 @@
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
 
-use crate::api::models::{MeResponse, Project, Task, TimeEntry};
+use crate::api::models::{Client, MeResponse, Project, Task, TimeEntry};
 use crate::types::format_duration;
 
 #[allow(dead_code)]
@@ -89,6 +89,26 @@ impl TableDisplay for MeResponse {
     }
 }
 
+// ── Client table ──
+
+#[derive(Tabled)]
+pub struct ClientRow {
+    #[tabled(rename = "ID")]
+    pub id: String,
+    #[tabled(rename = "Name")]
+    pub name: String,
+    #[tabled(rename = "Currency")]
+    pub currency: String,
+    #[tabled(rename = "Active")]
+    pub active: String,
+}
+
+impl TableDisplay for Client {
+    fn to_row(&self) -> Vec<TableRow> {
+        vec![]
+    }
+}
+
 // Single-item wrapper for serde references
 impl<T: TableDisplay> TableDisplay for &T {
     fn to_row(&self) -> Vec<TableRow> {
@@ -122,6 +142,9 @@ fn to_table_from_serde<T: serde::Serialize>(items: &[T]) -> String {
     }
 
     // For known types, use typed table formatting
+    if let Some(clients) = try_as_clients(arr) {
+        return format_client_table(&clients);
+    }
     if let Some(projects) = try_as_projects(arr) {
         return format_project_table(&projects);
     }
@@ -156,9 +179,27 @@ fn to_table_from_serde<T: serde::Serialize>(items: &[T]) -> String {
 fn try_as_projects(arr: &[serde_json::Value]) -> Option<Vec<Project>> {
     // Check if items have project-specific fields
     let first = arr.first()?.as_object()?;
-    if first.contains_key("is_active")
-        && first.contains_key("name")
+    if first.contains_key("name")
+        && (first.contains_key("is_billable")
+            || first.contains_key("client")
+            || first.contains_key("code"))
         && !first.contains_key("is_running")
+        && !first.contains_key("currency")
+    {
+        serde_json::from_value(serde_json::Value::Array(arr.to_vec())).ok()
+    } else {
+        None
+    }
+}
+
+fn try_as_clients(arr: &[serde_json::Value]) -> Option<Vec<Client>> {
+    let first = arr.first()?.as_object()?;
+    if first.contains_key("name")
+        && first.contains_key("currency")
+        && !first.contains_key("project_id")
+        && !first.contains_key("task_id")
+        && !first.contains_key("is_billable")
+        && !first.contains_key("code")
     {
         serde_json::from_value(serde_json::Value::Array(arr.to_vec())).ok()
     } else {
@@ -215,6 +256,19 @@ fn format_project_table(projects: &[Project]) -> String {
             client: p.client_name().unwrap_or_default().to_string(),
             billable: if p.is_billable { "Yes" } else { "No" }.into(),
             active: if p.is_active { "Yes" } else { "No" }.into(),
+        })
+        .collect();
+    Table::new(rows).with(Style::rounded()).to_string()
+}
+
+fn format_client_table(clients: &[Client]) -> String {
+    let rows: Vec<ClientRow> = clients
+        .iter()
+        .map(|c| ClientRow {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            currency: c.currency.clone().unwrap_or_default(),
+            active: if c.is_active { "Yes" } else { "No" }.into(),
         })
         .collect();
     Table::new(rows).with(Style::rounded()).to_string()

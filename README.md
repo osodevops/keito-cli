@@ -128,6 +128,7 @@ Configuration file:
 api_key = "kto_..."
 account_id = "co_abc123"
 workspace_id = "co_abc123" # legacy alias, kept for compatibility
+api_url = "https://app.keito.ai"
 ```
 
 ### Credential Precedence
@@ -150,6 +151,7 @@ Find the Company ID in Keito under Settings > API & Developers > Company ID.
 | Variable | Description |
 |---|---|
 | `KEITO_API_KEY` | API key — takes precedence over config |
+| `KEITO_API_URL` | API base URL override; defaults to `https://app.keito.ai` |
 | `KEITO_ACCOUNT_ID` | Company/account ID sent as `Keito-Account-Id` |
 | `KEITO_WORKSPACE_ID` | Legacy alias for `KEITO_ACCOUNT_ID` |
 

@@ -1,5 +1,5 @@
 use chrono::{Duration as ChronoDuration, Utc};
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 use keito_cli::api::client::KeitorClient;
@@ -16,6 +16,7 @@ fn test_auth(workspace_id: &str) -> ResolvedAuth {
 fn fixture(name: &str) -> serde_json::Value {
     let contents = match name {
         "users_me" => include_str!("fixtures/api_v2/users_me.json"),
+        "clients_list" => include_str!("fixtures/api_v2/clients_list.json"),
         "projects_list" => include_str!("fixtures/api_v2/projects_list.json"),
         "tasks_list" => include_str!("fixtures/api_v2/tasks_list.json"),
         "time_entries_list" => include_str!("fixtures/api_v2/time_entries_list.json"),
@@ -61,6 +62,66 @@ async fn get_me_success() {
 }
 
 #[tokio::test]
+async fn list_clients_success() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/clients"))
+        .and(header("Authorization", "Bearer kto_test_key"))
+        .and(header("Keito-Account-Id", "co_test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("clients_list")))
+        .mount(&server)
+        .await;
+
+    let auth = test_auth("co_test");
+    let client = KeitorClient::new(&auth, &server.uri()).unwrap();
+    let clients = client.list_clients().await.unwrap();
+
+    assert_eq!(clients.len(), 2);
+    assert_eq!(clients[0].name, "Client A");
+    assert_eq!(clients[0].currency.as_deref(), Some("USD"));
+    assert!(clients[0].is_active);
+}
+
+#[tokio::test]
+async fn create_client_success() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/clients"))
+        .and(header("Authorization", "Bearer kto_test_key"))
+        .and(header("Keito-Account-Id", "co_test"))
+        .and(body_json(serde_json::json!({
+            "name": "Client A",
+            "currency": "USD"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "c1",
+            "name": "Client A",
+            "currency": "USD",
+            "address": null,
+            "is_active": true
+        })))
+        .mount(&server)
+        .await;
+
+    let auth = test_auth("co_test");
+    let client = KeitorClient::new(&auth, &server.uri()).unwrap();
+    let created = client
+        .create_client(&keito_cli::api::models::CreateClientRequest {
+            name: "Client A".into(),
+            address: None,
+            currency: Some("USD".into()),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(created.id, "c1");
+    assert_eq!(created.name, "Client A");
+    assert_eq!(created.currency.as_deref(), Some("USD"));
+}
+
+#[tokio::test]
 async fn get_me_unauthorized() {
     let server = MockServer::start().await;
 
@@ -99,6 +160,136 @@ async fn list_projects_success() {
     assert_eq!(projects[0].name, "Project A");
     assert_eq!(projects[0].code.as_deref(), Some("PA"));
     assert_eq!(projects[0].client_name(), Some("Client A"));
+}
+
+#[tokio::test]
+async fn list_projects_can_filter_by_client() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/projects"))
+        .and(query_param("client_id", "c1"))
+        .and(header("Authorization", "Bearer kto_test_key"))
+        .and(header("Keito-Account-Id", "co_test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("projects_list")))
+        .mount(&server)
+        .await;
+
+    let auth = test_auth("co_test");
+    let client = KeitorClient::new(&auth, &server.uri()).unwrap();
+    let projects = client.list_projects_for_client(Some("c1")).await.unwrap();
+
+    assert_eq!(projects.len(), 2);
+    assert_eq!(projects[0].client_name(), Some("Client A"));
+}
+
+#[tokio::test]
+async fn list_projects_encodes_client_filter() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/projects"))
+        .and(query_param("client_id", "c 1/2"))
+        .and(header("Authorization", "Bearer kto_test_key"))
+        .and(header("Keito-Account-Id", "co_test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("projects_list")))
+        .mount(&server)
+        .await;
+
+    let auth = test_auth("co_test");
+    let client = KeitorClient::new(&auth, &server.uri()).unwrap();
+    let projects = client
+        .list_projects_for_client(Some("c 1/2"))
+        .await
+        .unwrap();
+
+    assert_eq!(projects.len(), 2);
+}
+
+#[tokio::test]
+async fn create_project_success() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/projects"))
+        .and(header("Authorization", "Bearer kto_test_key"))
+        .and(header("Keito-Account-Id", "co_test"))
+        .and(body_json(serde_json::json!({
+            "client_id": "c1",
+            "name": "Agent Project",
+            "code": "AP",
+            "is_billable": true,
+            "bill_by": "PROJECT",
+            "budget_by": "NONE",
+            "task_ids": ["t1"]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "p_agent",
+            "client": { "id": "c1", "name": "Client A" },
+            "name": "Agent Project",
+            "code": "AP",
+            "is_active": true,
+            "is_billable": true,
+            "is_fixed_fee": false,
+            "bill_by": "PROJECT",
+            "budget_by": "NONE"
+        })))
+        .mount(&server)
+        .await;
+
+    let auth = test_auth("co_test");
+    let client = KeitorClient::new(&auth, &server.uri()).unwrap();
+    let project = client
+        .create_project(&keito_cli::api::models::CreateProjectRequest {
+            client_id: "c1".into(),
+            name: "Agent Project".into(),
+            code: Some("AP".into()),
+            notes: None,
+            is_billable: Some(true),
+            bill_by: Some("PROJECT".into()),
+            budget_by: Some("NONE".into()),
+            task_ids: Some(vec!["t1".into()]),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(project.id, "p_agent");
+    assert_eq!(project.name, "Agent Project");
+    assert_eq!(project.client_name(), Some("Client A"));
+}
+
+#[tokio::test]
+async fn create_project_conflict() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/projects"))
+        .and(header("Authorization", "Bearer kto_test_key"))
+        .and(header("Keito-Account-Id", "co_test"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+            "error": "conflict",
+            "error_description": "A project with this code already exists in your account"
+        })))
+        .mount(&server)
+        .await;
+
+    let auth = test_auth("co_test");
+    let client = KeitorClient::new(&auth, &server.uri()).unwrap();
+    let result = client
+        .create_project(&keito_cli::api::models::CreateProjectRequest {
+            client_id: "c1".into(),
+            name: "Agent Project".into(),
+            code: Some("AP".into()),
+            notes: None,
+            is_billable: Some(true),
+            bill_by: Some("PROJECT".into()),
+            budget_by: Some("NONE".into()),
+            task_ids: None,
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().exit_code(), 3);
 }
 
 #[tokio::test]
@@ -164,6 +355,8 @@ async fn create_time_entry_success() {
             "notes": "test",
             "billable": true,
             "is_running": false,
+            "started_time": "09:00",
+            "ended_time": "10:30",
             "source": "cli",
             "metadata": {"tool": "keito-cli"}
         })))
@@ -182,6 +375,8 @@ async fn create_time_entry_success() {
         notes: Some("test".into()),
         billable: Some(true),
         is_running: false,
+        started_time: Some("09:00".into()),
+        ended_time: Some("10:30".into()),
         source: Some("cli".into()),
         metadata: Some(serde_json::json!({"tool": "keito-cli"})),
     };
@@ -213,10 +408,15 @@ async fn update_time_entry_success() {
     let client = KeitorClient::new(&auth, &server.uri()).unwrap();
 
     let req = keito_cli::api::models::UpdateTimeEntryRequest {
+        project_id: None,
+        task_id: None,
+        spent_date: None,
         is_running: Some(false),
         notes: None,
         hours: Some(1.5),
         billable: None,
+        started_time: None,
+        ended_time: None,
         metadata: None,
     };
 
@@ -318,6 +518,7 @@ async fn stop_time_entry_compat_falls_back_when_stop_route_is_missing() {
             "notes": "done",
             "billable": true,
             "is_running": false,
+            "started_time": "09:00",
             "source": "cli",
             "metadata": {"tool": "keito-cli"}
         })))

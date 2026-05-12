@@ -1,6 +1,6 @@
 [package]
 name = "keito-cli"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "CLI for AI agents and humans to track billable time against the Keito platform"
 license = "MIT"

@@ -29,6 +29,44 @@ EXAMPLE:
         /// Max results to return
         #[arg(long)]
         limit: Option<u32>,
+
+        /// Filter by client ID
+        #[arg(long)]
+        client: Option<String>,
+    },
+
+    /// Create a project
+    #[command(long_about = "\
+Create a project for a client.
+
+Requires a Keito API key with manager permissions. The API assigns default \
+workspace tasks unless --task is supplied one or more times.
+
+EXAMPLE:
+  keito projects create \"Acme Website\" --client cli_abc --code ACME --json")]
+    Create {
+        /// Project name
+        name: String,
+
+        /// Client ID
+        #[arg(long)]
+        client: String,
+
+        /// Project code
+        #[arg(long)]
+        code: Option<String>,
+
+        /// Project notes
+        #[arg(long)]
+        notes: Option<String>,
+
+        /// Override billable status
+        #[arg(long)]
+        billable: Option<bool>,
+
+        /// Assign a task ID. Can be used multiple times.
+        #[arg(long = "task")]
+        tasks: Vec<String>,
     },
 
     /// Show project details
