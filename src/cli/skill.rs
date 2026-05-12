@@ -20,17 +20,17 @@ pub struct SkillCommand {
 pub enum SkillSubcommand {
     /// Install the Keito Skill and configure supported agent hooks
     #[command(long_about = "\
-Install the Keito Skill via the open skills CLI, then run the installed hook
-installer for each selected agent.
+Install the Keito Skill with the pinned open skills installer package, then run
+the installed hook installer for each selected agent.
 
 By default this configures both Codex and Claude Code. The skill still needs
 per-repository setup after installation: cd into a client repo and run
 /track-time-keito to select its Keito client, project, and task.")]
     Install {
-        /// Skill source for npx skills add
+        /// Skill source for the skills installer
         #[arg(
             long,
-            default_value = "keito-ai/keito-skill",
+            default_value = "osodevops/keito-skill",
             env = "KEITO_SKILL_SOURCE"
         )]
         source: String,
@@ -39,7 +39,7 @@ per-repository setup after installation: cd into a client repo and run
         #[arg(long, value_enum)]
         agent: Vec<SkillAgent>,
 
-        /// Skip running npx skills add and only run hook installers if present
+        /// Skip the skills installer and only run hook installers if present
         #[arg(long)]
         skip_skills_add: bool,
     },

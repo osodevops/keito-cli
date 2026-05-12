@@ -10,6 +10,7 @@ use crate::error::AppError;
 use crate::output::OutputMode;
 
 const SKILL_NAME: &str = "keito-time-track";
+const DEFAULT_SKILLS_PACKAGE: &str = "skills@1.5.6";
 
 #[derive(Debug, Serialize)]
 struct SkillStatus {
@@ -58,7 +59,7 @@ pub async fn run(
 
 pub async fn install_defaults(global: &GlobalFlags, mode: OutputMode) -> Result<(), AppError> {
     let source =
-        std::env::var("KEITO_SKILL_SOURCE").unwrap_or_else(|_| "keito-ai/keito-skill".into());
+        std::env::var("KEITO_SKILL_SOURCE").unwrap_or_else(|_| "osodevops/keito-skill".into());
     install(global, mode, &source, default_agents(), false).await
 }
 
@@ -141,10 +142,12 @@ fn default_agents() -> Vec<SkillAgent> {
 }
 
 fn run_skills_add(source: &str, agent: SkillAgent, show_output: bool) -> Result<(), AppError> {
+    let skills_package =
+        std::env::var("KEITO_SKILLS_PACKAGE").unwrap_or_else(|_| DEFAULT_SKILLS_PACKAGE.into());
     let status = ProcessCommand::new("npx")
         .args([
             "--yes",
-            "skills@latest",
+            &skills_package,
             "add",
             source,
             "-g",
@@ -159,11 +162,11 @@ fn run_skills_add(source: &str, agent: SkillAgent, show_output: bool) -> Result<
         .stdout(child_stdio(show_output))
         .stderr(child_stdio(show_output))
         .status()
-        .map_err(|e| AppError::Config(format!("Failed to run npx skills: {e}")))?;
+        .map_err(|e| AppError::Config(format!("Failed to run the skills installer: {e}")))?;
 
     if !status.success() {
         return Err(AppError::Config(format!(
-            "npx skills add failed for {}",
+            "Skills installer failed for {}",
             agent.display_name()
         )));
     }

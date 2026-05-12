@@ -1,5 +1,7 @@
 # keito
 
+[![CI](https://github.com/osodevops/keito-cli/actions/workflows/test.yml/badge.svg)](https://github.com/osodevops/keito-cli/actions/workflows/test.yml)
+
 Track billable time against the [Keito](https://keito.ai) platform — from the terminal or from an AI agent.
 
 <p align="center">
@@ -86,6 +88,17 @@ keito time stop --json
 ```
 
 Exit codes tell you exactly what happened — no need to parse error messages. See [Exit Codes](#exit-codes) below.
+
+## Agent Skill
+
+The Keito Agent Skill is installed from the GitHub skill repo, not from an npm package:
+
+```sh
+keito auth login
+keito skill install
+```
+
+`keito skill install` uses `npx` only to run the open skills installer. The installer package is pinned to `skills@1.5.6` by default and can be overridden intentionally with `KEITO_SKILLS_PACKAGE`.
 
 ## Features
 
