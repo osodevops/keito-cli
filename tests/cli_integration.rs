@@ -287,7 +287,7 @@ fn skill_install_configures_agent_hooks_with_fake_skills_cli() {
     assert!(!output_text.contains("fake claude installer output"));
 
     let log = fs::read_to_string(npx_log).unwrap();
-    assert!(log.contains("skills@latest add /tmp/keito-skill"));
+    assert!(log.contains("skills@1.5.6 add /tmp/keito-skill"));
     assert!(log.contains("-a codex"));
     assert!(log.contains("-a claude-code"));
     assert!(temp_dir.path().join(".codex/hooks.json").exists());
