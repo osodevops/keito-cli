@@ -72,6 +72,13 @@ impl AppConfig {
     }
 
     pub fn api_base_url(&self) -> String {
+        if let Ok(api_url) = std::env::var("KEITO_API_URL") {
+            let api_url = api_url.trim();
+            if !api_url.is_empty() {
+                return api_url.to_string();
+            }
+        }
+
         self.api_url
             .clone()
             .unwrap_or_else(|| "https://app.keito.ai".into())
@@ -85,6 +92,35 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static KEITO_API_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var_os(name);
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 
     #[test]
     fn parse_config_toml() {
@@ -106,11 +142,23 @@ timezone = "Europe/London"
 
     #[test]
     fn empty_config_uses_defaults() {
+        let _guard = KEITO_API_URL_ENV_LOCK.lock().unwrap();
+        let _env = EnvVarGuard::set("KEITO_API_URL", None);
+
         let config: AppConfig = toml::from_str("").unwrap();
         assert!(config.api_key.is_none());
         assert!(config.account_id.is_none());
         assert!(config.workspace_id.is_none());
         assert_eq!(config.api_base_url(), "https://app.keito.ai");
+    }
+
+    #[test]
+    fn api_url_env_overrides_config() {
+        let _guard = KEITO_API_URL_ENV_LOCK.lock().unwrap();
+        let _env = EnvVarGuard::set("KEITO_API_URL", Some("http://localhost:3999"));
+
+        let config: AppConfig = toml::from_str(r#"api_url = "https://app.keito.ai""#).unwrap();
+        assert_eq!(config.api_base_url(), "http://localhost:3999");
     }
 
     #[test]

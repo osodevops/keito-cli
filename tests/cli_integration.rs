@@ -25,11 +25,12 @@ fn write_test_config(home: &Path, api_url: &str) {
     fs::write(windows_path.join("config.toml"), config).unwrap();
 }
 
-fn command_with_mock_config(home: &Path) -> Command {
+fn command_with_mock_config(home: &Path, api_url: &str) -> Command {
     let mut cmd = Command::cargo_bin("keito").unwrap();
     cmd.env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("APPDATA", home.join("AppData").join("Roaming"))
+        .env("KEITO_API_URL", api_url)
         .env("KEITO_API_KEY", "kto_test_key")
         .env("KEITO_ACCOUNT_ID", "co_test")
         .env_remove("KEITO_WORKSPACE_ID");
@@ -121,7 +122,7 @@ async fn projects_create_sends_normalized_body_against_mock_api() {
         .mount(&server)
         .await;
 
-    command_with_mock_config(temp_dir.path())
+    command_with_mock_config(temp_dir.path(), &server.uri())
         .args([
             "--json",
             "projects",
@@ -165,6 +166,7 @@ fn whoami_without_auth_fails() {
         .env("XDG_CONFIG_HOME", temp_dir.path().join("config"))
         .env_remove("KEITO_API_KEY")
         .env_remove("KEITO_ACCOUNT_ID")
+        .env_remove("KEITO_API_URL")
         .env_remove("KEITO_WORKSPACE_ID")
         .assert()
         .failure()
@@ -308,7 +310,7 @@ async fn time_session_record_creates_agent_entry_against_mock_api() {
         .mount(&server)
         .await;
 
-    command_with_mock_config(temp_dir.path())
+    command_with_mock_config(temp_dir.path(), &server.uri())
         .args([
             "--json",
             "time",

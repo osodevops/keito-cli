@@ -20,6 +20,7 @@ and returns structured exit codes for programmatic error handling.",
     after_long_help = "\
 ENVIRONMENT VARIABLES:
   KEITO_API_KEY          API key (takes precedence over config)
+  KEITO_API_URL          API base URL override
   KEITO_ACCOUNT_ID       Company/account ID for Keito-Account-Id
   KEITO_WORKSPACE_ID     Legacy alias for KEITO_ACCOUNT_ID
 
