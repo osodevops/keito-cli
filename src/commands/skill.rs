@@ -59,7 +59,7 @@ pub async fn run(
 
 pub async fn install_defaults(global: &GlobalFlags, mode: OutputMode) -> Result<(), AppError> {
     let source =
-        std::env::var("KEITO_SKILL_SOURCE").unwrap_or_else(|_| "keito-ai/keito-skill".into());
+        std::env::var("KEITO_SKILL_SOURCE").unwrap_or_else(|_| "osodevops/keito-skill".into());
     install(global, mode, &source, default_agents(), false).await
 }
 

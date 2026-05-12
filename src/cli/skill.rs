@@ -30,7 +30,7 @@ per-repository setup after installation: cd into a client repo and run
         /// Skill source for the skills installer
         #[arg(
             long,
-            default_value = "keito-ai/keito-skill",
+            default_value = "osodevops/keito-skill",
             env = "KEITO_SKILL_SOURCE"
         )]
         source: String,
