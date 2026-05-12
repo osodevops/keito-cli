@@ -8,6 +8,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn write_test_config(home: &Path, api_url: &str) {
     let config = format!("api_url = \"{api_url}\"\n");
+
     let xdg_path = home.join("config").join("keito");
     fs::create_dir_all(&xdg_path).unwrap();
     fs::write(xdg_path.join("config.toml"), &config).unwrap();
@@ -17,13 +18,18 @@ fn write_test_config(home: &Path, api_url: &str) {
         .join("Application Support")
         .join("keito");
     fs::create_dir_all(&mac_path).unwrap();
-    fs::write(mac_path.join("config.toml"), config).unwrap();
+    fs::write(mac_path.join("config.toml"), &config).unwrap();
+
+    let windows_path = home.join("AppData").join("Roaming").join("keito");
+    fs::create_dir_all(&windows_path).unwrap();
+    fs::write(windows_path.join("config.toml"), config).unwrap();
 }
 
 fn command_with_mock_config(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("keito").unwrap();
     cmd.env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("AppData").join("Roaming"))
         .env("KEITO_API_KEY", "kto_test_key")
         .env("KEITO_ACCOUNT_ID", "co_test")
         .env_remove("KEITO_WORKSPACE_ID");
