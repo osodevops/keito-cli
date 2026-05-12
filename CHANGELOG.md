@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.5] - 2026-05-12
+
+### Added
+
+- `keito skill install`, `keito skill status`, and `keito skill doctor` commands for installing and verifying the Keito Agent Skill.
+- Optional interactive Agent Skill install prompt after `keito auth login`.
+- JSON-safe skill installer execution so child installer output does not contaminate `--json` responses.
+
 ## [0.1.4] - 2026-05-12
 
 ### Added

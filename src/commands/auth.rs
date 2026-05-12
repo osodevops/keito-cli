@@ -1,9 +1,11 @@
 use colored::Colorize;
-use dialoguer::{Input, Password};
+use dialoguer::{Confirm, Input, Password};
+use std::io::IsTerminal;
 
 use crate::api::KeitorClient;
 use crate::cli::auth::{AuthCommand, AuthSubcommand};
 use crate::cli::GlobalFlags;
+use crate::commands::skill;
 use crate::config::{AppConfig, ResolvedAuth};
 use crate::error::AppError;
 use crate::output::{self, OutputMode};
@@ -71,6 +73,27 @@ async fn login(global: &GlobalFlags, mode: OutputMode) -> Result<(), AppError> {
             "Credentials saved to {}.",
             AppConfig::config_path()?.display()
         );
+        maybe_offer_skill_install(global, mode).await?;
+    }
+
+    Ok(())
+}
+
+async fn maybe_offer_skill_install(global: &GlobalFlags, mode: OutputMode) -> Result<(), AppError> {
+    if mode != OutputMode::Table || global.quiet || !std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+
+    let install = Confirm::new()
+        .with_prompt("Install the Keito agent skill for Claude Code / Codex?")
+        .default(true)
+        .interact()
+        .map_err(|e| AppError::Config(format!("Input error: {e}")))?;
+
+    if install {
+        skill::install_defaults(global, mode).await?;
+    } else {
+        println!("You can install it later with: keito skill install");
     }
 
     Ok(())

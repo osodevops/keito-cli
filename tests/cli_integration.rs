@@ -37,6 +37,84 @@ fn command_with_mock_config(home: &Path, api_url: &str) -> Command {
     cmd
 }
 
+#[cfg(unix)]
+fn prepend_path(cmd: &mut Command, dir: &Path) {
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(current_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current_path));
+    }
+    cmd.env("PATH", std::env::join_paths(paths).unwrap());
+}
+
+#[cfg(unix)]
+fn write_fake_skill_tools(home: &Path) -> std::path::PathBuf {
+    let bin = home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+
+    let npx = bin.join("npx");
+    fs::write(
+        &npx,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$KEITO_FAKE_NPX_LOG"
+echo "fake npx install output"
+agent=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-a" ]; then
+    shift
+    agent="${1:-}"
+  fi
+  shift || true
+done
+
+case "$agent" in
+  codex)
+    root="$HOME/.agents/skills/keito-time-track"
+    mkdir -p "$root/installers"
+    cat > "$root/installers/install-codex.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "fake codex installer output"
+mkdir -p "$HOME/.codex"
+printf '{"hooks":{"SessionStart":[{"hooks":[{"command":"keito-time-track/hooks/session-start.sh"}]}],"Stop":[{"hooks":[{"command":"keito-time-track/hooks/session-end.sh"}]}]}}\n' > "$HOME/.codex/hooks.json"
+SH
+    chmod +x "$root/installers/install-codex.sh"
+    ;;
+  claude-code)
+    root="$HOME/.claude/skills/keito-time-track"
+    mkdir -p "$root/installers"
+    cat > "$root/installers/install-claude-code.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "fake claude installer output"
+mkdir -p "$HOME/.claude"
+printf '{"hooks":{"SessionStart":[{"hooks":[{"command":"keito-time-track/hooks/session-start.sh"}]}],"Stop":[{"hooks":[{"command":"keito-time-track/hooks/session-end.sh"}]}]}}\n' > "$HOME/.claude/settings.json"
+SH
+    chmod +x "$root/installers/install-claude-code.sh"
+    ;;
+  *)
+    echo "unexpected agent: $agent" >&2
+    exit 2
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    set_executable(&npx);
+
+    let jq = bin.join("jq");
+    fs::write(&jq, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+    set_executable(&jq);
+
+    bin
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[test]
 fn help_flag_works() {
     Command::cargo_bin("keito")
@@ -153,6 +231,67 @@ fn clients_help_works() {
         .assert()
         .success()
         .stdout(predicate::str::contains("list"));
+}
+
+#[test]
+fn skill_help_works() {
+    Command::cargo_bin("keito")
+        .unwrap()
+        .args(["skill", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("install"));
+}
+
+#[test]
+#[cfg(unix)]
+fn skill_install_configures_agent_hooks_with_fake_skills_cli() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let bin = write_fake_skill_tools(temp_dir.path());
+    let npx_log = temp_dir.path().join("npx.log");
+
+    let mut cmd = Command::cargo_bin("keito").unwrap();
+    prepend_path(&mut cmd, &bin);
+    let output = cmd
+        .env("HOME", temp_dir.path())
+        .env("XDG_CONFIG_HOME", temp_dir.path().join("config"))
+        .env("APPDATA", temp_dir.path().join("AppData").join("Roaming"))
+        .env("KEITO_FAKE_NPX_LOG", &npx_log)
+        .env("KEITO_API_KEY", "kto_test_key")
+        .env("KEITO_ACCOUNT_ID", "co_test")
+        .args([
+            "--json",
+            "skill",
+            "install",
+            "--source",
+            "/tmp/keito-skill",
+            "--agent",
+            "codex",
+            "--agent",
+            "claude-code",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let status_json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(status_json["authenticated"], true);
+    assert_eq!(status_json["codex"]["hooks_configured"], true);
+    assert_eq!(status_json["claude_code"]["hooks_configured"], true);
+
+    let output_text = String::from_utf8(output).unwrap();
+    assert!(!output_text.contains("fake npx install output"));
+    assert!(!output_text.contains("fake codex installer output"));
+    assert!(!output_text.contains("fake claude installer output"));
+
+    let log = fs::read_to_string(npx_log).unwrap();
+    assert!(log.contains("skills@latest add /tmp/keito-skill"));
+    assert!(log.contains("-a codex"));
+    assert!(log.contains("-a claude-code"));
+    assert!(temp_dir.path().join(".codex/hooks.json").exists());
+    assert!(temp_dir.path().join(".claude/settings.json").exists());
 }
 
 #[tokio::test]

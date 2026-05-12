@@ -39,5 +39,6 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         cli::Command::Clients(cmd) => commands::clients::run(cmd, &cli.global, output_mode).await,
         cli::Command::Time(cmd) => commands::time::run(cmd, &cli.global, output_mode).await,
         cli::Command::Projects(cmd) => commands::projects::run(cmd, &cli.global, output_mode).await,
+        cli::Command::Skill(cmd) => commands::skill::run(cmd, &cli.global, output_mode).await,
     }
 }

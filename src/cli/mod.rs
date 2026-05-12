@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod clients;
 pub mod projects;
+pub mod skill;
 pub mod time;
 
 use clap::{Parser, Subcommand};
@@ -104,4 +105,6 @@ pub enum Command {
     Time(time::TimeCommand),
     /// Browse projects and tasks
     Projects(projects::ProjectsCommand),
+    /// Install and verify the Keito agent skill
+    Skill(skill::SkillCommand),
 }
