@@ -37,6 +37,7 @@ fn command_with_mock_config(home: &Path, api_url: &str) -> Command {
     cmd
 }
 
+#[cfg(unix)]
 fn prepend_path(cmd: &mut Command, dir: &Path) {
     let mut paths = vec![dir.to_path_buf()];
     if let Some(current_path) = std::env::var_os("PATH") {
@@ -45,6 +46,7 @@ fn prepend_path(cmd: &mut Command, dir: &Path) {
     cmd.env("PATH", std::env::join_paths(paths).unwrap());
 }
 
+#[cfg(unix)]
 fn write_fake_skill_tools(home: &Path) -> std::path::PathBuf {
     let bin = home.join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -112,9 +114,6 @@ fn set_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) {}
 
 #[test]
 fn help_flag_works() {
