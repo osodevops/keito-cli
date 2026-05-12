@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-05-12
+
+### Added
+
+- Client discovery and creation commands for agent setup workflows.
+- Project creation from the CLI, including client filtering, billable defaults, explicit task IDs, and conflict handling.
+- Agent session recording fields for source metadata, duration-based logging, and setup wizard support.
+
+### Fixed
+
+- Integration tests now write mock config to the Windows `%APPDATA%` path as well as Unix/macOS paths.
+
 ## [0.1.3] - 2026-05-05
 
 ### Added
