@@ -1,0 +1,7 @@
+interface:
+  display_name: "Keito Time Track"
+  short_description: "Log coding sessions to Keito"
+  default_prompt: "Use $keito-time-track to set up Keito time tracking for this repository."
+
+policy:
+  allow_implicit_invocation: true

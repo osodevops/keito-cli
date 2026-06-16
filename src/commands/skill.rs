@@ -1,9 +1,11 @@
 use colored::Colorize;
 use serde::Serialize;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::cli::skill::{SkillAgent, SkillCommand, SkillSubcommand};
+use crate::cli::skill::{SkillAgent, SkillCommand, SkillSubcommand, SkillTeamMode};
 use crate::cli::GlobalFlags;
 use crate::config::ResolvedAuth;
 use crate::error::AppError;
@@ -11,6 +13,7 @@ use crate::output::OutputMode;
 
 const SKILL_NAME: &str = "keito-time-track";
 const DEFAULT_SKILLS_PACKAGE: &str = "skills@1.5.6";
+const BUNDLED_SKILL_SOURCE: &str = "bundled";
 
 #[derive(Debug, Serialize)]
 struct SkillStatus {
@@ -30,6 +33,114 @@ struct AgentStatus {
     skill_path: Option<String>,
     hooks_configured: bool,
     hook_config_path: Option<String>,
+}
+
+#[derive(Debug)]
+struct BundledSkillFile {
+    path: &'static str,
+    contents: &'static str,
+    executable: bool,
+}
+
+const BUNDLED_SKILL_FILES: &[BundledSkillFile] = &[
+    BundledSkillFile {
+        path: "SKILL.md",
+        contents: include_str!("../../skills/keito-time-track/SKILL.md"),
+        executable: false,
+    },
+    BundledSkillFile {
+        path: "agents/openai.yaml",
+        contents: include_str!("../../skills/keito-time-track/agents/openai.yaml"),
+        executable: false,
+    },
+    BundledSkillFile {
+        path: "assets/claude.md-block.md",
+        contents: include_str!("../../skills/keito-time-track/assets/claude.md-block.md"),
+        executable: false,
+    },
+    BundledSkillFile {
+        path: "assets/config.example.yml",
+        contents: include_str!("../../skills/keito-time-track/assets/config.example.yml"),
+        executable: false,
+    },
+    BundledSkillFile {
+        path: "hooks/lib/config.sh",
+        contents: include_str!("../../skills/keito-time-track/hooks/lib/config.sh"),
+        executable: false,
+    },
+    BundledSkillFile {
+        path: "hooks/lib/duration.sh",
+        contents: include_str!("../../skills/keito-time-track/hooks/lib/duration.sh"),
+        executable: false,
+    },
+    BundledSkillFile {
+        path: "hooks/lib/log.sh",
+        contents: include_str!("../../skills/keito-time-track/hooks/lib/log.sh"),
+        executable: false,
+    },
+    BundledSkillFile {
+        path: "hooks/session-end.sh",
+        contents: include_str!("../../skills/keito-time-track/hooks/session-end.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "hooks/session-start.sh",
+        contents: include_str!("../../skills/keito-time-track/hooks/session-start.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "installers/install-claude-code.sh",
+        contents: include_str!("../../skills/keito-time-track/installers/install-claude-code.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "installers/install-codex.sh",
+        contents: include_str!("../../skills/keito-time-track/installers/install-codex.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "scripts/disable.sh",
+        contents: include_str!("../../skills/keito-time-track/scripts/disable.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "scripts/install-cli.sh",
+        contents: include_str!("../../skills/keito-time-track/scripts/install-cli.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "scripts/pause-resume.sh",
+        contents: include_str!("../../skills/keito-time-track/scripts/pause-resume.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "scripts/setup-wizard.sh",
+        contents: include_str!("../../skills/keito-time-track/scripts/setup-wizard.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "scripts/status.sh",
+        contents: include_str!("../../skills/keito-time-track/scripts/status.sh"),
+        executable: true,
+    },
+];
+
+struct MaterializedBundledSkill {
+    temp_root: PathBuf,
+    skill_root: PathBuf,
+}
+
+impl Drop for MaterializedBundledSkill {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.temp_root);
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TeamInitStatus {
+    mode: String,
+    repo_root: String,
+    changed_files: Vec<String>,
 }
 
 pub async fn run(
@@ -54,12 +165,13 @@ pub async fn run(
         }
         SkillSubcommand::Status => status(global, mode, false).await,
         SkillSubcommand::Doctor => status(global, mode, true).await,
+        SkillSubcommand::TeamInit { mode: team_mode } => team_init(team_mode, global, mode).await,
     }
 }
 
 pub async fn install_defaults(global: &GlobalFlags, mode: OutputMode) -> Result<(), AppError> {
     let source =
-        std::env::var("KEITO_SKILL_SOURCE").unwrap_or_else(|_| "osodevops/keito-skill".into());
+        std::env::var("KEITO_SKILL_SOURCE").unwrap_or_else(|_| BUNDLED_SKILL_SOURCE.into());
     install(global, mode, &source, default_agents(), false).await
 }
 
@@ -70,9 +182,12 @@ async fn install(
     agents: Vec<SkillAgent>,
     skip_skills_add: bool,
 ) -> Result<(), AppError> {
-    if !skip_skills_add && find_in_path("npx").is_none() {
+    let source = source.trim();
+    let use_bundled = source.is_empty() || source == BUNDLED_SKILL_SOURCE;
+
+    if !skip_skills_add && !use_bundled && find_in_path("npx").is_none() {
         return Err(AppError::Config(
-            "npx is required to install the Keito Skill. Install Node.js or run the manual skill installer.".into(),
+            "npx is required for an external skill source. Install Node.js, use --source bundled, or run the manual skill installer.".into(),
         ));
     }
     if find_in_path("jq").is_none() {
@@ -81,12 +196,22 @@ async fn install(
         ));
     }
 
+    let bundled_skill = if !skip_skills_add && use_bundled {
+        Some(materialize_bundled_skill()?)
+    } else {
+        None
+    };
+
     for agent in &agents {
         let show_child_output = !global.quiet && mode == OutputMode::Table;
-        if !skip_skills_add {
+        if skip_skills_add {
+            run_hook_installer(*agent, show_child_output)?;
+        } else if let Some(skill) = bundled_skill.as_ref() {
+            run_bundled_hook_installer(*agent, show_child_output, &skill.skill_root)?;
+        } else {
             run_skills_add(source, *agent, show_child_output)?;
+            run_hook_installer(*agent, show_child_output)?;
         }
-        run_hook_installer(*agent, show_child_output)?;
     }
 
     if global.quiet {
@@ -103,6 +228,7 @@ async fn install(
     } else {
         println!("{}", "Keito Skill installed.".green().bold());
         println!("Next: cd into each client repo and run /track-time-keito.");
+        println!("For shared repos: keito skill team-init optional");
         println!("Check readiness any time with: keito skill doctor");
     }
 
@@ -174,6 +300,19 @@ fn run_skills_add(source: &str, agent: SkillAgent, show_output: bool) -> Result<
     Ok(())
 }
 
+fn run_bundled_hook_installer(
+    agent: SkillAgent,
+    show_output: bool,
+    skill_root: &Path,
+) -> Result<(), AppError> {
+    let installer_name = match agent {
+        SkillAgent::Codex => "install-codex.sh",
+        SkillAgent::ClaudeCode => "install-claude-code.sh",
+    };
+    let script = skill_root.join("installers").join(installer_name);
+    run_installer_script(agent, show_output, &script)
+}
+
 fn run_hook_installer(agent: SkillAgent, show_output: bool) -> Result<(), AppError> {
     let script = hook_installer_path(agent).ok_or_else(|| {
         AppError::Config(format!(
@@ -182,11 +321,19 @@ fn run_hook_installer(agent: SkillAgent, show_output: bool) -> Result<(), AppErr
         ))
     })?;
 
+    run_installer_script(agent, show_output, &script)
+}
+
+fn run_installer_script(
+    agent: SkillAgent,
+    show_output: bool,
+    script: &Path,
+) -> Result<(), AppError> {
     let current_exe = std::env::current_exe()
         .map_err(|e| AppError::Config(format!("Could not resolve current keito binary: {e}")))?;
 
     let status = ProcessCommand::new("bash")
-        .arg(&script)
+        .arg(script)
         .env("KEITO_CLI_BIN", current_exe)
         .stdin(Stdio::null())
         .stdout(child_stdio(show_output))
@@ -201,6 +348,60 @@ fn run_hook_installer(agent: SkillAgent, show_output: bool) -> Result<(), AppErr
         )));
     }
 
+    Ok(())
+}
+
+fn materialize_bundled_skill() -> Result<MaterializedBundledSkill, AppError> {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp_root =
+        std::env::temp_dir().join(format!("keito-skill-{}-{unique}", std::process::id()));
+    let skill_root = temp_root.join(SKILL_NAME);
+
+    for file in BUNDLED_SKILL_FILES {
+        let path = skill_root.join(file.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                AppError::Config(format!("Failed to create bundled skill directory: {e}"))
+            })?;
+        }
+        fs::write(&path, file.contents).map_err(|e| {
+            AppError::Config(format!(
+                "Failed to write bundled skill file {}: {e}",
+                file.path
+            ))
+        })?;
+        set_executable_if_needed(&path, file.executable)?;
+    }
+
+    Ok(MaterializedBundledSkill {
+        temp_root,
+        skill_root,
+    })
+}
+
+#[cfg(unix)]
+fn set_executable_if_needed(path: &Path, executable: bool) -> Result<(), AppError> {
+    if !executable {
+        return Ok(());
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)
+        .map_err(|e| AppError::Config(format!("Failed to inspect {}: {e}", path.display())))?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).map_err(|e| {
+        AppError::Config(format!("Failed to mark {} executable: {e}", path.display()))
+    })?;
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_executable_if_needed(_path: &Path, _executable: bool) -> Result<(), AppError> {
     Ok(())
 }
 
@@ -373,4 +574,244 @@ fn yes_no(value: bool) -> String {
     } else {
         "no".red().to_string()
     }
+}
+
+async fn team_init(
+    team_mode: SkillTeamMode,
+    global: &GlobalFlags,
+    mode: OutputMode,
+) -> Result<(), AppError> {
+    let repo_root = git_repo_root()?;
+    let mut changed_files = Vec::new();
+
+    let ag_sections = team_guidance_sections(team_mode);
+    append_section_once(
+        &repo_root.join("AGENTS.md"),
+        "## Keito Time Tracking",
+        ag_sections.agents,
+        &mut changed_files,
+    )?;
+    append_section_once(
+        &repo_root.join("CLAUDE.md"),
+        "## Keito Time Tracking",
+        ag_sections.claude,
+        &mut changed_files,
+    )?;
+    ensure_gitignore(&repo_root, &mut changed_files)?;
+    write_config_example(&repo_root, &mut changed_files)?;
+
+    if global.quiet {
+        return Ok(());
+    }
+
+    let status = TeamInitStatus {
+        mode: match team_mode {
+            SkillTeamMode::Optional => "optional".to_string(),
+            SkillTeamMode::Required => "required".to_string(),
+        },
+        repo_root: repo_root.display().to_string(),
+        changed_files,
+    };
+
+    if mode == OutputMode::Json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status)
+                .map_err(|e| AppError::ServerError(format!("JSON serialization failed: {e}")))?
+        );
+    } else {
+        println!(
+            "{} Keito repo guidance initialized ({})",
+            "Done.".green().bold(),
+            status.mode
+        );
+        if status.changed_files.is_empty() {
+            println!("No files changed; Keito guidance was already present.");
+        } else {
+            println!("Changed files:");
+            for file in &status.changed_files {
+                println!("- {file}");
+            }
+        }
+        println!("Next: commit the guidance, then run /track-time-keito in this repo.");
+    }
+
+    Ok(())
+}
+
+struct TeamGuidance {
+    agents: &'static str,
+    claude: &'static str,
+}
+
+fn team_guidance_sections(team_mode: SkillTeamMode) -> TeamGuidance {
+    match team_mode {
+        SkillTeamMode::Optional => TeamGuidance {
+            agents: "\
+## Keito Time Tracking
+
+This repository can use Keito agent time tracking for billable coding work.
+If the user wants tracking enabled, verify `keito skill status --json`, then
+run `/track-time-keito` from Codex or Claude Code to create the repo-local
+`.keito/config.yml` project/task mapping.
+
+Do not commit `.keito/config.yml`; it is specific to one Keito account,
+client, project, and task. The lifecycle hooks create one `source=agent` time
+entry when a tracked session ends, so do not create duplicate manual entries.
+",
+            claude: "\
+## Keito Time Tracking
+
+This repository can use Keito agent time tracking for billable coding work.
+If the user wants tracking enabled, verify `keito skill status --json`, then
+run `/track-time-keito` to create the repo-local `.keito/config.yml`
+project/task mapping.
+
+Do not commit `.keito/config.yml`; it is specific to one Keito account,
+client, project, and task. The lifecycle hooks create one `source=agent` time
+entry when a tracked session ends, so do not create duplicate manual entries.
+",
+        },
+        SkillTeamMode::Required => TeamGuidance {
+            agents: "\
+## Keito Time Tracking
+
+Keito agent time tracking is required before billable coding work in this
+repository. Before starting, verify `keito skill status --json`. If the skill
+or hooks are missing, stop and tell the user to run `keito skill install`.
+
+If `.keito/config.yml` is missing for this worktree, stop and run
+`/track-time-keito` from Codex or Claude Code so the user can choose the Keito
+client, project, and task. Do not guess project or task IDs. Do not commit
+`.keito/config.yml`.
+
+The lifecycle hooks create one `source=agent` time entry when a tracked session
+ends. Do not create duplicate manual entries for the same coding session.
+",
+            claude: "\
+## Keito Time Tracking
+
+Keito agent time tracking is required before billable coding work in this
+repository. Before starting, verify `keito skill status --json`. If the skill
+or hooks are missing, stop and tell the user to run `keito skill install`.
+
+If `.keito/config.yml` is missing for this worktree, stop and run
+`/track-time-keito` so the user can choose the Keito client, project, and task.
+Do not guess project or task IDs. Do not commit `.keito/config.yml`.
+
+The lifecycle hooks create one `source=agent` time entry when a tracked session
+ends. Do not create duplicate manual entries for the same coding session.
+",
+        },
+    }
+}
+
+fn git_repo_root() -> Result<PathBuf, AppError> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| AppError::Config(format!("Failed to run git: {e}")))?;
+
+    if !output.status.success() {
+        return Err(AppError::Config(
+            "Run this from inside the Git repository you want to bootstrap.".into(),
+        ));
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        return Err(AppError::Config(
+            "Git did not return a repository root.".into(),
+        ));
+    }
+
+    Ok(PathBuf::from(root))
+}
+
+fn append_section_once(
+    path: &Path,
+    marker: &str,
+    section: &str,
+    changed_files: &mut Vec<String>,
+) -> Result<(), AppError> {
+    let current = fs::read_to_string(path).unwrap_or_default();
+    if current.contains(marker) {
+        return Ok(());
+    }
+
+    let mut next = current;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    if !next.is_empty() {
+        next.push('\n');
+    }
+    next.push_str(section.trim_end());
+    next.push('\n');
+
+    fs::write(path, next)
+        .map_err(|e| AppError::Config(format!("Failed to update {}: {e}", path.display())))?;
+    changed_files.push(relative_display(path));
+    Ok(())
+}
+
+fn ensure_gitignore(repo_root: &Path, changed_files: &mut Vec<String>) -> Result<(), AppError> {
+    let path = repo_root.join(".gitignore");
+    let mut current = fs::read_to_string(&path).unwrap_or_default();
+    let mut changed = false;
+    for line in [
+        ".keito/config.yml",
+        ".keito/*.disabled*",
+        "!.keito/config.example.yml",
+    ] {
+        if !current.lines().any(|existing| existing.trim() == line) {
+            if !current.is_empty() && !current.ends_with('\n') {
+                current.push('\n');
+            }
+            current.push_str(line);
+            current.push('\n');
+            changed = true;
+        }
+    }
+
+    if changed {
+        fs::write(&path, current)
+            .map_err(|e| AppError::Config(format!("Failed to update {}: {e}", path.display())))?;
+        changed_files.push(relative_display(&path));
+    }
+
+    Ok(())
+}
+
+fn write_config_example(repo_root: &Path, changed_files: &mut Vec<String>) -> Result<(), AppError> {
+    let path = repo_root.join(".keito").join("config.example.yml");
+    if path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| AppError::Config(format!("Failed to create {}: {e}", parent.display())))?;
+    }
+    fs::write(
+        &path,
+        include_str!("../../skills/keito-time-track/assets/config.example.yml"),
+    )
+    .map_err(|e| AppError::Config(format!("Failed to write {}: {e}", path.display())))?;
+    changed_files.push(relative_display(&path));
+    Ok(())
+}
+
+fn relative_display(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            if name == "config.example.yml" {
+                ".keito/config.example.yml".to_string()
+            } else {
+                name.to_string()
+            }
+        })
+        .unwrap_or_else(|| path.display().to_string())
 }
