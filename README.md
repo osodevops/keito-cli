@@ -1,12 +1,31 @@
-# keito
+# Keito CLI - AI Agent Time Tracking and Billing
 
 [![CI](https://github.com/osodevops/keito-cli/actions/workflows/test.yml/badge.svg)](https://github.com/osodevops/keito-cli/actions/workflows/test.yml)
 
-Track billable time against the [Keito](https://keito.ai) platform — from the terminal or from an AI agent.
+Track billable human and AI agent work in [Keito](https://keito.ai) from the terminal, CI, scripts, or autonomous agent workflows.
+
+`keito` is a command-line interface for AI agencies, professional services teams, and AI-native service companies that need billing-grade records for client work. Use it to start and stop timers, log completed work, map time to Keito projects and tasks, and return structured JSON that agents can safely use without scraping terminal text.
+
+Keito is built for teams selling outcomes with people and AI agents. The CLI helps make that work visible for client billing, project profitability, time tracking, and invoice review.
 
 <p align="center">
   <img src="recordings/time-start-stop-optimised.gif" alt="keito demo" width="720" />
 </p>
+
+## Why Keito CLI?
+
+- **AI agent time tracking** - record billable work from coding agents, automation agents, and human operators in the same Keito workspace.
+- **Client billing for AI work** - attach work to projects and tasks so AI-assisted delivery can be reviewed before invoicing.
+- **Built for AI-native service companies** - support agency, consulting, and professional services teams where delivery is a mix of humans, agents, and automated workflows.
+- **Agent-safe automation** - every command supports JSON output, stable exit codes, explicit errors, and non-interactive execution.
+- **Project margin visibility** - keep service delivery records in Keito so time, billing, and profitability workflows have reliable source data.
+
+Related Keito pages:
+
+- [AI agent billing for agencies and developers](https://keito.ai/agents)
+- [AI agency billing software](https://keito.ai/solutions/ai-agent-cost-tracking/ai-agency-billing-software/)
+- [Billing for AI-native service companies](https://keito.ai/solutions/ai-agent-cost-tracking/ai-native-service-company-billing/)
+- [Professional services AI agent billing](https://keito.ai/solutions/billing/professional-services-ai-agent-billing/)
 
 ## Install
 
