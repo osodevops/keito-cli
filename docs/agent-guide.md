@@ -28,6 +28,47 @@ keito auth status --json
 
 Exit code `0` = ready. Exit code `1` = fix credentials.
 
+## Skill Installation
+
+Install the packaged Keito skill into Claude Code and Codex:
+
+```sh
+keito skill install
+```
+
+Install one host only when needed:
+
+```sh
+keito skill install --agent claude-code
+keito skill install --agent codex
+```
+
+For source-checkout installs, use the gstack-style setup entrypoint:
+
+```sh
+git clone --single-branch --depth 1 https://github.com/osodevops/keito-cli.git ~/.keito/keito-cli
+cd ~/.keito/keito-cli
+./setup
+```
+
+From each client repository, invoke the skill once:
+
+```text
+/track-time-keito
+```
+
+This writes `.keito/config.yml` with the selected Keito client, project, and
+task IDs. Do not commit that file. For shared repositories, run
+`keito skill team-init optional` or `keito skill team-init required` to add
+agent guidance plus `.keito/config.example.yml`.
+
+Check readiness:
+
+```sh
+keito skill doctor
+keito skill status --json
+```
+
 ## Discovery
 
 ### List Projects

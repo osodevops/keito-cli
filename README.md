@@ -4,6 +4,10 @@
 
 Track billable time against the [Keito](https://keito.ai) platform — from the terminal or from an AI agent.
 
+Keito is billing and profitability infrastructure for AI-native services teams:
+agent work is recorded against the same clients, projects, tasks, and invoices
+as human work, with metadata for margin and audit analysis.
+
 <p align="center">
   <img src="recordings/time-start-stop-optimised.gif" alt="keito demo" width="720" />
 </p>
@@ -91,14 +95,137 @@ Exit codes tell you exactly what happened — no need to parse error messages. S
 
 ## Agent Skill
 
-The Keito Agent Skill is installed from the GitHub skill repo, not from an npm package:
+The Keito Agent Skill ships with this CLI. It brings Keito to the places where
+agents already work by installing lifecycle hooks for Claude Code and OpenAI
+Codex CLI, then recording one `source=agent` time entry when a tracked coding
+session ends.
+
+### Requirements
+
+- Claude Code and/or Codex CLI
+- Git, Bash, and `jq`
+- Keito credentials via `keito auth login` or `KEITO_API_KEY` +
+  `KEITO_ACCOUNT_ID`
+- macOS/Linux: `./setup` can install the CLI through Homebrew or release
+  tarballs if `keito` is not already on `PATH`
+- Windows: install the binary from
+  [Releases](https://github.com/osodevops/keito-cli/releases) first, then run
+  the skill commands from Git Bash or WSL where `bash` and `jq` are available
+
+### Step 1: Install on your machine
+
+Open Claude Code or Codex and paste this. The agent can run the same
+source-checkout flow that gstack documents:
 
 ```sh
-keito auth login
+git clone --single-branch --depth 1 https://github.com/osodevops/keito-cli.git ~/.keito/keito-cli
+cd ~/.keito/keito-cli
+./setup
+```
+
+`./setup` installs the CLI if needed, installs the bundled `keito-time-track`
+skill, and configures hooks for Claude Code, Codex, or both. In an interactive
+terminal it asks which host to configure. In non-interactive runs it defaults
+to both.
+
+Target one host explicitly when needed:
+
+```sh
+~/.keito/keito-cli/setup --host claude
+~/.keito/keito-cli/setup --host codex
+~/.keito/keito-cli/setup --host both
+```
+
+If the CLI is already installed, this equivalent command uses the bundled skill
+without the source checkout:
+
+```sh
 keito skill install
 ```
 
-`keito skill install` uses `npx` only to run the open skills installer. The installer package is pinned to `skills@1.5.6` by default and can be overridden intentionally with `KEITO_SKILLS_PACKAGE`.
+Choose one target when needed:
+
+```sh
+keito skill install --agent claude-code
+keito skill install --agent codex
+```
+
+Check readiness:
+
+```sh
+keito skill doctor
+keito skill status --json
+```
+
+### Step 2: Configure each client repo
+
+From each client repository, invoke the skill once to map that worktree to a
+Keito client, project, and task:
+
+```text
+/track-time-keito
+```
+
+This writes `.keito/config.yml`, which is intentionally repo-local and should
+not be committed.
+
+### Team Mode
+
+For shared repos, use the same model as gstack team mode: the skill remains
+globally installed, and the repository commits only agent guidance plus an
+example config.
+
+From inside the shared repo:
+
+```sh
+~/.keito/keito-cli/setup --team optional
+git add AGENTS.md CLAUDE.md .gitignore .keito/config.example.yml
+git commit -m "add Keito tracking guidance for agent work"
+```
+
+Use `required` instead of `optional` when agents must stop before billable
+coding work until `/track-time-keito` has configured the repo:
+
+```sh
+~/.keito/keito-cli/setup --team required
+```
+
+If the CLI is already installed and the global skill is already configured, you
+can run only the repo bootstrap:
+
+```sh
+keito skill team-init optional
+keito skill team-init required
+```
+
+`team-init` writes `AGENTS.md`, `CLAUDE.md`, `.gitignore`, and
+`.keito/config.example.yml`. It does not vendor the skill into the repo. Do not
+commit `.keito/config.yml`; that file contains the local project/task mapping
+created by `/track-time-keito`.
+
+### How It Works
+
+- `./setup` is the gstack-style source-checkout installer. It keeps a stable
+  checkout at `~/.keito/keito-cli`, installs the CLI if needed, then calls
+  `keito skill install --source bundled`.
+- `keito skill install` materializes the bundled `keito-time-track` skill and
+  copies it into agent home directories:
+  `~/.claude/skills/keito-time-track` for Claude Code and
+  `~/.codex/skills/keito-time-track` for Codex.
+- The hook installers merge lifecycle hooks into `~/.claude/settings.json` and
+  `~/.codex/hooks.json` using `jq`.
+- `/track-time-keito` verifies auth, asks for the Keito client/project/task for
+  the current repo, and writes `.keito/config.yml`.
+- On agent session start, the hook records local session state. On session end,
+  the hook logs one Keito time entry with `source=agent` and metadata such as
+  repo path, branch, commit, and agent type.
+
+Audit-first external install remains available:
+
+```sh
+npx --yes skills@1.5.6 add osodevops/keito-skill -g -a codex -a claude-code -s keito-time-track -y --copy
+keito skill install --skip-skills-add
+```
 
 ## Features
 

@@ -626,9 +626,9 @@ struct MetadataInput {
 fn normalize_source(source: &str) -> Result<String, AppError> {
     let normalized = source.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "web" | "cli" | "api" | "agent" => Ok(normalized),
+        "web" | "cli" | "api" | "agent" | "calendar" | "desktop" => Ok(normalized),
         _ => Err(AppError::InvalidInput(format!(
-            "source must be one of: web, cli, api, agent (got '{source}')"
+            "source must be one of: web, cli, api, agent, calendar, desktop (got '{source}')"
         ))),
     }
 }
@@ -751,7 +751,9 @@ mod tests {
     #[test]
     fn source_is_normalized_and_validated() {
         assert_eq!(normalize_source("Agent").unwrap(), "agent");
-        assert!(normalize_source("desktop").is_err());
+        assert_eq!(normalize_source("desktop").unwrap(), "desktop");
+        assert_eq!(normalize_source("Calendar").unwrap(), "calendar");
+        assert!(normalize_source("mobile").is_err());
     }
 
     #[test]
