@@ -3,6 +3,8 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
+#[cfg(unix)]
+use std::process::Command as StdCommand;
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -292,6 +294,54 @@ fn skill_install_configures_agent_hooks_with_fake_skills_cli() {
     assert!(log.contains("-a claude-code"));
     assert!(temp_dir.path().join(".codex/hooks.json").exists());
     assert!(temp_dir.path().join(".claude/settings.json").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn skill_install_uses_bundled_skill_by_default() {
+    if StdCommand::new("jq").arg("--version").output().is_err() {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let output = Command::cargo_bin("keito")
+        .unwrap()
+        .env("HOME", temp_dir.path())
+        .env("XDG_CONFIG_HOME", temp_dir.path().join("config"))
+        .env("APPDATA", temp_dir.path().join("AppData").join("Roaming"))
+        .env("KEITO_API_KEY", "kto_test_key")
+        .env("KEITO_ACCOUNT_ID", "co_test")
+        .args([
+            "--json",
+            "skill",
+            "install",
+            "--agent",
+            "codex",
+            "--agent",
+            "claude-code",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let status_json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(status_json["authenticated"], true);
+    assert_eq!(status_json["codex"]["skill_installed"], true);
+    assert_eq!(status_json["codex"]["hooks_configured"], true);
+    assert_eq!(status_json["claude_code"]["skill_installed"], true);
+    assert_eq!(status_json["claude_code"]["hooks_configured"], true);
+
+    assert!(temp_dir
+        .path()
+        .join(".codex/skills/keito-time-track/SKILL.md")
+        .exists());
+    assert!(temp_dir
+        .path()
+        .join(".claude/skills/keito-time-track/SKILL.md")
+        .exists());
 }
 
 #[tokio::test]

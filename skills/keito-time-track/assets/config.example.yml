@@ -1,0 +1,18 @@
+version: 1
+workspace_id: co_example
+client_id: cli_example
+client_name: "Example Client"
+project_id: prj_example
+project_name: "Example Project"
+task_id: tsk_development
+task_name: "Development"
+agent_tracking:
+  enabled: true
+  source: agent
+  draft: true
+  min_duration_seconds: 60
+  max_duration_seconds: 28800
+  redact_notes: false
+metadata:
+  integration: keito_skill
+  cost_centre: engineering
