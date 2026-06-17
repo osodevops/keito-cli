@@ -131,6 +131,23 @@ session ends.
   [Releases](https://github.com/osodevops/keito-cli/releases) first, then run
   the skill commands from Git Bash or WSL where `bash` and `jq` are available
 
+### Ask Your Agent to Install Keito
+
+Keito is designed to be installed by the coding agent itself. Paste the
+relevant prompt into the agent you use.
+
+Claude Code:
+
+> Install Keito for Claude Code: run **`git clone --single-branch --depth 1 https://github.com/osodevops/keito-cli.git ~/.keito/keito-cli && cd ~/.keito/keito-cli && ./setup --host claude`**. Then run `keito skill doctor`. If Keito is unauthenticated, stop and tell me to run `keito auth login` or set `KEITO_API_KEY` and `KEITO_ACCOUNT_ID`; never ask for or print API keys. After install, ask whether I want to enable tracking in the current repo with `/track-time-keito`, and whether to add team guidance with `keito skill team-init optional` or `keito skill team-init required`.
+
+Codex:
+
+> Install Keito for Codex: run **`git clone --single-branch --depth 1 https://github.com/osodevops/keito-cli.git ~/.keito/keito-cli && cd ~/.keito/keito-cli && ./setup --host codex`**. Then run `keito skill doctor`. If Keito is unauthenticated, stop and tell me to run `keito auth login` or set `KEITO_API_KEY` and `KEITO_ACCOUNT_ID`; never ask for or print API keys. After install, ask whether I want to enable tracking in the current repo with `/track-time-keito`, and whether to add team guidance with `keito skill team-init optional` or `keito skill team-init required`.
+
+Other AI coding agents:
+
+> Install Keito agent time tracking: run **`git clone --single-branch --depth 1 https://github.com/osodevops/keito-cli.git ~/.keito/keito-cli && cd ~/.keito/keito-cli && ./setup --host both`**. Then run `keito skill doctor`. If this agent does not support Keito lifecycle hooks, use the Keito CLI directly with `--json` commands and add repo guidance to `AGENTS.md` that says billable agent work should be tracked through Keito.
+
 ### Step 1: Install on your machine
 
 Open Claude Code or Codex and paste this. The agent can run the same
@@ -238,6 +255,17 @@ created by `/track-time-keito`.
 - On agent session start, the hook records local session state. On session end,
   the hook logs one Keito time entry with `source=agent` and metadata such as
   repo path, branch, commit, and agent type.
+
+### Distribution Model
+
+The default install path is Git-based and auditable: clone this public repo,
+run `./setup`, and install the skill copy bundled with the reviewed CLI
+release. That gives agents a deterministic install path without making npm the
+primary trust boundary.
+
+`npx` remains useful as a convenience for audit-first external installs, but it
+is not required for the bundled path. When using `npx`, pin the installer
+version exactly, inspect the source repo, and avoid `latest` in automation.
 
 Audit-first external install remains available:
 
