@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Keito setup - install the bundled agent skill into Claude Code and/or Codex.
+set -euo pipefail
+
+HOST="auto"
+TEAM_MODE=""
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: ./setup [--host auto|both|claude|codex] [--team optional|required]
+
+Installs the Keito Time Track skill and lifecycle hooks into local agent tools.
+Run from a checkout of keito-cli, or use `keito skill install` directly if the
+CLI is already installed.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host)
+      [ $# -ge 2 ] || { echo "Missing value for --host" >&2; exit 1; }
+      HOST="$2"
+      shift 2
+      ;;
+    --host=*)
+      HOST="${1#--host=}"
+      shift
+      ;;
+    --team)
+      [ $# -ge 2 ] || { echo "Missing value for --team" >&2; exit 1; }
+      TEAM_MODE="$2"
+      shift 2
+      ;;
+    --team=*)
+      TEAM_MODE="${1#--team=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+case "$HOST" in
+  auto|both|claude|codex) ;;
+  *) echo "Unknown --host value: $HOST" >&2; exit 1 ;;
+esac
+
+case "$TEAM_MODE" in
+  ""|optional|required) ;;
+  *) echo "Unknown --team value: $TEAM_MODE" >&2; exit 1 ;;
+esac
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+
+if ! command -v keito >/dev/null 2>&1; then
+  "$script_dir/skills/keito-time-track/scripts/install-cli.sh"
+fi
+
+if ! command -v keito >/dev/null 2>&1; then
+  echo "Keito CLI is still not on PATH after install. Add it to PATH and rerun ./setup." >&2
+  exit 1
+fi
+
+if [ "$HOST" = "auto" ] && [ -t 0 ]; then
+  echo ""
+  echo "Install Keito skill for:"
+  echo ""
+  echo "  1) Claude Code + Codex (recommended)"
+  echo "  2) Claude Code only"
+  echo "  3) Codex only"
+  echo ""
+  printf "Choice [1/2/3] (default: 1): "
+  read -r choice
+  case "${choice:-1}" in
+    2) HOST="claude" ;;
+    3) HOST="codex" ;;
+    *) HOST="both" ;;
+  esac
+elif [ "$HOST" = "auto" ]; then
+  HOST="both"
+fi
+
+args=(skill install --source bundled)
+case "$HOST" in
+  both)
+    ;;
+  claude)
+    args+=(--agent claude-code)
+    ;;
+  codex)
+    args+=(--agent codex)
+    ;;
+esac
+
+keito "${args[@]}"
+
+if ! keito --json auth status >/dev/null 2>&1; then
+  echo ""
+  echo "Keito CLI is installed, but authentication is not ready."
+  echo "Run: keito auth login"
+fi
+
+if [ -n "$TEAM_MODE" ]; then
+  keito skill team-init "$TEAM_MODE"
+fi
+
+echo ""
+echo "Next: cd into each client repo and run /track-time-keito."

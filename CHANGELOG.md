@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.7] - 2026-06-16
+
+### Added
+
+- Bundle the `keito-time-track` agent skill with the CLI so `keito skill install` no longer depends on an external skill repository by default.
+- Add a gstack-style `./setup` entrypoint for source-checkout installs with Claude Code and Codex target selection.
+- Add `keito skill team-init optional|required` to write repo-level agent guidance and `.keito/config.example.yml`.
+- Add packaged lifecycle hook tests that exercise the bundled skill with a fake Keito CLI.
+- Add AI-native services positioning notes for agent billing, project attribution, and client profitability.
+
+### Changed
+
+- Keep the audit-first external skill install path available through `--source` and `--skip-skills-add`.
+- Document the bundled skill install, repo setup workflow, and release positioning in README and the agent guide.
+- Accept `calendar` and `desktop` as time entry source values alongside `web`, `cli`, `api`, and `agent`.
+
 ## [0.1.6] - 2026-05-12
 
 ### Changed

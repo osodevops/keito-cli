@@ -194,7 +194,7 @@ Duration of the time entry. Accepts two formats:
         #[arg(long)]
         billable: Option<bool>,
 
-        /// Source to store on the time entry: web, cli, api, or agent
+        /// Source to store on the time entry: web, cli, api, agent, calendar, or desktop
         #[arg(long, default_value = "cli")]
         source: String,
 
@@ -270,7 +270,7 @@ EXAMPLE:
         #[arg(long)]
         billable: Option<bool>,
 
-        /// Source to store on the time entry: web, cli, api, or agent
+        /// Source to store on the time entry: web, cli, api, agent, calendar, or desktop
         #[arg(long, default_value = "agent")]
         source: String,
 
@@ -328,7 +328,7 @@ EXAMPLES:
         #[arg(long)]
         task: Option<String>,
 
-        /// Filter by source: web, cli, api, or agent
+        /// Filter by source: web, cli, api, agent, calendar, or desktop
         #[arg(long)]
         source: Option<String>,
 
