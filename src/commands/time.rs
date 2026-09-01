@@ -833,7 +833,16 @@ fn prepare_agent_log_metadata(
         "duration_seconds".into(),
         Value::Number(duration_seconds.into()),
     );
-    Ok(Some(Value::Object(map)))
+    let value = Value::Object(map);
+    let size = serde_json::to_string(&value)
+        .map_err(|err| AppError::InvalidInput(format!("failed to serialize metadata: {err}")))?
+        .len();
+    if size > 4096 {
+        return Err(AppError::InvalidInput(
+            "--metadata payload must be 4KB or smaller".into(),
+        ));
+    }
+    Ok(Some(value))
 }
 
 fn insert_string_metadata(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
@@ -971,5 +980,35 @@ mod tests {
 
         assert_eq!(metadata["skill"], "keito-time-track");
         assert_eq!(metadata["duration_seconds"], 900);
+    }
+
+    #[test]
+    fn agent_log_lifecycle_metadata_checks_final_size() {
+        let raw = serde_json::json!({
+            "session_id": "session-123",
+            "padding": "x".repeat(4020),
+        })
+        .to_string();
+        assert!(raw.len() <= 4096);
+
+        let error = prepare_agent_log_metadata(
+            build_metadata(MetadataInput {
+                metadata: Some(raw),
+                session_id: None,
+                agent_id: None,
+                agent_type: None,
+                skill: None,
+            })
+            .unwrap(),
+            "agent",
+            900,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::InvalidInput(message)
+                if message == "--metadata payload must be 4KB or smaller"
+        ));
     }
 }

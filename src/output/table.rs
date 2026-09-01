@@ -196,6 +196,7 @@ fn try_as_clients(arr: &[serde_json::Value]) -> Option<Vec<Client>> {
     let first = arr.first()?.as_object()?;
     if first.contains_key("name")
         && first.contains_key("currency")
+        && !first.contains_key("billable_by_default")
         && !first.contains_key("project_id")
         && !first.contains_key("task_id")
         && !first.contains_key("is_billable")
@@ -347,5 +348,33 @@ fn format_me_table(me_list: &[MeResponse]) -> String {
         Table::new(rows).with(Style::rounded()).to_string()
     } else {
         "No data.".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_with_currency_uses_task_table() {
+        let task = Task {
+            id: "task-1".into(),
+            name: "Development".into(),
+            is_active: true,
+            billable_by_default: true,
+            default_hourly_rate: Some(100.0),
+            effective_billable_rate: Some(120.0),
+            currency: Some("GBP".into()),
+            budget: None,
+            is_default: false,
+            parent_task_id: None,
+            created_at: None,
+            updated_at: None,
+        };
+
+        let output = to_table(&[task]);
+
+        assert!(output.contains("Billable"));
+        assert!(!output.contains("Currency"));
     }
 }
