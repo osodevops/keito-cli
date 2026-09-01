@@ -2,8 +2,8 @@ use clap::{Args, Subcommand};
 
 #[derive(Args)]
 #[command(after_long_help = "\
-NOTE: Tasks in Keito are workspace-global, not scoped to a project. \
-Use `keito projects tasks` to list all available tasks.")]
+NOTE: Task availability can be scoped to a project. Use \
+`keito projects tasks <PROJECT>` before starting or logging time.")]
 pub struct ProjectsCommand {
     #[command(subcommand)]
     pub command: ProjectsSubcommand,
@@ -87,21 +87,26 @@ Project name, code, or numeric ID. Resolution is case-insensitive.")]
         project: String,
     },
 
-    /// List tasks (global — not filtered by project)
+    /// List workspace tasks or tasks assigned to a project
     #[command(long_about = "\
-List tasks available in the current workspace.
+List active tasks available in the current workspace or assigned to a project.
 
-IMPORTANT: Tasks are workspace-global in Keito, not scoped to any \
-particular project. Every task returned here can be used with any project.
+Pass a project name, code, or ID to return only tasks assigned to that project. \
+This is the correct discovery path before tracking time because Keito validates \
+project/task assignments and may also enforce member-specific task restrictions. \
+Without a project, the command returns active workspace-level tasks only.
 
 EXAMPLE:
-  $ keito projects tasks --json
+  $ keito projects tasks \"Acme Website\" --json
   [
     {\"id\": \"tsk_001\", \"name\": \"Development\", ...},
     {\"id\": \"tsk_002\", \"name\": \"Design\", ...},
     ...
   ]")]
     Tasks {
+        /// Project name, code, or ID
+        project: Option<String>,
+
         /// Max results to return
         #[arg(long)]
         limit: Option<u32>,

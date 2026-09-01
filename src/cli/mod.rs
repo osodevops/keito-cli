@@ -42,7 +42,7 @@ EXIT CODES:
 QUICK START (AGENT):
   keito auth status --json          # verify credentials
   keito projects list --json        # discover project IDs
-  keito projects tasks --json       # discover task IDs
+  keito projects tasks <PROJECT> --json  # discover valid task IDs
   keito time start --project <ID> --task <ID> --json
   keito time running --json         # check active timer
   keito time stop --json            # stop when done

@@ -21,6 +21,9 @@ Store API key and configure account ID (interactive, one-time setup).
 
 This command prompts for an API key and account/company ID, validates them \
 against the production v2 API, and stores them in the platform config file. \
+The tracking CLI requires a full-access personal access token bound to a \
+permitted identity. A Personal read-only sync key cannot list tasks or mutate \
+time, so login rejects it. \
 For non-interactive / agent use, set the KEITO_API_KEY and KEITO_ACCOUNT_ID \
 environment variables instead.
 
@@ -40,8 +43,9 @@ EXAMPLE:
     #[command(long_about = "\
 Check authentication status and credential source.
 
-Returns which credential source is active and whether it is valid. \
-Useful as a health check before starting a session.
+Returns which credential source is active, whether it is valid, and whether it \
+can be used by the tracking CLI. Personal read-only sync credentials and invalid \
+credentials return exit code 1. Useful as a health check before a session.
 
 EXAMPLE (JSON):
   $ keito auth status --json
@@ -49,12 +53,16 @@ EXAMPLE (JSON):
     \"authenticated\": true,
     \"api_key_source\": \"environment variable\",
     \"account_id\": \"co_abc123\",
-    \"workspace_id\": \"co_abc123\"
+    \"workspace_id\": \"co_abc123\",
+    \"api_key_valid\": true,
+    \"credential_type\": \"full_access\",
+    \"cli_compatible\": true,
+    \"can_track_time\": true
   }
 
 EXIT CODES:
   0   Authenticated
-  1   Not authenticated (no valid credentials found)")]
+  1   Missing, invalid, or non-CLI-compatible credentials")]
     Status,
 
     /// Show current user identity and account info

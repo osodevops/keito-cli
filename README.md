@@ -62,6 +62,8 @@ keito auth login
 
 This prompts for your API key (`kto_...`) and account/company ID, validates them against the production v2 API, and stores them in the platform config file. On macOS this is `~/Library/Application Support/keito/config.toml`; on Linux this is typically `~/.config/keito/config.toml`. Find the Company ID in Keito under Settings > API & Developers > Company ID.
 
+The tracking CLI requires a CLI-compatible full-access Personal Access Token bound to an identity with the relevant Keito permissions. The **Personal read-only sync key** shown to members is deliberately limited to read-only sync endpoints: it cannot list tasks or create, update, stop, or discard time. `keito auth login` and `keito auth status` reject that key with exit code `1` instead of reporting a response parsing error. If that is the only credential your workspace exposes, the workspace must provision a supported CLI credential before time tracking can work.
+
 For agent / CI use, set environment variables instead:
 
 ```sh
@@ -77,7 +79,7 @@ keito auth whoami
 
 # Browse projects and tasks
 keito projects list
-keito projects tasks
+keito projects tasks "Acme Website"
 
 # Start a timer
 keito time start --project "Acme Website" --task dev
@@ -102,7 +104,7 @@ keito auth status --json
 
 # Discover projects and tasks
 keito projects list --json
-keito projects tasks --json
+keito projects tasks "Acme Website" --json
 
 # Start → work → stop
 keito time start --project "Acme Website" --task dev --json
@@ -281,7 +283,7 @@ keito skill install --skip-skills-add
 - **Exit codes 0–8** — every failure mode has a unique code for programmatic handling
 - **Name resolution** — use project names, codes, or IDs interchangeably (case-insensitive)
 - **Config-backed auth** — long-lived API keys are stored in a local `config.toml` for agent-friendly execution
-- **Retry logic** — 3× exponential backoff for network and server errors
+- **Safe retries** — mutation idempotency keys, exponential backoff for transient server/network errors, and `Retry-After` handling
 - **Cross-platform** — macOS, Linux, Windows
 
 ## Commands
@@ -299,7 +301,7 @@ keito skill install --skip-skills-add
 | `keito time running` | Show the currently running timer |
 | `keito projects list` | List available projects in the workspace |
 | `keito projects show` | Show project details by name, code, or ID |
-| `keito projects tasks` | List tasks (global, not per-project) |
+| `keito projects tasks [PROJECT]` | List workspace tasks or tasks assigned to a project |
 
 Run `keito <command> --help` for detailed usage, examples, and exit codes.
 
@@ -360,10 +362,12 @@ $ keito time list --limit 2
 [
   {
     "id": "te_abc123",
-    "project": "Acme Website",
-    "task": "Development",
-    "duration": 1.5,
-    "date": "2025-01-15",
+    "project": { "id": "prj_abc", "name": "Acme Website" },
+    "task": { "id": "tsk_dev", "name": "Development" },
+    "spent_date": "2025-01-15",
+    "hours": 1.5,
+    "duration_seconds": 5400,
+    "rounded_hours": 1.5,
     "billable": true
   }
 ]
@@ -374,11 +378,11 @@ $ keito time list --limit 2
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | Authentication error (missing or invalid API key) |
+| 1 | Authentication/permission error (including a non-CLI-compatible sync key) |
 | 2 | Invalid input (bad arguments, malformed duration) |
 | 3 | Conflict (e.g. timer already running) |
 | 4 | Not found (project, task, or entry does not exist) |
-| 5 | Rate limited (retry after a moment) |
+| 5 | Rate limited (`details.retry_after_seconds` is included when supplied) |
 | 6 | Server error (Keito API 5xx) |
 | 7 | Network error (connection failed, timeout) |
 | 8 | Configuration error (missing config, bad TOML) |

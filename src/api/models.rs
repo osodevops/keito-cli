@@ -6,12 +6,65 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedReference {
     pub id: String,
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 // -- User / Me --
 
-pub type Company = NamedReference;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Company {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_rounding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_past_timer_starts: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_future_expense_dates: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_time_notes_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_time_notes_visibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_entry_notes_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_billability_overrides_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MeCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_track_time: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_track_expenses: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_edit_time_billability: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_create_field_clients: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_view_team_time: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_view_invoices: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_send_invoices: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_record_invoice_payments: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_read_own_time_entries: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_read_users: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_read_own_profile: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_read_clients: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_read_projects: Option<bool>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeResponse {
@@ -22,15 +75,38 @@ pub struct MeResponse {
     pub last_name: Option<String>,
     #[serde(default)]
     pub email: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telephone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_access_to_all_future_projects: Option<bool>,
+    #[serde(default)]
+    pub is_contractor: bool,
     #[serde(default)]
     pub is_active: bool,
     #[serde(default)]
     pub roles: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_type: Option<String>,
-    pub company: Company,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_capacity: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_hourly_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company: Option<Company>,
+    #[serde(default)]
+    pub capabilities: MeCapabilities,
 }
 
 impl MeResponse {
@@ -45,6 +121,22 @@ impl MeResponse {
             self.email.clone()
         }
     }
+
+    pub fn is_personal_read_only_sync(&self) -> bool {
+        self.company.is_none()
+            && self.capabilities.can_read_own_time_entries == Some(true)
+            && self.capabilities.can_read_own_profile == Some(true)
+    }
+
+    pub fn credential_type(&self) -> &'static str {
+        if self.is_personal_read_only_sync() {
+            "personal_read_only_sync"
+        } else if self.company.is_some() {
+            "full_access"
+        } else {
+            "unknown"
+        }
+    }
 }
 
 // -- Clients --
@@ -57,6 +149,18 @@ pub struct Client {
     pub currency: Option<String>,
     #[serde(default)]
     pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_terms: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tax: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tax2: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discount: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement_key: Option<String>,
     #[serde(default)]
     pub is_active: bool,
     #[serde(default)]
@@ -81,9 +185,19 @@ pub struct Project {
     pub id: String,
     #[serde(default)]
     pub client: Option<NamedReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<OwnerReference>,
     pub name: String,
     #[serde(default)]
     pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_code: Option<String>,
     #[serde(default)]
     pub is_active: bool,
     #[serde(default)]
@@ -100,13 +214,45 @@ pub struct Project {
     pub budget_by: Option<String>,
     #[serde(default)]
     pub budget: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_is_monthly: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_counts_billable_hours_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_when_over_budget: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_budget_notification_percentage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_budget_to_all: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_budget: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_budget_include_expenses: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_on: Option<NaiveDate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ends_on: Option<NaiveDate>,
     #[serde(default)]
     pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<Task>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnerReference {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub email: String,
 }
 
 impl Project {
     pub fn client_name(&self) -> Option<&str> {
-        self.client.as_ref().map(|client| client.name.as_str())
+        self.client.as_ref()?.name.as_deref()
     }
 }
 
@@ -140,10 +286,20 @@ pub struct Task {
     pub billable_by_default: bool,
     #[serde(default)]
     pub default_hourly_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_billable_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<f64>,
     #[serde(default)]
     pub is_default: bool,
     #[serde(default)]
     pub parent_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 // -- Time Entries --
@@ -163,14 +319,24 @@ pub struct TimeEntry {
     pub project_id: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_assignment: Option<SyncTaskAssignment>,
     #[serde(default, rename = "spent_date", alias = "date")]
     pub spent_date: Option<NaiveDate>,
     #[serde(default)]
     pub hours: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounded_hours: Option<f64>,
     #[serde(default)]
     pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_notes: Option<String>,
     #[serde(default, alias = "is_billable")]
     pub billable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_edit_billable: Option<bool>,
     #[serde(default)]
     pub is_running: bool,
     #[serde(default)]
@@ -195,19 +361,49 @@ pub struct TimeEntry {
     pub source: Option<String>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_reference: Option<ExternalReference>,
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncTaskAssignment {
+    pub id: String,
+    pub billable: bool,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalReference {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permalink: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+}
+
 impl TimeEntry {
     pub fn project_name(&self) -> Option<&str> {
-        self.project.as_ref().map(|project| project.name.as_str())
+        self.project.as_ref()?.name.as_deref()
     }
 
     pub fn task_name(&self) -> Option<&str> {
-        self.task.as_ref().map(|task| task.name.as_str())
+        self.task.as_ref()?.name.as_deref()
+    }
+
+    pub fn actual_hours(&self) -> Option<f64> {
+        self.duration_seconds
+            .map(|seconds| seconds as f64 / 3600.0)
+            .or(self.hours)
     }
 }
 
@@ -244,8 +440,6 @@ pub struct UpdateTimeEntryRequest {
     pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spent_date: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_running: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

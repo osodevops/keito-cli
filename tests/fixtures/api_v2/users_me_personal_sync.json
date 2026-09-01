@@ -1,0 +1,16 @@
+{
+  "id": "usr_support",
+  "first_name": "Support",
+  "last_name": "User",
+  "email": "support@keito.ai",
+  "is_active": true,
+  "is_contractor": false,
+  "roles": ["member"],
+  "capabilities": {
+    "can_read_own_time_entries": true,
+    "can_read_users": true,
+    "can_read_own_profile": true,
+    "can_read_clients": true,
+    "can_read_projects": true
+  }
+}

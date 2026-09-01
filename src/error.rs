@@ -16,7 +16,7 @@ pub enum AppError {
     NotFound(String),
 
     #[error("Rate limited — please retry after a moment")]
-    RateLimited,
+    RateLimited { retry_after_seconds: Option<u64> },
 
     #[error("Server error: {0}")]
     ServerError(String),
@@ -35,7 +35,7 @@ impl AppError {
             AppError::InvalidInput(_) => 2,
             AppError::Conflict(_) => 3,
             AppError::NotFound(_) => 4,
-            AppError::RateLimited => 5,
+            AppError::RateLimited { .. } => 5,
             AppError::ServerError(_) => 6,
             AppError::Network(_) => 7,
             AppError::Config(_) => 8,
@@ -51,10 +51,22 @@ impl AppError {
             AppError::NotFound(msg) if msg.contains("Project") => {
                 Some("keito projects list --json")
             }
-            AppError::NotFound(msg) if msg.contains("Task") => Some("keito projects tasks --json"),
+            AppError::NotFound(msg) if msg.contains("Task") => {
+                Some("keito projects tasks <PROJECT> --json")
+            }
+            AppError::Auth(msg)
+                if msg.contains("read-only sync")
+                    || msg.contains("scope does not allow")
+                    || msg.contains("Insufficient permissions")
+                    || msg.contains("permission") =>
+            {
+                Some(
+                    "Use a CLI-compatible key with the required permission; personal read-only sync keys cannot track time",
+                )
+            }
             AppError::Auth(_) => Some("Set KEITO_API_KEY env var or run 'keito auth login'"),
             AppError::Config(_) => Some("Run 'keito auth login' to configure"),
-            AppError::RateLimited => Some("Retry after a moment"),
+            AppError::RateLimited { .. } => Some("Retry after the server's Retry-After delay"),
             _ => None,
         }
     }
@@ -77,6 +89,9 @@ impl AppError {
                 }
                 None
             }
+            AppError::RateLimited {
+                retry_after_seconds: Some(seconds),
+            } => Some(json!({"retry_after_seconds": seconds})),
             _ => None,
         }
     }
@@ -108,7 +123,13 @@ mod tests {
         assert_eq!(AppError::InvalidInput("x".into()).exit_code(), 2);
         assert_eq!(AppError::Conflict("x".into()).exit_code(), 3);
         assert_eq!(AppError::NotFound("x".into()).exit_code(), 4);
-        assert_eq!(AppError::RateLimited.exit_code(), 5);
+        assert_eq!(
+            AppError::RateLimited {
+                retry_after_seconds: None
+            }
+            .exit_code(),
+            5
+        );
         assert_eq!(AppError::ServerError("x".into()).exit_code(), 6);
         assert_eq!(AppError::Network("x".into()).exit_code(), 7);
         assert_eq!(AppError::Config("x".into()).exit_code(), 8);
@@ -142,6 +163,23 @@ mod tests {
             err.suggestion(),
             Some("Set KEITO_API_KEY env var or run 'keito auth login'")
         );
+    }
+
+    #[test]
+    fn read_only_scope_error_has_credential_recovery() {
+        let err = AppError::Auth(
+            "API key scope does not allow GET /api/v2/tasks (personal read-only sync key)".into(),
+        );
+        assert!(err.suggestion().unwrap().contains("CLI-compatible key"));
+    }
+
+    #[test]
+    fn rate_limit_json_includes_retry_after() {
+        let err = AppError::RateLimited {
+            retry_after_seconds: Some(60),
+        };
+        let json: serde_json::Value = serde_json::from_str(&err.to_json()).unwrap();
+        assert_eq!(json["details"]["retry_after_seconds"], 60);
     }
 
     #[test]

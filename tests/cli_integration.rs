@@ -1,5 +1,6 @@
 #![allow(deprecated)]
 use assert_cmd::Command;
+use chrono::Local;
 use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
@@ -476,6 +477,7 @@ async fn time_session_record_creates_agent_entry_against_mock_api() {
 
     Mock::given(method("GET"))
         .and(path("/api/v2/tasks"))
+        .and(query_param("project_id", "p1"))
         .and(header("Authorization", "Bearer kto_test_key"))
         .and(header("Keito-Account-Id", "co_test"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -522,7 +524,8 @@ async fn time_session_record_creates_agent_entry_against_mock_api() {
                 "session_id": "sess_123",
                 "agent_id": "codex",
                 "agent_type": "codex",
-                "skill": "keito-agent"
+                "skill": "keito-time-track",
+                "duration_seconds": 5400
             }
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -567,12 +570,327 @@ async fn time_session_record_creates_agent_entry_against_mock_api() {
             "--agent-type",
             "codex",
             "--skill",
-            "keito-agent",
+            "keito-time-track",
         ])
         .assert()
         .success()
         .stdout(predicate::str::contains(r#""status": "created""#))
         .stdout(predicate::str::contains(r#""session_id": "sess_123""#));
+}
+
+#[tokio::test]
+async fn time_start_uses_tasks_embedded_for_selected_project() {
+    let server = MockServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_test_config(temp_dir.path(), &server.uri());
+    let spent_date = Local::now().format("%Y-%m-%d").to_string();
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/time_entries"))
+        .and(query_param("is_running", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "time_entries": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/projects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "projects": [{
+                "id": "p1",
+                "client": { "id": "c1", "name": "Client A" },
+                "name": "Project A",
+                "code": "PA",
+                "is_active": true,
+                "is_billable": true,
+                "tasks": [{
+                    "id": "t1",
+                    "name": "Development",
+                    "billable_by_default": true,
+                    "is_active": true
+                }]
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/time_entries"))
+        .and(body_json(serde_json::json!({
+            "project_id": "p1",
+            "task_id": "t1",
+            "spent_date": spent_date,
+            "is_running": true,
+            "source": "cli"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "te_running",
+            "project": { "id": "p1", "name": "Project A" },
+            "task": { "id": "t1", "name": "Development" },
+            "project_id": "p1",
+            "task_id": "t1",
+            "spent_date": spent_date,
+            "hours": 0,
+            "duration_seconds": 0,
+            "rounded_hours": 0,
+            "billable": true,
+            "is_running": true,
+            "source": "cli",
+            "timer_started_at": "2026-09-01T09:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    command_with_mock_config(temp_dir.path(), &server.uri())
+        .args([
+            "--json",
+            "time",
+            "start",
+            "--project",
+            "PA",
+            "--task",
+            "Development",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""status": "started""#));
+}
+
+#[tokio::test]
+async fn time_running_returns_an_object_when_active() {
+    let server = MockServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_test_config(temp_dir.path(), &server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/time_entries"))
+        .and(query_param("is_running", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            include_str!("fixtures/api_v2/time_entry_running.json"),
+            "application/json",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = command_with_mock_config(temp_dir.path(), &server.uri())
+        .args(["--json", "time", "running"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value.is_object());
+    assert_eq!(value["running"], true);
+    assert_eq!(value["entry_id"], "te_running");
+}
+
+#[tokio::test]
+async fn time_running_returns_an_object_when_inactive() {
+    let server = MockServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_test_config(temp_dir.path(), &server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/time_entries"))
+        .and(query_param("is_running", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "time_entries": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = command_with_mock_config(temp_dir.path(), &server.uri())
+        .args(["--json", "time", "running"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value.is_object());
+    assert_eq!(value["running"], false);
+}
+
+#[tokio::test]
+async fn time_session_record_update_omits_removed_is_running_field() {
+    let server = MockServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_test_config(temp_dir.path(), &server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/projects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "projects": [{
+                "id": "p1",
+                "client": { "id": "c1", "name": "Client A" },
+                "name": "Project A",
+                "code": "PA",
+                "is_active": true,
+                "is_billable": true,
+                "tasks": [{
+                    "id": "t1",
+                    "name": "Development",
+                    "billable_by_default": true,
+                    "is_active": true
+                }]
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/time_entries"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "time_entries": [{
+                "id": "te_agent",
+                "project_id": "p1",
+                "task_id": "t1",
+                "spent_date": "2026-09-01",
+                "hours": 1,
+                "billable": true,
+                "is_running": false,
+                "source": "agent",
+                "metadata": {
+                    "skill": "keito-time-track",
+                    "session_id": "sess_update",
+                    "duration_seconds": 3600
+                }
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/api/v2/time_entries/te_agent"))
+        .and(body_json(serde_json::json!({
+            "project_id": "p1",
+            "task_id": "t1",
+            "spent_date": "2026-09-01",
+            "hours": 1.5,
+            "metadata": {
+                "skill": "keito-time-track",
+                "session_id": "sess_update",
+                "duration_seconds": 5400
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "te_agent",
+            "project": { "id": "p1", "name": "Project A" },
+            "task": { "id": "t1", "name": "Development" },
+            "project_id": "p1",
+            "task_id": "t1",
+            "spent_date": "2026-09-01",
+            "hours": 1.5,
+            "duration_seconds": 5400,
+            "rounded_hours": 1.5,
+            "billable": true,
+            "is_running": false,
+            "source": "agent",
+            "metadata": {
+                "skill": "keito-time-track",
+                "session_id": "sess_update",
+                "duration_seconds": 5400
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    command_with_mock_config(temp_dir.path(), &server.uri())
+        .args([
+            "--json",
+            "time",
+            "session-record",
+            "--project",
+            "PA",
+            "--task",
+            "Development",
+            "--session-id",
+            "sess_update",
+            "--duration-seconds",
+            "5400",
+            "--date",
+            "2026-09-01",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""status": "updated""#));
+}
+
+#[tokio::test]
+async fn auth_status_rejects_personal_sync_key_with_actionable_error() {
+    let server = MockServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_test_config(temp_dir.path(), &server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/users/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "usr_support",
+            "first_name": "Support",
+            "last_name": "User",
+            "email": "support@keito.ai",
+            "is_active": true,
+            "is_contractor": false,
+            "roles": ["member"],
+            "capabilities": {
+                "can_read_own_time_entries": true,
+                "can_read_users": true,
+                "can_read_own_profile": true,
+                "can_read_clients": true,
+                "can_read_projects": true
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    command_with_mock_config(temp_dir.path(), &server.uri())
+        .args(["--json", "auth", "status"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("personal read-only sync key"))
+        .stderr(predicate::str::contains("missing field `company`").not());
+}
+
+#[tokio::test]
+async fn auth_whoami_can_render_personal_sync_identity() {
+    let server = MockServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_test_config(temp_dir.path(), &server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/users/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "usr_support",
+            "first_name": "Support",
+            "last_name": "User",
+            "email": "support@keito.ai",
+            "is_active": true,
+            "roles": ["member"],
+            "capabilities": {
+                "can_read_own_time_entries": true,
+                "can_read_own_profile": true
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    command_with_mock_config(temp_dir.path(), &server.uri())
+        .args(["--json", "auth", "whoami"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("support@keito.ai"))
+        .stdout(predicate::str::contains(r#""company""#).not());
 }
 
 #[test]

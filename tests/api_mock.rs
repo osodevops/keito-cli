@@ -1,5 +1,6 @@
-use chrono::{Duration as ChronoDuration, Utc};
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use wiremock::matchers::{body_json, header, header_regex, method, path, query_param};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 use keito_cli::api::client::KeitorClient;
@@ -16,6 +17,9 @@ fn test_auth(workspace_id: &str) -> ResolvedAuth {
 fn fixture(name: &str) -> serde_json::Value {
     let contents = match name {
         "users_me" => include_str!("fixtures/api_v2/users_me.json"),
+        "users_me_personal_sync" => {
+            include_str!("fixtures/api_v2/users_me_personal_sync.json")
+        }
         "clients_list" => include_str!("fixtures/api_v2/clients_list.json"),
         "projects_list" => include_str!("fixtures/api_v2/projects_list.json"),
         "tasks_list" => include_str!("fixtures/api_v2/tasks_list.json"),
@@ -58,7 +62,29 @@ async fn get_me_success() {
 
     assert_eq!(me.display_name(), "Test User");
     assert_eq!(me.email, "test@test.com");
-    assert_eq!(me.company.name, "Test Co");
+    assert_eq!(me.company.as_ref().unwrap().name, "Test Co");
+    assert_eq!(me.credential_type(), "full_access");
+    assert!(!me.is_personal_read_only_sync());
+}
+
+#[tokio::test]
+async fn get_me_accepts_personal_sync_shape_without_company() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/users/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("users_me_personal_sync")))
+        .mount(&server)
+        .await;
+
+    let auth = test_auth("co_test");
+    let client = KeitorClient::new(&auth, &server.uri()).unwrap();
+    let me = client.get_me().await.unwrap();
+
+    assert_eq!(me.email, "support@keito.ai");
+    assert!(me.company.is_none());
+    assert!(me.is_personal_read_only_sync());
+    assert_eq!(me.credential_type(), "personal_read_only_sync");
 }
 
 #[tokio::test]
@@ -314,6 +340,27 @@ async fn list_tasks_success() {
 }
 
 #[tokio::test]
+async fn list_tasks_can_be_scoped_to_project() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/tasks"))
+        .and(query_param("project_id", "p1"))
+        .and(query_param("is_active", "true"))
+        .and(query_param("per_page", "200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("tasks_list")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let auth = test_auth("co_test");
+    let client = KeitorClient::new(&auth, &server.uri()).unwrap();
+    let tasks = client.list_tasks_for_project(Some("p1")).await.unwrap();
+
+    assert_eq!(tasks.len(), 2);
+}
+
+#[tokio::test]
 async fn list_time_entries_success() {
     let server = MockServer::start().await;
 
@@ -347,6 +394,10 @@ async fn create_time_entry_success() {
         .and(path("/api/v2/time_entries"))
         .and(header("Authorization", "Bearer kto_test_key"))
         .and(header("Keito-Account-Id", "co_test"))
+        .and(header("X-Keito-Client", "cli"))
+        .and(header("X-Keito-Client-Version", env!("CARGO_PKG_VERSION")))
+        .and(header_regex("User-Agent", r"^keito-cli/\d+\.\d+\.\d+$"))
+        .and(header_regex("Idempotency-Key", r"^keito-cli-\d+-\d+-\d+$"))
         .and(body_json(serde_json::json!({
             "project_id": "p1",
             "task_id": "t1",
@@ -389,6 +440,65 @@ async fn create_time_entry_success() {
 }
 
 #[tokio::test]
+async fn mutation_retry_reuses_idempotency_key_and_retry_after() {
+    let server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let response_body = fixture("time_entry_create");
+    let responder_attempts = Arc::clone(&attempts);
+    let responder_keys = Arc::clone(&keys);
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/time_entries"))
+        .respond_with(move |request: &Request| {
+            let key = request
+                .headers
+                .get("Idempotency-Key")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            responder_keys.lock().unwrap().push(key);
+            if responder_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503)
+                    .insert_header("Retry-After", "0")
+                    .set_body_json(serde_json::json!({
+                        "error": "service unavailable",
+                        "message": "Task reference data is temporarily at capacity."
+                    }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(response_body.clone())
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let auth = test_auth("co_test");
+    let client = KeitorClient::new(&auth, &server.uri()).unwrap();
+    let request = keito_cli::api::models::CreateTimeEntryRequest {
+        project_id: "p1".into(),
+        task_id: "t1".into(),
+        spent_date: "2026-03-04".into(),
+        hours: Some(1.5),
+        notes: Some("test".into()),
+        billable: Some(true),
+        is_running: false,
+        started_time: None,
+        ended_time: None,
+        source: Some("cli".into()),
+        metadata: None,
+    };
+
+    let entry = client.create_time_entry(&request).await.unwrap();
+    assert_eq!(entry.id, "te_1");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let keys = keys.lock().unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0], keys[1]);
+}
+
+#[tokio::test]
 async fn update_time_entry_success() {
     let server = MockServer::start().await;
 
@@ -397,7 +507,6 @@ async fn update_time_entry_success() {
         .and(header("Authorization", "Bearer kto_test_key"))
         .and(header("Keito-Account-Id", "co_test"))
         .and(body_json(serde_json::json!({
-            "is_running": false,
             "hours": 1.5
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("time_entry_create")))
@@ -411,7 +520,6 @@ async fn update_time_entry_success() {
         project_id: None,
         task_id: None,
         spent_date: None,
-        is_running: Some(false),
         notes: None,
         hours: Some(1.5),
         billable: None,
@@ -493,7 +601,7 @@ async fn stop_time_entry_not_running_conflict() {
 }
 
 #[tokio::test]
-async fn stop_time_entry_compat_falls_back_when_stop_route_is_missing() {
+async fn stop_time_entry_does_not_emulate_a_missing_production_route() {
     let server = MockServer::start().await;
 
     Mock::given(method("PATCH"))
@@ -506,51 +614,11 @@ async fn stop_time_entry_compat_falls_back_when_stop_route_is_missing() {
         .mount(&server)
         .await;
 
-    Mock::given(method("POST"))
-        .and(path("/api/v2/time_entries"))
-        .and(header("Authorization", "Bearer kto_test_key"))
-        .and(header("Keito-Account-Id", "co_test"))
-        .and(body_json(serde_json::json!({
-            "project_id": "p1",
-            "task_id": "t1",
-            "spent_date": "2026-03-04",
-            "hours": 1.5,
-            "notes": "done",
-            "billable": true,
-            "is_running": false,
-            "started_time": "09:00",
-            "source": "cli",
-            "metadata": {"tool": "keito-cli"}
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("time_entry_create")))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    Mock::given(method("DELETE"))
-        .and(path("/api/v2/time_entries/te_running"))
-        .and(header("Authorization", "Bearer kto_test_key"))
-        .and(header("Keito-Account-Id", "co_test"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
-
     let auth = test_auth("co_test");
     let client = KeitorClient::new(&auth, &server.uri()).unwrap();
-    let mut timer: keito_cli::api::models::TimeEntry =
-        serde_json::from_value(fixture("time_entry_running")["time_entries"][0].clone()).unwrap();
-    let started_at = Utc::now() - ChronoDuration::minutes(90);
-    timer.timer_started_at = Some(started_at);
-    timer.created_at = Some(started_at);
+    let result = client.stop_time_entry("te_running", Some("done")).await;
 
-    let entry = client
-        .stop_time_entry_compat(&timer, Some("done"))
-        .await
-        .unwrap();
-
-    assert_eq!(entry.id, "te_1");
-    assert!(!entry.is_running);
+    assert_eq!(result.unwrap_err().exit_code(), 4);
 }
 
 #[tokio::test]
@@ -577,6 +645,11 @@ async fn delete_time_entry_success() {
 
     Mock::given(method("DELETE"))
         .and(path("/api/v2/time_entries/te_1"))
+        .and(header(
+            "X-Keito-Time-Entry-Delete-Intent",
+            "discard-running",
+        ))
+        .and(header_regex("Idempotency-Key", r"^keito-cli-\d+-\d+-\d+$"))
         .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
@@ -594,7 +667,14 @@ async fn rate_limited_error() {
 
     Mock::given(method("GET"))
         .and(path("/api/v2/users/me"))
-        .respond_with(ResponseTemplate::new(429))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "60")
+                .set_body_json(serde_json::json!({
+                    "error": "rate limited",
+                    "message": "Too many API requests. Retry in 60 seconds."
+                })),
+        )
         .mount(&server)
         .await;
 
@@ -602,6 +682,7 @@ async fn rate_limited_error() {
     let client = KeitorClient::new(&auth, &server.uri()).unwrap();
     let result = client.get_me().await;
 
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().exit_code(), 5);
+    let err = result.unwrap_err();
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(err.details().unwrap()["retry_after_seconds"], 60);
 }
