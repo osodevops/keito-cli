@@ -2,7 +2,9 @@ use chrono::{DateTime, Local, Utc};
 use colored::Colorize;
 use serde_json::{Map, Value};
 
-use crate::api::models::{CreateTimeEntryRequest, TimeEntry, UpdateTimeEntryRequest};
+use crate::api::models::{
+    CreateTimeEntryRequest, Project, Task, TimeEntry, UpdateTimeEntryRequest,
+};
 use crate::api::KeitorClient;
 use crate::cli::time::{TimeCommand, TimeSubcommand};
 use crate::cli::GlobalFlags;
@@ -142,7 +144,7 @@ async fn start(
     let project_id = resolve_name_to_id(project_query, &project_items, "Project")?.to_string();
 
     // Resolve task
-    let tasks = client.list_tasks().await?;
+    let tasks = tasks_for_resolved_project(&client, &projects, &project_id).await?;
     let task_items: Vec<(String, String, Option<String>)> = tasks
         .iter()
         .map(|t| (t.id.clone(), t.name.clone(), None))
@@ -229,9 +231,7 @@ async fn stop(
         return Ok(());
     }
 
-    let entry = client
-        .stop_time_entry_compat(&timer, notes.as_deref())
-        .await?;
+    let entry = client.stop_time_entry(&timer.id, notes.as_deref()).await?;
 
     if mode == OutputMode::Json {
         let out = serde_json::json!({
@@ -239,8 +239,10 @@ async fn stop(
             "entry_id": entry.id,
             "project": entry.project_name(),
             "task": entry.task_name(),
-            "duration_hours": entry.hours,
-            "duration": entry.hours.map(format_duration),
+            "duration_hours": entry.actual_hours(),
+            "duration_seconds": entry.duration_seconds,
+            "rounded_hours": entry.rounded_hours,
+            "duration": entry.actual_hours().map(format_duration),
             "spent_date": entry.spent_date,
             "billable": entry.billable,
             "source": entry.source,
@@ -252,7 +254,10 @@ async fn stop(
         println!(
             "{} Timer stopped — {} for {} / {}",
             "Stopped!".green().bold(),
-            entry.hours.map(format_duration).unwrap_or_default(),
+            entry
+                .actual_hours()
+                .map(format_duration)
+                .unwrap_or_default(),
             entry.project_name().unwrap_or("?"),
             entry.task_name().unwrap_or("?"),
         );
@@ -282,14 +287,20 @@ async fn log_entry(
     skill: Option<String>,
 ) -> Result<(), AppError> {
     let hours = hours_from_duration_inputs(duration_str.as_deref(), duration_seconds)?;
+    let metadata_duration_seconds =
+        duration_seconds.unwrap_or_else(|| (hours * 3600.0).round() as u64);
     let source = normalize_source(&source)?;
-    let metadata = build_metadata(MetadataInput {
-        metadata,
-        session_id,
-        agent_id,
-        agent_type,
-        skill,
-    })?;
+    let metadata = prepare_agent_log_metadata(
+        build_metadata(MetadataInput {
+            metadata,
+            session_id,
+            agent_id,
+            agent_type,
+            skill,
+        })?,
+        &source,
+        metadata_duration_seconds,
+    )?;
 
     let auth = ResolvedAuth::resolve(global)?;
     let config = AppConfig::load()?;
@@ -304,7 +315,7 @@ async fn log_entry(
     let project_id = resolve_name_to_id(project_query, &project_items, "Project")?.to_string();
 
     // Resolve task
-    let tasks = client.list_tasks().await?;
+    let tasks = tasks_for_resolved_project(&client, &projects, &project_id).await?;
     let task_items: Vec<(String, String, Option<String>)> = tasks
         .iter()
         .map(|t| (t.id.clone(), t.name.clone(), None))
@@ -335,8 +346,10 @@ async fn log_entry(
             "entry_id": entry.id,
             "project": entry.project_name(),
             "task": entry.task_name(),
-            "duration_hours": entry.hours,
-            "duration": entry.hours.map(format_duration),
+            "duration_hours": entry.actual_hours(),
+            "duration_seconds": entry.duration_seconds,
+            "rounded_hours": entry.rounded_hours,
+            "duration": entry.actual_hours().map(format_duration),
             "spent_date": entry.spent_date,
             "date": entry.spent_date,
             "billable": entry.billable,
@@ -347,7 +360,10 @@ async fn log_entry(
         println!(
             "{} Logged {} for {} / {}",
             "Logged!".green().bold(),
-            entry.hours.map(format_duration).unwrap_or_default(),
+            entry
+                .actual_hours()
+                .map(format_duration)
+                .unwrap_or_default(),
             entry.project_name().unwrap_or("?"),
             entry.task_name().unwrap_or("?"),
         );
@@ -386,14 +402,17 @@ async fn session_record(
         .as_deref()
         .map(local_time_from_rfc3339)
         .transpose()?;
-    let metadata = build_metadata(MetadataInput {
-        metadata,
-        session_id: Some(session_id.clone()),
-        agent_id,
-        agent_type,
-        skill,
-    })?
-    .unwrap_or_else(|| serde_json::json!({ "session_id": session_id.clone() }));
+    let metadata = build_session_metadata(
+        MetadataInput {
+            metadata,
+            session_id: Some(session_id.clone()),
+            agent_id,
+            agent_type,
+            skill,
+        },
+        duration_seconds,
+        &source,
+    )?;
 
     let auth = ResolvedAuth::resolve(global)?;
     let config = AppConfig::load()?;
@@ -406,7 +425,7 @@ async fn session_record(
         .collect();
     let project_id = resolve_name_to_id(project_query, &project_items, "Project")?.to_string();
 
-    let tasks = client.list_tasks().await?;
+    let tasks = tasks_for_resolved_project(&client, &projects, &project_id).await?;
     let task_items: Vec<(String, String, Option<String>)> = tasks
         .iter()
         .map(|t| (t.id.clone(), t.name.clone(), None))
@@ -428,7 +447,6 @@ async fn session_record(
                     project_id: Some(project_id),
                     task_id: Some(task_id),
                     spent_date: Some(spent_date.clone()),
-                    is_running: Some(false),
                     notes,
                     hours: Some(hours),
                     billable,
@@ -464,8 +482,10 @@ async fn session_record(
             "entry_id": entry.id,
             "project": entry.project_name(),
             "task": entry.task_name(),
-            "duration_hours": entry.hours,
-            "duration": entry.hours.map(format_duration),
+            "duration_hours": entry.actual_hours(),
+            "duration_seconds": entry.duration_seconds,
+            "rounded_hours": entry.rounded_hours,
+            "duration": entry.actual_hours().map(format_duration),
             "spent_date": entry.spent_date,
             "billable": entry.billable,
             "source": entry.source,
@@ -481,7 +501,10 @@ async fn session_record(
         println!(
             "{} {} for {} / {}",
             label.green().bold(),
-            entry.hours.map(format_duration).unwrap_or_default(),
+            entry
+                .actual_hours()
+                .map(format_duration)
+                .unwrap_or_default(),
             entry.project_name().unwrap_or("?"),
             entry.task_name().unwrap_or("?"),
         );
@@ -503,6 +526,17 @@ async fn list(
     limit: u32,
     page: u32,
 ) -> Result<(), AppError> {
+    if !(1..=2000).contains(&limit) {
+        return Err(AppError::InvalidInput(
+            "--limit must be between 1 and 2000".into(),
+        ));
+    }
+    if page == 0 {
+        return Err(AppError::InvalidInput(
+            "--page must be greater than zero".into(),
+        ));
+    }
+
     let auth = ResolvedAuth::resolve(global)?;
     let config = AppConfig::load()?;
     let client = KeitorClient::new(&auth, &config.api_base_url())?;
@@ -531,6 +565,8 @@ async fn list(
         params.push(format!("source={}", normalize_source(&source)?));
     }
 
+    let mut project_tasks = None;
+
     // Resolve project ID if provided
     if let Some(ref project_query) = project {
         let projects = client.list_projects().await?;
@@ -538,13 +574,17 @@ async fn list(
             .iter()
             .map(|p| (p.id.clone(), p.name.clone(), p.code.clone()))
             .collect();
-        let project_id = resolve_name_to_id(project_query, &project_items, "Project")?;
+        let project_id = resolve_name_to_id(project_query, &project_items, "Project")?.to_string();
+        project_tasks = Some(tasks_for_resolved_project(&client, &projects, &project_id).await?);
         params.push(format!("project_id={project_id}"));
     }
 
     // Resolve task ID if provided
     if let Some(ref task_query) = task {
-        let tasks = client.list_tasks().await?;
+        let tasks = match project_tasks {
+            Some(tasks) => tasks,
+            None => client.list_tasks().await?,
+        };
         let task_items: Vec<(String, String, Option<String>)> = tasks
             .iter()
             .map(|t| (t.id.clone(), t.name.clone(), None))
@@ -576,26 +616,27 @@ async fn running(global: &GlobalFlags, mode: OutputMode) -> Result<(), AppError>
     }
 
     if mode == OutputMode::Json {
-        let mut entries: Vec<serde_json::Value> = Vec::new();
-        for entry in &running {
-            let elapsed = entry.timer_started_at.map(|started| {
-                let elapsed = Utc::now() - started;
-                elapsed.num_seconds() as f64 / 3600.0
-            });
-            entries.push(serde_json::json!({
-                "running": true,
-                "entry_id": entry.id,
-                "project": entry.project_name(),
-                "task": entry.task_name(),
-                "started_at": entry.timer_started_at,
-                "spent_date": entry.spent_date,
-                "billable": entry.billable,
-                "source": entry.source,
-                "elapsed_hours": elapsed,
-                "elapsed": elapsed.map(format_duration),
-            }));
-        }
-        println!("{}", serde_json::to_string_pretty(&entries).unwrap());
+        // Production enforces one running timer per user. Keep the JSON shape
+        // stable between the running and not-running states by returning one
+        // object in both cases.
+        let entry = &running[0];
+        let elapsed = entry.timer_started_at.map(|started| {
+            let elapsed = Utc::now() - started;
+            elapsed.num_seconds() as f64 / 3600.0
+        });
+        let out = serde_json::json!({
+            "running": true,
+            "entry_id": entry.id,
+            "project": entry.project_name(),
+            "task": entry.task_name(),
+            "started_at": entry.timer_started_at,
+            "spent_date": entry.spent_date,
+            "billable": entry.billable,
+            "source": entry.source,
+            "elapsed_hours": elapsed,
+            "elapsed": elapsed.map(format_duration),
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
     } else {
         for entry in &running {
             let elapsed = entry.timer_started_at.map(|started| {
@@ -626,11 +667,28 @@ struct MetadataInput {
 fn normalize_source(source: &str) -> Result<String, AppError> {
     let normalized = source.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "web" | "cli" | "api" | "agent" | "calendar" | "desktop" => Ok(normalized),
+        "web" | "cli" | "api" | "agent" | "calendar" | "desktop" | "mobile"
+        | "integration" => Ok(normalized),
         _ => Err(AppError::InvalidInput(format!(
-            "source must be one of: web, cli, api, agent, calendar, desktop (got '{source}')"
+            "source must be one of: web, cli, api, agent, calendar, desktop, mobile, integration (got '{source}')"
         ))),
     }
+}
+
+async fn tasks_for_resolved_project(
+    client: &KeitorClient,
+    projects: &[Project],
+    project_id: &str,
+) -> Result<Vec<Task>, AppError> {
+    if let Some(tasks) = projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .and_then(|project| project.tasks.clone())
+    {
+        return Ok(tasks);
+    }
+
+    client.list_tasks_for_project(Some(project_id)).await
 }
 
 fn hours_from_duration_inputs(
@@ -701,6 +759,83 @@ fn build_metadata(input: MetadataInput) -> Result<Option<Value>, AppError> {
     Ok(Some(value))
 }
 
+fn build_session_metadata(
+    input: MetadataInput,
+    duration_seconds: u64,
+    source: &str,
+) -> Result<Value, AppError> {
+    let mut metadata = match build_metadata(input)? {
+        Some(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
+
+    metadata.insert(
+        "duration_seconds".into(),
+        Value::Number(duration_seconds.into()),
+    );
+    if source == "agent" {
+        match metadata.get("skill") {
+            Some(Value::String(skill)) if skill == "keito-time-track" => {}
+            Some(_) => {
+                return Err(AppError::InvalidInput(
+                    "source=agent session records require metadata.skill=keito-time-track".into(),
+                ))
+            }
+            None => {
+                metadata.insert("skill".into(), Value::String("keito-time-track".into()));
+            }
+        }
+    }
+
+    let value = Value::Object(metadata);
+    let size = serde_json::to_string(&value)
+        .map_err(|err| AppError::InvalidInput(format!("failed to serialize metadata: {err}")))?
+        .len();
+    if size > 4096 {
+        return Err(AppError::InvalidInput(
+            "--metadata payload must be 4KB or smaller".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn prepare_agent_log_metadata(
+    metadata: Option<Value>,
+    source: &str,
+    duration_seconds: u64,
+) -> Result<Option<Value>, AppError> {
+    if source != "agent" {
+        return Ok(metadata);
+    }
+
+    let mut map = match metadata {
+        Some(Value::Object(map)) => map,
+        other => return Ok(other),
+    };
+    if !map.contains_key("session_id") {
+        // Strict public-build metadata is a separate valid source=agent shape;
+        // leave it untouched for production to validate against the target user.
+        return Ok(Some(Value::Object(map)));
+    }
+
+    match map.get("skill") {
+        Some(Value::String(skill)) if skill == "keito-time-track" => {}
+        Some(_) => {
+            return Err(AppError::InvalidInput(
+                "source=agent lifecycle metadata requires skill=keito-time-track".into(),
+            ))
+        }
+        None => {
+            map.insert("skill".into(), Value::String("keito-time-track".into()));
+        }
+    }
+    map.insert(
+        "duration_seconds".into(),
+        Value::Number(duration_seconds.into()),
+    );
+    Ok(Some(Value::Object(map)))
+}
+
 fn insert_string_metadata(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         let value = value.trim();
@@ -753,7 +888,9 @@ mod tests {
         assert_eq!(normalize_source("Agent").unwrap(), "agent");
         assert_eq!(normalize_source("desktop").unwrap(), "desktop");
         assert_eq!(normalize_source("Calendar").unwrap(), "calendar");
-        assert!(normalize_source("mobile").is_err());
+        assert_eq!(normalize_source("mobile").unwrap(), "mobile");
+        assert_eq!(normalize_source("integration").unwrap(), "integration");
+        assert!(normalize_source("unknown").is_err());
     }
 
     #[test]
@@ -787,5 +924,52 @@ mod tests {
             skill: None,
         })
         .is_err());
+    }
+
+    #[test]
+    fn session_metadata_matches_production_agent_lifecycle_contract() {
+        let metadata = build_session_metadata(
+            MetadataInput {
+                metadata: None,
+                session_id: Some("session-123".into()),
+                agent_id: Some("codex".into()),
+                agent_type: Some("codex".into()),
+                skill: None,
+            },
+            5400,
+            "agent",
+        )
+        .unwrap();
+
+        assert_eq!(metadata["skill"], "keito-time-track");
+        assert_eq!(metadata["session_id"], "session-123");
+        assert_eq!(metadata["duration_seconds"], 5400);
+
+        assert!(build_session_metadata(
+            MetadataInput {
+                metadata: None,
+                session_id: Some("session-123".into()),
+                agent_id: None,
+                agent_type: None,
+                skill: Some("another-skill".into()),
+            },
+            5400,
+            "agent",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn agent_log_lifecycle_metadata_gets_skill_and_duration() {
+        let metadata = prepare_agent_log_metadata(
+            Some(serde_json::json!({"session_id": "session-123"})),
+            "agent",
+            900,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(metadata["skill"], "keito-time-track");
+        assert_eq!(metadata["duration_seconds"], 900);
     }
 }

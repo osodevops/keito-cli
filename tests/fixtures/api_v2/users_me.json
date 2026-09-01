@@ -3,12 +3,41 @@
   "first_name": "Test",
   "last_name": "User",
   "email": "test@test.com",
+  "telephone": null,
   "timezone": "Europe/London",
+  "has_access_to_all_future_projects": false,
+  "is_contractor": false,
   "is_active": true,
+  "weekly_capacity": 40,
+  "default_hourly_rate": 150,
+  "currency": "GBP",
   "roles": ["member"],
   "user_type": "human",
+  "avatar_url": null,
+  "created_at": "2026-01-01T09:00:00Z",
+  "updated_at": "2026-08-31T09:00:00Z",
+  "membership_role": "member",
   "company": {
     "id": "co_test",
-    "name": "Test Co"
+    "name": "Test Co",
+    "currency": "GBP",
+    "timezone": "Europe/London",
+    "time_rounding": "none",
+    "allow_past_timer_starts": true,
+    "allow_future_expense_dates": false,
+    "internal_time_notes_enabled": false,
+    "internal_time_notes_visibility": "project_admins",
+    "time_entry_notes_mode": "per_entry",
+    "time_billability_overrides_enabled": false
+  },
+  "capabilities": {
+    "can_track_time": true,
+    "can_track_expenses": true,
+    "can_edit_time_billability": false,
+    "can_create_field_clients": false,
+    "can_view_team_time": false,
+    "can_view_invoices": false,
+    "can_send_invoices": false,
+    "can_record_invoice_payments": false
   }
 }

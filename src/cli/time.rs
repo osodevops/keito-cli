@@ -61,7 +61,8 @@ Use `keito projects list --json` to discover available values."
             long,
             long_help = "\
 Task name or numeric ID. Resolution is case-insensitive. Tasks are \
-global (not per-project). Use `keito projects tasks --json` to list."
+resolved within the selected project. Use `keito projects tasks <PROJECT> --json` \
+to list valid choices."
         )]
         task: String,
 
@@ -194,7 +195,7 @@ Duration of the time entry. Accepts two formats:
         #[arg(long)]
         billable: Option<bool>,
 
-        /// Source to store on the time entry: web, cli, api, agent, calendar, or desktop
+        /// Source: web, cli, api, agent, calendar, desktop, mobile, or integration
         #[arg(long, default_value = "cli")]
         source: String,
 
@@ -214,7 +215,7 @@ Duration of the time entry. Accepts two formats:
         #[arg(long = "agent-type")]
         agent_type: Option<String>,
 
-        /// Skill name to store in metadata.skill
+        /// Lifecycle skill; source=agent sessions require keito-time-track
         #[arg(long)]
         skill: Option<String>,
     },
@@ -232,7 +233,10 @@ EXAMPLE:
   keito time session-record --project acme --task dev \\
     --session-id codex-123 --duration-seconds 5400 \\
     --started-at 2026-05-11T09:00:00Z --ended-at 2026-05-11T10:30:00Z \\
-    --skill keito-agent --json")]
+    --skill keito-time-track --json
+
+When source=agent, this command emits lifecycle-session metadata with \
+skill=keito-time-track and duration_seconds. Other --skill values are rejected.")]
     SessionRecord {
         /// Project name, code, or ID
         #[arg(long)]
@@ -270,7 +274,7 @@ EXAMPLE:
         #[arg(long)]
         billable: Option<bool>,
 
-        /// Source to store on the time entry: web, cli, api, agent, calendar, or desktop
+        /// Source: web, cli, api, agent, calendar, desktop, mobile, or integration
         #[arg(long, default_value = "agent")]
         source: String,
 
@@ -286,8 +290,8 @@ EXAMPLE:
         #[arg(long = "agent-type")]
         agent_type: Option<String>,
 
-        /// Skill name to store in metadata.skill
-        #[arg(long)]
+        /// Skill name; source=agent requires keito-time-track
+        #[arg(long, default_value = "keito-time-track")]
         skill: Option<String>,
     },
 
@@ -328,7 +332,7 @@ EXAMPLES:
         #[arg(long)]
         task: Option<String>,
 
-        /// Filter by source: web, cli, api, agent, calendar, or desktop
+        /// Filter by source: web, cli, api, agent, calendar, desktop, mobile, or integration
         #[arg(long)]
         source: Option<String>,
 
@@ -353,20 +357,18 @@ API EFFECT:
 
 EXAMPLE:
   $ keito time running --json
-  [
-    {
-      \"running\": true,
-      \"entry_id\": \"te_abc123\",
-      \"project\": \"Acme Website\",
-      \"task\": \"Development\",
-      \"spent_date\": \"2026-03-04\",
-      \"billable\": true,
-      \"source\": \"cli\",
-      \"started_at\": \"2026-03-04T09:00:00Z\",
-      \"elapsed_hours\": 1.5,
-      \"elapsed\": \"1:30\"
-    }
-  ]
+  {
+    \"running\": true,
+    \"entry_id\": \"te_abc123\",
+    \"project\": \"Acme Website\",
+    \"task\": \"Development\",
+    \"spent_date\": \"2026-03-04\",
+    \"billable\": true,
+    \"source\": \"cli\",
+    \"started_at\": \"2026-03-04T09:00:00Z\",
+    \"elapsed_hours\": 1.5,
+    \"elapsed\": \"1:30\"
+  }
 
 EXIT CODES:
   0   Command succeeded; inspect JSON running field")]

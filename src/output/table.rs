@@ -239,7 +239,7 @@ fn try_as_time_entries(arr: &[serde_json::Value]) -> Option<Vec<TimeEntry>> {
 
 fn try_as_me(arr: &[serde_json::Value]) -> Option<Vec<MeResponse>> {
     let first = arr.first()?.as_object()?;
-    if first.contains_key("id") && first.contains_key("email") && first.contains_key("company") {
+    if first.contains_key("id") && first.contains_key("email") && first.contains_key("roles") {
         serde_json::from_value(serde_json::Value::Array(arr.to_vec())).ok()
     } else {
         None
@@ -294,7 +294,7 @@ fn format_time_entry_table(entries: &[TimeEntry]) -> String {
             date: e.spent_date.map(|d| d.to_string()).unwrap_or_default(),
             project: e.project_name().unwrap_or_default().to_string(),
             task: e.task_name().unwrap_or_default().to_string(),
-            duration: e.hours.map(format_duration).unwrap_or_else(|| {
+            duration: e.actual_hours().map(format_duration).unwrap_or_else(|| {
                 if e.is_running {
                     "running...".into()
                 } else {
@@ -310,7 +310,7 @@ fn format_time_entry_table(entries: &[TimeEntry]) -> String {
 
 fn format_me_table(me_list: &[MeResponse]) -> String {
     if let Some(me) = me_list.first() {
-        let rows = vec![
+        let mut rows = vec![
             TableRow {
                 key: "User ID".into(),
                 value: me.id.clone(),
@@ -324,14 +324,26 @@ fn format_me_table(me_list: &[MeResponse]) -> String {
                 value: me.email.clone(),
             },
             TableRow {
-                key: "Company".into(),
-                value: me.company.name.clone(),
-            },
-            TableRow {
-                key: "Company ID".into(),
-                value: me.company.id.clone(),
+                key: "Credential".into(),
+                value: me.credential_type().replace('_', " "),
             },
         ];
+        if let Some(company) = &me.company {
+            rows.push(TableRow {
+                key: "Company".into(),
+                value: company.name.clone(),
+            });
+            rows.push(TableRow {
+                key: "Company ID".into(),
+                value: company.id.clone(),
+            });
+        }
+        if let Some(can_track_time) = me.capabilities.can_track_time {
+            rows.push(TableRow {
+                key: "Can track time".into(),
+                value: if can_track_time { "Yes" } else { "No" }.into(),
+            });
+        }
         Table::new(rows).with(Style::rounded()).to_string()
     } else {
         "No data.".into()

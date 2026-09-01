@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.8] - 2026-09-01
+
+### Added
+
+- Add project-scoped task discovery through `keito projects tasks [PROJECT]` and use embedded/project-filtered tasks for all tracking commands.
+- Preserve current API v2 user, company, capability, client, project, task, actual-duration, rounded-duration, internal-note, billability, and external-reference response fields in JSON output.
+- Send CLI identity headers and a unique idempotency key for every API mutation, reusing the key across transient retries.
+- Include production lifecycle metadata (`skill=keito-time-track` and `duration_seconds`) for agent session records.
+- Surface `Retry-After` seconds in structured rate-limit errors.
+
+### Changed
+
+- Reject Personal read-only sync keys during login/status with a clear credential-scope error; `auth whoami` can still display their limited identity response.
+- Paginate client, project, and task reference discovery instead of silently stopping after the first page.
+- Respect server `Retry-After` delays when retrying transient 5xx responses.
+- Use the production safe-delete intent when discarding a running timer and rely exclusively on the server-side timer stop endpoint.
+- Accept the current `mobile` and `integration` time-entry source values.
+
+### Fixed
+
+- Parse `/api/v2/users/me` responses that intentionally omit `company` for Personal read-only sync credentials instead of returning a server/serde error.
+- Stop sending the removed `is_running` field to the strict time-entry update endpoint during agent session upserts.
+- Map production `400`, `413`, and `415` responses to invalid input, and `412`/`428` responses to conflict, while preserving stable CLI exit codes.
+- Resolve tasks within the selected project so the CLI no longer offers workspace tasks that production rejects for that project.
+- Preserve exact actual seconds and rounded hours in timer/log/session output when returned by the API.
+- Return a stable JSON object from `time running` whether or not a timer is active.
+- Update `h2` and `quinn-proto` to versions containing their current security fixes.
+
 ## [0.1.7] - 2026-06-16
 
 ### Added

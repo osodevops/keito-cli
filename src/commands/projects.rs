@@ -23,7 +23,9 @@ pub async fn run(
             tasks,
         } => create(global, mode, name, client, code, notes, billable, tasks).await,
         ProjectsSubcommand::Show { project } => show(global, mode, &project).await,
-        ProjectsSubcommand::Tasks { limit } => tasks(global, mode, limit).await,
+        ProjectsSubcommand::Tasks { project, limit } => {
+            tasks(global, mode, project.as_deref(), limit).await
+        }
     }
 }
 
@@ -106,12 +108,40 @@ async fn show(global: &GlobalFlags, mode: OutputMode, query: &str) -> Result<(),
     output::render_single(&project, mode, global.quiet)
 }
 
-async fn tasks(global: &GlobalFlags, mode: OutputMode, limit: Option<u32>) -> Result<(), AppError> {
+async fn tasks(
+    global: &GlobalFlags,
+    mode: OutputMode,
+    project_query: Option<&str>,
+    limit: Option<u32>,
+) -> Result<(), AppError> {
     let auth = ResolvedAuth::resolve(global)?;
     let config = AppConfig::load()?;
     let client = KeitorClient::new(&auth, &config.api_base_url())?;
 
-    let mut tasks = client.list_tasks().await?;
+    let mut tasks = if let Some(project_query) = project_query {
+        let projects = client.list_projects().await?;
+        let items: Vec<(String, String, Option<String>)> = projects
+            .iter()
+            .map(|project| {
+                (
+                    project.id.clone(),
+                    project.name.clone(),
+                    project.code.clone(),
+                )
+            })
+            .collect();
+        let project_id = resolve_name_to_id(project_query, &items, "Project")?.to_string();
+        match projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .and_then(|project| project.tasks.clone())
+        {
+            Some(tasks) => tasks,
+            None => client.list_tasks_for_project(Some(&project_id)).await?,
+        }
+    } else {
+        client.list_tasks().await?
+    };
     if let Some(limit) = limit {
         tasks.truncate(limit as usize);
     }

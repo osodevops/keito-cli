@@ -11,6 +11,10 @@ export KEITO_API_KEY=kto_your_api_key_here
 export KEITO_ACCOUNT_ID=co_your_company_id
 ```
 
+Use a CLI-compatible full-access Personal Access Token. A Personal read-only
+sync key cannot list project tasks or mutate time entries and therefore fails
+the CLI preflight with exit code `1`.
+
 Verify credentials:
 
 ```sh
@@ -22,7 +26,11 @@ keito auth status --json
   "authenticated": true,
   "api_key_source": "environment variable",
   "account_id": "co_abc123",
-  "workspace_id": "co_abc123"
+  "workspace_id": "co_abc123",
+  "api_key_valid": true,
+  "credential_type": "full_access",
+  "cli_compatible": true,
+  "can_track_time": true
 }
 ```
 
@@ -91,10 +99,12 @@ keito projects list --json
 
 ### List Tasks
 
-Tasks are **global** — they are not scoped to a project. Any task can be used with any project.
+Task availability is project-aware. Always pass the selected project so the
+CLI returns its assigned tasks and production can enforce project/task and
+member restrictions consistently.
 
 ```sh
-keito projects tasks --json
+keito projects tasks "Acme Website" --json
 ```
 
 ```json
@@ -115,7 +125,8 @@ Always check first — only one timer can be active at a time:
 keito time running --json
 ```
 
-Exit code `4` = no timer running (safe to start). Exit code `0` = timer already active.
+The command exits `0` in both states. Inspect `running`: `false` means it is
+safe to start; a returned entry with `running: true` means a timer is active.
 
 ### 2. Start Timer
 
@@ -125,11 +136,12 @@ keito time start --project "Acme Website" --task dev --json
 
 ```json
 {
-  "id": "te_abc123",
+  "status": "started",
+  "entry_id": "te_abc123",
   "project": "Acme Website",
   "task": "Development",
   "started_at": "2025-01-15T09:00:00Z",
-  "is_running": true
+  "source": "cli"
 }
 ```
 
@@ -143,11 +155,13 @@ keito time stop --json
 
 ```json
 {
-  "id": "te_abc123",
+  "status": "stopped",
+  "entry_id": "te_abc123",
   "project": "Acme Website",
   "task": "Development",
-  "duration": 1.5,
-  "is_running": false
+  "duration_hours": 1.5,
+  "duration_seconds": 5400,
+  "source": "cli"
 }
 ```
 
@@ -190,11 +204,11 @@ Every error returns a structured JSON response with recovery hints:
 | Exit Code | Meaning | Recovery Action |
 |---|---|---|
 | 0 | Success | — |
-| 1 | Auth error | Check `KEITO_API_KEY` is set and valid |
+| 1 | Auth/permission error | Check the key is valid, full-access, and permitted; read-only sync keys cannot track time |
 | 2 | Invalid input | Fix arguments (bad duration, missing flags) |
 | 3 | Conflict | Stop the existing timer first: `keito time stop` |
 | 4 | Not found | Check project/task names: `keito projects list --json` |
-| 5 | Rate limited | Wait a moment, then retry |
+| 5 | Rate limited | Wait for `details.retry_after_seconds` when present, then retry |
 | 6 | Server error | Retry (automatic 3× backoff is built in) |
 | 7 | Network error | Check connectivity, retry |
 | 8 | Config error | Run `keito auth login` or set env vars |
@@ -227,10 +241,11 @@ When finishing work, run:
 
 ```
 1. keito auth status --json          # verify credentials (exit 0 = ok)
-2. keito time running --json         # check for active timer (exit 4 = none)
-3. keito time start --project X --task Y --json   # start timer
-4. ... perform work ...
-5. keito time stop --json            # stop timer
+2. keito projects tasks X --json      # choose a task valid for project X
+3. keito time running --json          # inspect running=false before starting
+4. keito time start --project X --task Y --json   # start timer
+5. ... perform work ...
+6. keito time stop --json             # stop timer
 ```
 
 ### Environment Variables Reference

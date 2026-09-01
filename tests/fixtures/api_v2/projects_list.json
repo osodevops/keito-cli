@@ -3,17 +3,48 @@
     {
       "id": "p1",
       "client": { "id": "c1", "name": "Client A" },
+      "owner_id": "usr_1",
+      "owner": { "id": "usr_1", "name": "Test User", "email": "test@test.com" },
       "name": "Project A",
       "code": "PA",
+      "project_kind": "standard",
+      "display_name": "Project A",
+      "display_code": "PA",
       "is_active": true,
       "is_billable": true,
       "is_fixed_fee": false,
-      "bill_by": "Project",
+      "bill_by": "PROJECT",
       "hourly_rate": 150,
       "fee": null,
-      "budget_by": "project",
+      "budget_by": "PROJECT",
       "budget": 100,
-      "notes": "Production-shaped project"
+      "budget_is_monthly": false,
+      "budget_counts_billable_hours_only": false,
+      "notify_when_over_budget": true,
+      "over_budget_notification_percentage": 80,
+      "show_budget_to_all": true,
+      "cost_budget": null,
+      "cost_budget_include_expenses": false,
+      "starts_on": "2026-01-01",
+      "ends_on": null,
+      "notes": "Production-shaped project",
+      "tasks": [
+        {
+          "id": "t1",
+          "name": "Development",
+          "billable_by_default": true,
+          "effective_billable_rate": 150,
+          "currency": "GBP",
+          "budget": 100,
+          "is_default": true,
+          "is_active": true,
+          "parent_task_id": null,
+          "created_at": "2026-01-01T09:00:00Z",
+          "updated_at": "2026-08-31T09:00:00Z"
+        }
+      ],
+      "created_at": "2026-01-01T09:00:00Z",
+      "updated_at": "2026-08-31T09:00:00Z"
     },
     {
       "id": "p2",
@@ -23,12 +54,13 @@
       "is_active": true,
       "is_billable": false,
       "is_fixed_fee": false,
-      "bill_by": "Project",
+      "bill_by": "NONE",
       "hourly_rate": null,
       "fee": null,
-      "budget_by": "none",
+      "budget_by": "NONE",
       "budget": null,
-      "notes": null
+      "notes": null,
+      "tasks": []
     }
   ],
   "per_page": 200,
