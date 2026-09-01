@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.9] - 2026-09-01
+
+### Fixed
+
+- Render task responses containing currency fields with the task table and its billable column instead of misclassifying them as clients.
+- Show the actual human-readable duration format in `time stop`, `time log`, and `time running` help examples.
+- Validate agent lifecycle metadata against the 4KB API limit after adding required skill and duration fields.
+
 ## [0.1.8] - 2026-09-01
 
 ### Added

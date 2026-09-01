@@ -98,7 +98,7 @@ EXAMPLE:
     \"project\": \"Acme Website\",
     \"task\": \"Development\",
     \"duration_hours\": 1.5,
-    \"duration\": \"1:30\",
+    \"duration\": \"1h 30m\",
     \"spent_date\": \"2026-03-04\",
     \"billable\": true,
     \"source\": \"cli\"
@@ -146,7 +146,7 @@ EXAMPLE:
     \"project\": \"Acme Website\",
     \"task\": \"Development\",
     \"duration_hours\": 1.5,
-    \"duration\": \"1:30\",
+    \"duration\": \"1h 30m\",
     \"spent_date\": \"2025-01-15\",
     \"date\": \"2025-01-15\",
     \"billable\": true,
@@ -367,7 +367,7 @@ EXAMPLE:
     \"source\": \"cli\",
     \"started_at\": \"2026-03-04T09:00:00Z\",
     \"elapsed_hours\": 1.5,
-    \"elapsed\": \"1:30\"
+    \"elapsed\": \"1h 30m\"
   }
 
 EXIT CODES:
