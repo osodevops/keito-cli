@@ -38,8 +38,12 @@ impl AppConfig {
         }
         let contents = std::fs::read_to_string(&path)
             .map_err(|e| AppError::Config(format!("Failed to read config: {e}")))?;
-        let config: AppConfig = toml::from_str(&contents)
-            .map_err(|e| AppError::Config(format!("Invalid config TOML: {e}")))?;
+        let config: AppConfig = toml::from_str(&contents).map_err(|_| {
+            AppError::Config(
+                "Invalid config TOML; repair the local configuration without sharing its contents"
+                    .into(),
+            )
+        })?;
         Ok(config)
     }
 

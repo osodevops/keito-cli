@@ -242,6 +242,7 @@ pub struct Binding {
     pub revoked: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Segment {
     pub segment_key: String,
     pub started_at: String,
@@ -274,8 +275,11 @@ pub struct Session {
     seen_turns: std::collections::BTreeSet<String>,
     queued_lifecycle: String,
     pub needs_attention: bool,
+    #[serde(default)]
+    pub canonical_server_id: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapturePayload {
     pub schema_version: u8,
     pub source_namespace: String,
@@ -327,6 +331,7 @@ impl Session {
             seen_turns: Default::default(),
             queued_lifecycle: "ACTIVE".into(),
             needs_attention: false,
+            canonical_server_id: None,
         }
     }
     fn close(&mut self, clock: &Clock, complete: bool) -> Result<(), AppError> {
@@ -426,6 +431,9 @@ pub struct Queued {
     pub body: String,
     pub hash: String,
     pub attempts: i64,
+    pub session_id: String,
+    pub revision: i64,
+    pub canonical_server_id: Option<String>,
 }
 impl Store {
     pub fn open(directory: &Path) -> Result<Self, AppError> {
@@ -972,19 +980,57 @@ impl Store {
         if !current.is_some_and(|b| b.id == binding.id && !b.paused && !b.revoked) {
             return Ok(None);
         }
-        let row = tx.query_row("SELECT o.id,o.session_id,o.body,o.payload_hash,o.attempts FROM outbox o JOIN sessions s ON s.id=o.session_id
+        let row = tx.query_row("SELECT o.id,o.session_id,o.body,o.payload_hash,o.attempts,o.revision,json_extract(s.data,'$.canonical_server_id'),s.data FROM outbox o JOIN sessions s ON s.id=o.session_id
             WHERE s.binding_id=?1 AND o.state='pending' AND o.retry_at<=?2 AND o.claimed_until<=?2
             AND NOT EXISTS (SELECT 1 FROM outbox prior WHERE prior.session_id=o.session_id AND prior.revision<o.revision AND prior.state!='acknowledged') ORDER BY o.id LIMIT 1",
-            params![binding.id,now],|r| Ok(Queued{id:r.get(0)?,body:r.get(2)?,hash:r.get(3)?,attempts:r.get(4)?})).optional().map_err(storage_error)?;
-        if let Some(row) = &row {
+            params![binding.id,now],|r| Ok((Queued{id:r.get(0)?,session_id:r.get(1)?,body:r.get(2)?,hash:r.get(3)?,attempts:r.get(4)?,revision:r.get(5)?,canonical_server_id:r.get(6)?},r.get::<_,String>(7)?))).optional().map_err(storage_error)?;
+        let row = if let Some((row, raw)) = row {
+            let valid = serde_json::from_str::<Session>(&raw)
+                .ok()
+                .zip(serde_json::from_str::<CapturePayload>(&row.body).ok())
+                .is_some_and(|(session, payload)| {
+                    validate_frozen(&row, &payload, &session, binding)
+                });
+            if !valid {
+                tx.execute("UPDATE outbox SET state='held',reason='FROZEN_PAYLOAD_INVALID',claimed_until=0 WHERE id=?1",[row.id]).map_err(storage_error)?;
+                tx.execute("UPDATE sessions SET data=json_set(data,'$.needs_attention',json('true')) WHERE id=?1",[&row.session_id]).map_err(storage_error)?;
+                tx.commit().map_err(storage_error)?;
+                return Err(AppError::Config("Frozen capture evidence failed integrity checks; quarantined without transmission".into()));
+            }
             tx.execute(
                 "UPDATE outbox SET claimed_until=?2 WHERE id=?1",
                 params![row.id, now + 30],
             )
             .map_err(storage_error)?;
-        }
+            Some(row)
+        } else {
+            None
+        };
         tx.commit().map_err(storage_error)?;
         Ok(row)
+    }
+    pub fn acknowledge(&mut self, row: &Queued, server_id: &str, now: i64) -> Result<(), AppError> {
+        identifier(server_id)?;
+        let tx = self.transaction()?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(data,'$.canonical_server_id') FROM sessions WHERE id=?1",
+                [&row.session_id],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?;
+        if current.as_deref().is_some_and(|id| id != server_id) {
+            return Err(AppError::Conflict(
+                "Canonical capture identity changed; acknowledgement refused".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE sessions SET data=json_set(data,'$.canonical_server_id',?2) WHERE id=?1",
+            params![row.session_id, server_id],
+        )
+        .map_err(storage_error)?;
+        tx.execute("UPDATE outbox SET state='acknowledged',reason='ACCEPTED',attempts=attempts+1,claimed_until=0,acknowledged_at=?2 WHERE id=?1 AND payload_hash=?3",params![row.id,now,row.hash]).map_err(storage_error)?;
+        tx.commit().map_err(storage_error)
     }
     pub fn finish(
         &mut self,
@@ -1008,4 +1054,85 @@ impl Store {
             .map_err(storage_error)?;
         Ok(())
     }
+}
+
+fn validate_frozen(
+    row: &Queued,
+    payload: &CapturePayload,
+    session: &Session,
+    binding: &Binding,
+) -> bool {
+    if row.body.len() > MAX_BODY_BYTES
+        || hash(&row.body) != row.hash
+        || payload.schema_version != 1
+        || payload.revision != row.revision
+        || payload.expected_revision != row.revision - 1
+        || payload.source_namespace != session.source_namespace
+        || payload.source_session_id != session.source_session_id
+        || payload.harness_version != session.harness_version
+        || payload.repository_binding_id != session.binding.id
+        || payload.repository_binding_id != binding.id
+        || payload.binding_version != session.binding.version
+        || payload.project_id != session.binding.project_id
+        || payload.task_id != session.binding.task_id
+        || payload.work_kind != "HUMAN_ASSISTED_AGENT_ACTIVITY"
+        || payload.measurement_method != "OBSERVED_TURN_INTERVALS_V1"
+        || !matches!(payload.source_namespace.as_str(), "claude-code" | "codex")
+        || !matches!(
+            payload.lifecycle.as_str(),
+            "ACTIVE" | "COMPLETED" | "INCOMPLETE"
+        )
+        || payload.segments.len() > 100
+        || payload.usage
+            != serde_json::json!({"status":"UNAVAILABLE","reason":"NO_QUALIFIED_USAGE_EVIDENCE","models":[]})
+    {
+        return false;
+    }
+    for id in [
+        &payload.source_session_id,
+        &payload.repository_binding_id,
+        &payload.project_id,
+        &payload.task_id,
+        &payload.harness_version,
+    ] {
+        if identifier(id).is_err() {
+            return false;
+        }
+    }
+    let parse = |s: &str| DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp());
+    let Some(start) = parse(&payload.started_at) else {
+        return false;
+    };
+    let Some(end) = parse(&payload.observed_through) else {
+        return false;
+    };
+    if start != session.started_at
+        || end < start
+        || payload.revision < 1
+        || payload.revision > i32::MAX as i64
+    {
+        return false;
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for segment in &payload.segments {
+        let Some(a) = parse(&segment.started_at) else {
+            return false;
+        };
+        let Some(b) = parse(&segment.ended_at) else {
+            return false;
+        };
+        if identifier(&segment.segment_key).is_err()
+            || !keys.insert(&segment.segment_key)
+            || a < start
+            || b > end
+            || b < a
+            || b - a > MAX_INTERVAL_SECONDS
+            || (segment.completeness == "COMPLETE" && segment.duration_seconds != b - a)
+            || (segment.completeness == "INCOMPLETE" && segment.duration_seconds != 0)
+            || !matches!(segment.completeness.as_str(), "COMPLETE" | "INCOMPLETE")
+        {
+            return false;
+        }
+    }
+    true
 }

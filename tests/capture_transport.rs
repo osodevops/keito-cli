@@ -306,7 +306,7 @@ async fn mapping_change_between_queued_revisions_stops_before_next_upload() {
             .unwrap();
             let payload: Value = serde_json::from_slice(&request.body).unwrap();
             ResponseTemplate::new(201).set_body_json(
-                json!({"agent_session":{"id":"canonical-session","revision":payload["revision"]}}),
+                json!({"agent_session":{"id":"canonical-session","revision":payload["revision"],"projection_state":"PROJECTED","review_state":"PENDING"}}),
             )
         })
         .mount(&server)

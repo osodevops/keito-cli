@@ -364,7 +364,7 @@ async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
                     .headers()
                     .get("Retry-After")
                     .and_then(|h| h.to_str().ok())
-                    .and_then(|h| h.parse::<i64>().ok());
+                    .and_then(|h| retry_after_delay(h, now));
                 if (200..300).contains(&status) {
                     // Read bounded acknowledgements; never persist server prose.
                     if response.content_length().is_some_and(|n| n > 64 * 1024) {
@@ -372,14 +372,11 @@ async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
                         retryable += 1;
                         break;
                     }
-                    let expected: Value = serde_json::from_str(&row.body)
-                        .map_err(|_| AppError::Config("Invalid frozen capture evidence".into()))?;
-                    let ack = bounded_ack(response).await;
-                    if ack.as_ref().is_some_and(|a| {
-                        a["agent_session"]["revision"] == expected["revision"]
-                            && a["agent_session"]["id"].is_string()
-                    }) {
-                        store.finish(&row, "acknowledged", "ACCEPTED", now, None)?;
+                    let acknowledgement = bounded_ack(response).await.and_then(|value| {
+                        serde_json::from_value::<AcknowledgementEnvelope>(value).ok()
+                    });
+                    if let Some(ack) = acknowledgement.filter(|a| a.agent_session.valid(&row)) {
+                        store.acknowledge(&row, &ack.agent_session.id, now)?;
                         accepted += 1;
                     } else {
                         store.finish(&row, "pending", "INVALID_ACKNOWLEDGEMENT", now, None)?;
@@ -401,6 +398,23 @@ async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
                     retryable += 1;
                     break;
                 } else {
+                    let body = bounded_ack(response).await;
+                    let code = body.as_ref().and_then(safe_error_code);
+                    if status == 409 && matches!(code, Some("in_progress" | "projection_pending")) {
+                        store.finish(
+                            &row,
+                            "pending",
+                            if code == Some("in_progress") {
+                                "IN_PROGRESS"
+                            } else {
+                                "PROJECTION_PENDING"
+                            },
+                            now,
+                            retry_after,
+                        )?;
+                        retryable += 1;
+                        break;
+                    }
                     let reason = match status {
                         401 => "NEEDS_AUTH",
                         403 => "FORBIDDEN_OR_DISABLED",
@@ -409,13 +423,12 @@ async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
                         413 => "PAYLOAD_LIMIT",
                         _ => "REQUEST_REJECTED",
                     };
-                    // Auth/feature disable are recoverable with the same payload.
-                    let state = if status == 401 || status == 403 || status == 404 {
+                    let state = if matches!(status, 401 | 403 | 404) {
                         "pending"
                     } else {
                         "held"
                     };
-                    store.finish(&row, state, reason, now, Some(60))?;
+                    store.finish(&row, state, reason, now, retry_after.or(Some(60)))?;
                     held += 1;
                     break;
                 }
@@ -511,4 +524,65 @@ fn verify_runtime_hash(expected: &str) -> Result<(), AppError> {
         return Err(AppError::Config("Capture worker runtime changed; explicitly reinstall the reviewed worker before delivery".into()));
     }
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct AcknowledgementEnvelope {
+    agent_session: Acknowledgement,
+}
+#[derive(serde::Deserialize)]
+struct Acknowledgement {
+    id: String,
+    revision: i64,
+    projection_state: String,
+    review_state: String,
+}
+impl Acknowledgement {
+    fn valid(&self, row: &capture::Queued) -> bool {
+        capture::identifier(&self.id).is_ok()
+            && self.revision == row.revision
+            && matches!(self.projection_state.as_str(), "PENDING" | "PROJECTED")
+            && matches!(
+                self.review_state.as_str(),
+                "PENDING" | "APPROVED" | "EXCLUDED" | "NEEDS_ATTENTION" | "NEEDS_MAPPING"
+            )
+            && row
+                .canonical_server_id
+                .as_deref()
+                .is_none_or(|id| id == self.id)
+    }
+}
+fn safe_error_code(body: &Value) -> Option<&str> {
+    body.get("reason")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            body.get("error")
+                .and_then(|v| v.get("code"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| body.get("code").and_then(Value::as_str))
+        .filter(|v| {
+            matches!(
+                *v,
+                "in_progress"
+                    | "projection_pending"
+                    | "revision_conflict"
+                    | "mapping_invalid"
+                    | "needs_auth"
+                    | "review_required"
+                    | "forbidden_payload"
+                    | "unsupported_schema"
+            )
+        })
+}
+fn retry_after_delay(header: &str, now: i64) -> Option<i64> {
+    header
+        .parse::<i64>()
+        .ok()
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc2822(header)
+                .ok()
+                .map(|date| date.timestamp().saturating_sub(now))
+        })
+        .map(|seconds| seconds.clamp(1, 3600))
 }
