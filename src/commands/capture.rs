@@ -254,7 +254,14 @@ pub async fn run(
             }
             Ok(())
         }
-        CaptureSubcommand::WorkerStatus => {
+        CaptureSubcommand::WorkerStatus { all } => {
+            if all {
+                let value = match crate::capture_supervisor::Supervisor::system() {
+                    Ok(supervisor) => json!({"workers":supervisor.list()?}),
+                    Err(_) => json!({"supported":false,"workers":[]}),
+                };
+                return print(value, global.quiet);
+            }
             let value = match (
                 current_repo(),
                 crate::capture_supervisor::Supervisor::system(),
@@ -290,11 +297,18 @@ pub async fn run(
             };
             print(value, global.quiet)
         }
-        CaptureSubcommand::WorkerUninstall { .. } => {
-            let repo = current_repo()?;
+        CaptureSubcommand::WorkerUninstall { worker_id, .. } => {
+            let key = if let Some(id) = worker_id {
+                if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(AppError::InvalidInput("Invalid worker identity".into()));
+                }
+                id
+            } else {
+                current_repo()?.key
+            };
             let supervisor = crate::capture_supervisor::Supervisor::system()?;
             print(
-                serde_json::to_value(supervisor.uninstall(&repo.key)?)
+                serde_json::to_value(supervisor.uninstall(&key)?)
                     .map_err(|_| AppError::Config("Cannot inspect worker service".into()))?,
                 global.quiet,
             )

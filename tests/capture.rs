@@ -113,3 +113,24 @@ fn live_doctor_malformed_config_never_echoes_credential_source_lines() {
         .failure()
         .stderr(predicate::str::contains("PRIVATE_CONFIG_CANARY").not());
 }
+
+#[test]
+fn local_doctor_distinguishes_repository_worker_and_delivery_from_credential_presence() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("keito")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("KEITO_CAPTURE_HOME", home.path().join("capture"))
+        .args(["skill", "doctor", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert!(status["capture"]["current_repository"].is_object());
+    assert!(status["worker"].is_object());
+    assert_eq!(status["ready"], false);
+    assert_eq!(status["delivery_verified"], false);
+    assert_eq!(status["hook_trust"], "UNKNOWN_REVIEW_IN_HARNESS");
+}

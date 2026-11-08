@@ -71,12 +71,15 @@ in the launch agent. Existing unrelated launch agents are preserved. Binary chan
 the service stale; its expected-runtime digest also refuses delivery after replacement.
 Explicitly repeat installation with the reviewed updated runtime.
 
-Launchd starts and restarts the worker. Settings installed, process running and delivery
+Launchd starts and restarts the worker. Settings installed, service loaded, process running and delivery
 verified are separate states. Real restart/kill/recovery checks remain part of artifact
 qualification. To stop/remove only this repository's worker service:
 
 ```sh
 keito capture worker-uninstall --repo
+# If the repository moved or was removed, discover its opaque owned worker ID:
+keito capture worker-status --all --json
+keito capture worker-uninstall --worker-id WORKER_ID
 ```
 
 For a separately supervised foreground worker, or supported development environments:

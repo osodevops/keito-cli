@@ -48,11 +48,22 @@ pub enum CaptureSubcommand {
         expected_runtime_hash: Option<String>,
     },
     /// Inspect the current repository's macOS worker service without network writes
-    WorkerStatus,
+    WorkerStatus {
+        /// Discover integration-owned workers, including stale or removed repositories
+        #[arg(long)]
+        all: bool,
+    },
     /// Stop/remove only this repository's integration-owned launchd service
     WorkerUninstall {
-        #[arg(long, required = true)]
+        #[arg(
+            long,
+            required_unless_present = "worker_id",
+            conflicts_with = "worker_id"
+        )]
         repo: bool,
+        /// Opaque worker ID from worker-status --all; works after repository removal
+        #[arg(long, required_unless_present = "repo")]
+        worker_id: Option<String>,
     },
     /// Exclude paused intervals and hold this repository's queued deliveries
     Pause {

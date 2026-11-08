@@ -27,6 +27,11 @@ pub struct Supervisor {
     pub uid: u32,
 }
 #[derive(Debug, Serialize)]
+pub struct OwnedWorker {
+    pub worker_id: String,
+    pub status: WorkerStatus,
+}
+#[derive(Debug, Serialize)]
 pub struct WorkerStatus {
     pub supported: bool,
     pub installed: bool,
@@ -92,6 +97,7 @@ impl Supervisor {
 <plist version="1.0"><dict>
 <key>Label</key><string>{label}</string>
 <key>KeitoCapturePolicy</key><string>{policy}</string>
+<key>KeitoRepositoryKey</key><string>{repository_key}</string>
 <key>KeitoBinarySha256</key><string>{binary_hash}</string>
 <key>ProgramArguments</key><array><string>{executable}</string><string>--workspace</string><string>{workspace}</string><string>capture</string><string>worker</string><string>--interval-seconds</string><string>5</string><string>--expected-runtime-hash</string><string>{binary_hash}</string></array>
 <key>WorkingDirectory</key><string>{repository}</string>
@@ -103,6 +109,7 @@ impl Supervisor {
 "#,
             label = Self::label(config.repository_key),
             policy = MARKER,
+            repository_key = xml(config.repository_key),
             binary_hash = hash(binary),
             executable = xml(&config.executable.to_string_lossy()),
             workspace = xml(config.workspace_id),
@@ -194,6 +201,50 @@ impl Supervisor {
             let _ = fs::remove_file(temporary);
         }
         result
+    }
+    pub fn list(&self) -> Result<Vec<OwnedWorker>, AppError> {
+        self.ensure_parents()?;
+        let directory = self.home.join("Library/LaunchAgents");
+        if !directory.exists() {
+            return Ok(vec![]);
+        }
+        let mut workers = Vec::new();
+        for entry in fs::read_dir(directory).map_err(|_| failure())? {
+            let entry = entry.map_err(|_| failure())?;
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("com.keito.capture.")
+                || entry.path().extension().is_none_or(|v| v != "plist")
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| failure())?;
+            if metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 {
+                continue;
+            }
+            let bytes = fs::read(entry.path()).map_err(|_| failure())?;
+            let text = String::from_utf8_lossy(&bytes);
+            let prefix = "<key>KeitoRepositoryKey</key><string>";
+            let Some(key) = text
+                .split_once(prefix)
+                .and_then(|(_, v)| v.split_once("</string>").map(|(v, _)| v))
+            else {
+                continue;
+            };
+            if key.len() != 64
+                || !key.bytes().all(|b| b.is_ascii_hexdigit())
+                || !Self::owned(&text, key)
+            {
+                continue;
+            }
+            workers.push(OwnedWorker {
+                worker_id: key.to_owned(),
+                status: self.status(key, None)?,
+            });
+        }
+        workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+        Ok(workers)
     }
     pub fn status(
         &self,

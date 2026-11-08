@@ -29,6 +29,8 @@ struct SkillStatus {
     hook_trust: String,
     delivery_verified: bool,
     ready: bool,
+    capture: serde_json::Value,
+    worker: serde_json::Value,
     account_id: Option<String>,
     codex: AgentStatus,
     claude_code: AgentStatus,
@@ -559,6 +561,11 @@ fn hook_installer_path(agent: SkillAgent) -> Option<PathBuf> {
 
 fn collect_status(global: &GlobalFlags) -> SkillStatus {
     let auth = ResolvedAuth::resolve(global).ok();
+    let (capture, worker) = capture_diagnostics();
+    let delivery_verified = capture
+        .get("delivery_verified")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
     SkillStatus {
         cli_installed: true,
         cli_path: std::env::current_exe()
@@ -570,8 +577,10 @@ fn collect_status(global: &GlobalFlags) -> SkillStatus {
         authenticated: false,
         authentication_state: "UNVERIFIED".into(),
         hook_trust: "UNKNOWN_REVIEW_IN_HARNESS".into(),
-        delivery_verified: false,
+        delivery_verified,
         ready: false,
+        capture,
+        worker,
         account_id: auth.map(|auth| auth.workspace_id),
         codex: agent_status(SkillAgent::Codex),
         claude_code: agent_status(SkillAgent::ClaudeCode),
@@ -716,7 +725,26 @@ fn print_status(status: &SkillStatus, doctor: bool) {
     );
     println!("Live authentication: {}", status.authentication_state);
     println!("Hook trust: {}", status.hook_trust);
-    println!("Capture delivery: unverified (inspect capture status after a real turn)");
+    println!(
+        "Capture delivery verified: {}",
+        yes_no(status.delivery_verified)
+    );
+    println!(
+        "Repository approval: {}",
+        status.capture["current_repository"]["approved"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    println!(
+        "Storage paused: {}",
+        status.capture["storage_paused"].as_bool().unwrap_or(true)
+    );
+    println!(
+        "Worker installed/loaded/running: {}/{}/{}",
+        status.worker["installed"].as_bool().unwrap_or(false),
+        status.worker["loaded"].as_bool().unwrap_or(false),
+        status.worker["running"].as_bool().unwrap_or(false)
+    );
     println!("Ready: no (unknown trust/delivery is not ready)");
     if let Some(account_id) = &status.account_id {
         println!("Account ID: {account_id}");
@@ -865,29 +893,35 @@ entry when a tracked session ends, so do not create duplicate manual entries.
 
 Keito agent time tracking is required before billable coding work in this
 repository. Before starting, verify `keito skill status --json`. If the skill
-or hooks are missing, stop and tell the user to run `keito skill install`.
+or hooks are missing, stop and tell the user to run `keito skill install --agent <claude-code|codex>`.
 
 If `.keito/config.yml` is missing for this worktree, stop and run
 `/track-time-keito` from Codex or Claude Code so the user can choose the Keito
 client, project, and task. Do not guess project or task IDs. Do not commit
 `.keito/config.yml`.
 
-The lifecycle hooks create one `source=agent` time entry when a tracked session
-ends. Do not create duplicate manual entries for the same coding session.
+The lifecycle hooks save minimized observed-turn evidence in a private local queue.
+A separately supervised worker sends canonical revisions for review; elapsed activity
+is not permission to bill. Verify local consent, worker and delivery with
+`keito capture status --json` and `keito capture worker-status --json`.
+Do not create duplicate manual entries for the same captured coding session.
 ",
             claude: "\
 ## Keito Time Tracking
 
 Keito agent time tracking is required before billable coding work in this
 repository. Before starting, verify `keito skill status --json`. If the skill
-or hooks are missing, stop and tell the user to run `keito skill install`.
+or hooks are missing, stop and tell the user to run `keito skill install --agent <claude-code|codex>`.
 
 If `.keito/config.yml` is missing for this worktree, stop and run
 `/track-time-keito` so the user can choose the Keito client, project, and task.
 Do not guess project or task IDs. Do not commit `.keito/config.yml`.
 
-The lifecycle hooks create one `source=agent` time entry when a tracked session
-ends. Do not create duplicate manual entries for the same coding session.
+The lifecycle hooks save minimized observed-turn evidence in a private local queue.
+A separately supervised worker sends canonical revisions for review; elapsed activity
+is not permission to bill. Verify local consent, worker and delivery with
+`keito capture status --json` and `keito capture worker-status --json`.
+Do not create duplicate manual entries for the same captured coding session.
 ",
         },
     }
@@ -1001,6 +1035,58 @@ fn relative_display(path: &Path) -> String {
             }
         })
         .unwrap_or_else(|| path.display().to_string())
+}
+
+fn capture_diagnostics() -> (serde_json::Value, serde_json::Value) {
+    let default_worker = serde_json::json!({"installed":false,"loaded":false,"running":false,"stale":false,"state":"UNKNOWN"});
+    let directory = std::env::var_os("KEITO_CAPTURE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            crate::config::AppConfig::config_dir()
+                .ok()
+                .map(|p| p.join("capture"))
+        });
+    let Some(directory) = directory else {
+        return (
+            serde_json::json!({"storage_paused":true,"reason":"STORAGE_UNAVAILABLE"}),
+            default_worker,
+        );
+    };
+    let Ok(store) = crate::capture::Store::open(&directory) else {
+        return (
+            serde_json::json!({"storage_paused":true,"reason":"STORAGE_UNAVAILABLE"}),
+            default_worker,
+        );
+    };
+    let Ok(status) = store.status() else {
+        return (
+            serde_json::json!({"storage_paused":true,"reason":"STORAGE_UNAVAILABLE"}),
+            default_worker,
+        );
+    };
+    let mut capture =
+        serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({"storage_paused":true}));
+    let repository = std::env::current_dir()
+        .ok()
+        .and_then(|path| crate::capture::Repository::resolve(&path).ok());
+    let worker = if let Some(repository) = repository {
+        capture["current_repository"] = match store.binding(&repository.key) {
+            Ok(Some(binding)) => {
+                serde_json::json!({"approved":!binding.revoked,"paused":binding.paused,"mapping_current":repository.matches_binding(&binding)})
+            }
+            _ => serde_json::json!({"approved":false,"reason":"LOCAL_APPROVAL_REQUIRED"}),
+        };
+        crate::capture_supervisor::Supervisor::system()
+            .ok()
+            .and_then(|s| s.status(&repository.key, None).ok())
+            .and_then(|s| serde_json::to_value(s).ok())
+            .unwrap_or(default_worker)
+    } else {
+        capture["current_repository"] =
+            serde_json::json!({"approved":false,"reason":"REPOSITORY_UNAVAILABLE"});
+        default_worker
+    };
+    (capture, worker)
 }
 
 #[cfg(test)]

@@ -169,4 +169,19 @@ exit 1
         assert!(s.uninstall(conf.repository_key).is_err());
         assert_eq!(std::fs::read(&owned).unwrap(), original);
     }
+    #[test]
+    fn owned_worker_registry_survives_repository_removal_and_allows_exact_removal() {
+        let (_temp, s, exe, root, capture) = fixture();
+        let key = keito_cli::capture::hash("stable-family");
+        let mut conf = config(&exe, &root, &capture);
+        conf.repository_key = &key;
+        s.install(&conf).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let workers = s.list().unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].worker_id, key);
+        assert!(workers[0].status.loaded);
+        s.uninstall(&workers[0].worker_id).unwrap();
+        assert!(s.list().unwrap().is_empty());
+    }
 }
