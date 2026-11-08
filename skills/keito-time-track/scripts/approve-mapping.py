@@ -42,7 +42,18 @@ def sync_directory(directory):
         os.close(fd)
 
 
-def atomic(file, content, mode=0o600):
+UNCONDITIONAL = object()
+
+
+def require_current(file, expected):
+    if file.is_symlink() or (file.exists() and not file.is_file()):
+        raise SafeError('Mapping changed outside setup; it was preserved. Inspect capture status and recovery metadata before retrying.')
+    current = file.read_bytes() if file.exists() else None
+    if current != expected:
+        raise SafeError('Mapping changed outside setup; it was preserved. Inspect capture status and recovery metadata before retrying.')
+
+
+def atomic(file, content, mode=0o600, expected=UNCONDITIONAL):
     fd, name = tempfile.mkstemp(prefix='.capture-setup-', dir=file.parent)
     temporary = Path(name)
     try:
@@ -51,6 +62,12 @@ def atomic(file, content, mode=0o600):
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+        if expected is not UNCONDITIONAL:
+            # Recheck after the temporary-file fsync, at the publication
+            # boundary for both the candidate hint and rollback. External
+            # writers do not honor our advisory lock: this narrows the race,
+            # but comparison plus rename is not universal filesystem CAS.
+            require_current(file, expected)
         os.replace(temporary, file)
         sync_directory(file.parent)
     finally:
@@ -77,9 +94,10 @@ def restore(hint, journal):
         pass
     elif current is not None and hashlib.sha256(current).hexdigest() == data['candidate_sha256']:
         if original is None:
+            require_current(hint, current)
             hint.unlink()
         else:
-            atomic(hint, original, data['mode'])
+            atomic(hint, original, data['mode'], expected=current)
     else:
         raise SafeError('Mapping changed outside setup; it was preserved. Inspect capture status and recovery metadata before retrying.')
     journal.unlink()
@@ -130,7 +148,7 @@ def main():
             checked(root, directory, hint, journal)
             if (hint.read_bytes() if hint.exists() else None) != original:
                 raise SafeError('Mapping changed during preparation. Inspect capture status before retrying.')
-            atomic(hint, candidate)
+            atomic(hint, candidate, expected=original)
             command = [os.environ.get('KEITO_CLI_BIN', 'keito'), '--workspace', args.workspace, 'capture', 'setup']
             for agent in dict.fromkeys(args.agent):
                 command += ['--agent', agent]

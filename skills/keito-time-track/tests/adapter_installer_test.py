@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Thin adapters/installers: temporary HOME and fake CLI only; no account/network."""
+import base64
 import json
 import os
 from pathlib import Path
@@ -490,6 +491,74 @@ m.apply('codex','install',SimpleNamespace(confirm_migration=False,harness_versio
                     self.assertEqual(len([c for c in self.recorded() if "setup" in c["args"]]), count_before)
                 self.assertEqual(hint.read_bytes(), old)
                 self.assertFalse((hint.parent / ".capture-mapping-recovery.json").exists())
+
+    def test_external_mapping_edit_during_publish_or_restore_fsync_is_preserved(self):
+        # Run the real entrypoint. Inject only an external writer immediately
+        # after fsync of the candidate/restoration temporary file.
+        wrapper = r'''
+import os, pathlib, runpy, sys, tempfile
+root = pathlib.Path(os.environ['FIXTURE_ROOT'])
+hint = root / '.keito/config.yml'
+real_mkstemp, real_fsync = tempfile.mkstemp, os.fsync
+temporary_files = {}
+fired = False
+external = b'{"workspace_id":"external","client_id":"c-external","project_id":"p-external","task_id":"t-external","agent_tracking":{"enabled":false}}\n'
+def mkstemp(*args, **kwargs):
+    fd, name = real_mkstemp(*args, **kwargs)
+    temporary_files[fd] = pathlib.Path(name)
+    return fd, name
+def fsync(fd):
+    global fired
+    result = real_fsync(fd)
+    temporary = temporary_files.get(fd)
+    if not fired and temporary and temporary.exists():
+        content = temporary.read_bytes()
+        target = (b'"workspace_id": "co_test"' in content if os.environ['INJECT_PHASE'] == 'publish'
+                  else content.startswith(b'{"workspace_id":"old"'))
+        if target:
+            fired = True
+            hint.write_bytes(external)
+            (root / 'external-edit-injected').write_bytes(external)
+    return result
+tempfile.mkstemp, os.fsync = mkstemp, fsync
+script = sys.argv[1]
+sys.argv = [script, '--root', str(root), '--workspace', 'co_test', '--client', 'c1',
+            '--project', 'p1', '--task', 't1', '--agent', 'codex', '--confirm']
+runpy.run_path(script, run_name='__main__')
+'''
+        for phase in ('publish', 'rollback'):
+            with self.subTest(phase=phase):
+                root = self.root / ('mapping-' + phase)
+                directory = root / '.keito'
+                directory.mkdir(parents=True)
+                hint = directory / 'config.yml'
+                old = b'{"workspace_id":"old","client_id":"c-old","project_id":"p-old","task_id":"t-old","agent_tracking":{"enabled":false}}\n'
+                hint.write_bytes(old)
+                before = len([c for c in self.recorded() if 'setup' in c['args']])
+                result = subprocess.run([sys.executable, '-c', wrapper, str(SKILL / 'scripts/approve-mapping.py')],
+                    env={**self.env, 'FIXTURE_ROOT': str(root), 'INJECT_PHASE': phase, 'FAKE_PICKER': '1',
+                         'FAKE_SETUP_EXIT': '0' if phase == 'publish' else '9'},
+                    capture_output=True, text=True, timeout=10)
+                external = (root / 'external-edit-injected').read_bytes()
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(hint.read_bytes(), external)
+                self.assertIn('preserved', result.stderr)
+                self.assertIn('status', result.stderr)
+                journal = directory / '.capture-mapping-recovery.json'
+                self.assertTrue(journal.is_file())
+                self.assertEqual(base64.b64decode(json.loads(journal.read_text())['original']), old)
+                calls = [c for c in self.recorded() if 'setup' in c['args']]
+                self.assertEqual(len(calls) - before, 0 if phase == 'publish' else 1)
+                # A retry must retain the external hint/journal and never replay
+                # consent while operator inspection remains necessary.
+                retry = subprocess.run([sys.executable, str(SKILL / 'scripts/approve-mapping.py'),
+                    '--root', str(root), '--workspace', 'co_test', '--client', 'c1',
+                    '--project', 'p1', '--task', 't1', '--agent', 'codex', '--confirm'],
+                    env=self.env, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(retry.returncode, 0)
+                self.assertEqual(hint.read_bytes(), external)
+                self.assertTrue(journal.is_file())
+                self.assertEqual(len([c for c in self.recorded() if 'setup' in c['args']]), len(calls))
 
     def test_home_alias_is_allowed_but_dangling_child_symlink_is_refused(self):
         alias = self.root / "approved-home-alias"
