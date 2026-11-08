@@ -124,7 +124,9 @@ impl Clock {
 #[derive(Clone, Debug)]
 pub struct Repository {
     pub key: String,
+    pub remote_hash: String,
     pub hint_hash: String,
+    pub linked_without_hint: bool,
     pub disabled: bool,
 }
 fn git(directory: &Path, args: &[&str]) -> Result<String, AppError> {
@@ -144,6 +146,11 @@ fn git(directory: &Path, args: &[&str]) -> Result<String, AppError> {
         .map_err(|_| AppError::Config("Cannot inspect repository identity".into()))
 }
 impl Repository {
+    pub fn matches_binding(&self, binding: &Binding) -> bool {
+        !self.disabled
+            && self.remote_hash == binding.remote_hash
+            && (self.linked_without_hint || self.hint_hash == binding.hint_hash)
+    }
     pub fn resolve(directory: &Path) -> Result<Self, AppError> {
         let root = PathBuf::from(git(directory, &["rev-parse", "--show-toplevel"])?)
             .canonicalize()
@@ -164,11 +171,8 @@ impl Repository {
         .unwrap_or_default();
         let mut remotes: Vec<_> = remotes.lines().collect();
         remotes.sort_unstable();
-        let key = hash(format!(
-            "{}\0{}",
-            common.to_string_lossy(),
-            remotes.join("\n")
-        ));
+        let key = hash(common.to_string_lossy().as_bytes());
+        let remote_hash = hash(remotes.join("\n"));
         let hint_path = root.join(".keito/config.yml");
         let mut disabled = false;
         let hint_hash = if hint_path.exists() {
@@ -209,9 +213,12 @@ impl Repository {
         } else {
             hash(b"no-mapping-hint")
         };
+        let linked_without_hint = root.join(".git").is_file() && !hint_path.exists();
         Ok(Self {
             key,
+            remote_hash,
             hint_hash,
+            linked_without_hint,
             disabled,
         })
     }
@@ -220,6 +227,8 @@ impl Repository {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Binding {
     pub repository_key: String,
+    #[serde(default)]
+    pub remote_hash: String,
     pub hint_hash: String,
     pub id: String,
     pub version: i64,
@@ -286,6 +295,12 @@ pub struct CapturePayload {
     pub segments: Vec<Segment>,
     pub usage: serde_json::Value,
 }
+fn canonical_session_key(binding: &Binding, source: &str, session_id: &str) -> String {
+    hash(format!(
+        "{}\0{}\0{}\0{}\0{}",
+        binding.origin_hash, binding.workspace_id, binding.owner_id, source, session_id
+    ))
+}
 impl Session {
     fn begin(
         binding: &Binding,
@@ -295,7 +310,7 @@ impl Session {
         clock: &Clock,
     ) -> Self {
         Self {
-            id: hash(format!("{}\0{}\0{}", binding.id, source, session_id)),
+            id: canonical_session_key(binding, source, session_id),
             source_session_id: session_id.into(),
             source_namespace: source.into(),
             binding: binding.clone(),
@@ -339,6 +354,9 @@ impl Session {
                 });
             }
             self.seen_turns.insert(active.key.clone());
+            if !complete {
+                self.needs_attention = true;
+            }
             self.last_turn = Some(active.key);
         }
         self.observed_through = self.observed_through.max(clock.wall);
@@ -504,21 +522,53 @@ impl Store {
         Self::check_size(&tx)?;
         let previous = Self::binding_in(&tx, &binding.repository_key)?;
         if let Some(old) = &previous {
-            if !old.revoked
+            if old.remote_hash == binding.remote_hash
                 && old.hint_hash == binding.hint_hash
                 && old.workspace_id == binding.workspace_id
                 && old.owner_id == binding.owner_id
                 && old.origin_hash == binding.origin_hash
                 && old.project_id == binding.project_id
                 && old.task_id == binding.task_id
-                && old.agents.iter().collect::<std::collections::BTreeSet<_>>()
-                    == binding
-                        .agents
-                        .iter()
-                        .collect::<std::collections::BTreeSet<_>>()
             {
-                return Ok(old.clone());
+                binding.id = old.id.clone();
+                binding.version = old.version;
+                binding.paused = old.paused && !old.revoked;
+                binding.revoked = false;
+                tx.execute(
+                    "UPDATE bindings SET data=?2 WHERE repo_key=?1",
+                    params![
+                        binding.repository_key,
+                        serde_json::to_string(&binding).map_err(storage_error)?
+                    ],
+                )
+                .map_err(storage_error)?;
+                let mut statement=tx.prepare("SELECT o.id,json_extract(s.data,'$.source_namespace'),o.state,o.reason FROM outbox o JOIN sessions s ON s.id=o.session_id WHERE s.binding_id=?1 AND o.state!='acknowledged'").map_err(storage_error)?;
+                let rows: Vec<(i64, String, String, Option<String>)> = statement
+                    .query_map([&binding.id], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })
+                    .map_err(storage_error)?
+                    .collect::<Result<_, _>>()
+                    .map_err(storage_error)?;
+                drop(statement);
+                for (id, source, state, reason) in rows {
+                    if !binding.agents.contains(&source) {
+                        tx.execute("UPDATE outbox SET state='held',reason='HARNESS_CONSENT_REVOKED' WHERE id=?1",[id]).map_err(storage_error)?;
+                    } else if state == "held"
+                        && reason.as_deref() == Some("HARNESS_CONSENT_REVOKED")
+                    {
+                        tx.execute(
+                            "UPDATE outbox SET state='pending',reason=NULL WHERE id=?1",
+                            [id],
+                        )
+                        .map_err(storage_error)?;
+                    }
+                }
+                tx.commit().map_err(storage_error)?;
+                return Ok(binding);
             }
+            tx.execute("UPDATE outbox SET state='held',reason='MAPPING_CHANGED_REVIEW_REQUIRED' WHERE session_id IN(SELECT id FROM sessions WHERE binding_id=?1) AND state!='acknowledged'",[&old.id]).map_err(storage_error)?;
+            tx.execute("UPDATE sessions SET data=json_set(data,'$.needs_attention',json('true')) WHERE binding_id=?1",[&old.id]).map_err(storage_error)?;
         }
         binding.version = previous.as_ref().map_or(1, |b| b.version + 1);
         binding.id = hash(format!(
@@ -577,21 +627,42 @@ impl Store {
         let Some(binding) = Self::binding_in(&tx, &repository.key)? else {
             return Ok(());
         };
-        if repository.disabled
+        if !repository.matches_binding(&binding)
             || binding.revoked
-            || binding.hint_hash != repository.hint_hash
             || !binding.agents.iter().any(|a| a == source)
         {
             return Ok(());
         }
-        if binding.paused {
+        if binding.paused
+            && !matches!(
+                event,
+                CaptureEvent::Stop | CaptureEvent::Interrupt | CaptureEvent::SessionEnd
+            )
+        {
             return Ok(());
         }
-        let id = hash(format!("{}\0{}\0{}", binding.id, source, source_id));
-        let raw: Option<String> = tx
-            .query_row("SELECT data FROM sessions WHERE id=?1", [&id], |r| r.get(0))
-            .optional()
+        let mut statement=tx.prepare("SELECT data FROM sessions WHERE source_id=?1 AND json_extract(data,'$.source_namespace')=?2 AND json_extract(data,'$.binding.workspace_id')=?3 AND json_extract(data,'$.binding.owner_id')=?4 AND json_extract(data,'$.binding.origin_hash')=?5 LIMIT 2").map_err(storage_error)?;
+        let matches: Vec<String> = statement
+            .query_map(
+                params![
+                    source_id,
+                    source,
+                    binding.workspace_id,
+                    binding.owner_id,
+                    binding.origin_hash
+                ],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
             .map_err(storage_error)?;
+        drop(statement);
+        if matches.len() > 1 {
+            return Err(AppError::Config(
+                "Conflicting canonical session state; evidence requires review".into(),
+            ));
+        }
+        let raw = matches.into_iter().next();
         if raw.is_none() && !matches!(event, CaptureEvent::SessionStart | CaptureEvent::Prompt) {
             return Ok(());
         }
@@ -599,6 +670,10 @@ impl Store {
             .map(|v| serde_json::from_str(&v).map_err(storage_error))
             .transpose()?
             .unwrap_or_else(|| Session::begin(&binding, source, source_id, version, clock));
+        if session.binding.id != binding.id {
+            return Err(AppError::Config("Native session mapping changed; review held evidence and begin a new native session".into()));
+        }
+        let id = session.id.clone();
         if resumed && event == CaptureEvent::SessionStart {
             session.close(clock, false)?;
         }
@@ -717,7 +792,7 @@ impl Store {
         let tx = self.transaction()?;
         let mut binding = Self::binding_in(&tx, &repository.key)?
             .ok_or_else(|| AppError::Config("Repository not approved; run capture setup".into()))?;
-        if action == "resume" && (binding.revoked || binding.hint_hash != repository.hint_hash) {
+        if action == "resume" && (binding.revoked || !repository.matches_binding(&binding)) {
             return Err(AppError::Config(
                 "Binding changed or revoked; run capture setup to approve again".into(),
             ));

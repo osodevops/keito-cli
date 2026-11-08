@@ -144,6 +144,7 @@ pub async fn run(
             }
             let approved = store.approve(Binding {
                 repository_key: repo.key,
+                remote_hash: repo.remote_hash,
                 hint_hash: repo.hint_hash,
                 id: String::new(),
                 version: 0,
@@ -181,7 +182,7 @@ pub async fn run(
             value["current_repository"] = match current_repo() {
                 Ok(repo) => match store.binding(&repo.key)? {
                     Some(b) => {
-                        json!({"approved":!b.revoked,"paused":b.paused,"mapping_current":b.hint_hash==repo.hint_hash,"binding_id":b.id})
+                        json!({"approved":!b.revoked,"paused":b.paused,"mapping_current":repo.matches_binding(&b),"binding_id":b.id})
                     }
                     None => json!({"approved":false,"reason":"LOCAL_APPROVAL_REQUIRED"}),
                 },
@@ -290,7 +291,7 @@ async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
     let Some(binding) = store.binding(&repo.key)? else {
         return Ok(json!({"accepted":0,"held":0,"reason":"LOCAL_APPROVAL_REQUIRED"}));
     };
-    if repo.disabled || binding.paused || binding.revoked || binding.hint_hash != repo.hint_hash {
+    if !repo.matches_binding(&binding) || binding.paused || binding.revoked {
         return Ok(json!({"accepted":0,"held":1,"reason":"BINDING_REAPPROVAL_REQUIRED"}));
     }
     if !store.has_ready(&binding, UtcClock::seconds())? {
@@ -319,6 +320,18 @@ async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
         .map_err(|_| AppError::Network("Cannot initialize capture transport".into()))?;
     // A sync invocation has bounded work; queued revisions remain durable.
     for _ in 0..100 {
+        let current_repository = current_repo()?;
+        let current_auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
+        let current_origin = AppConfig::load().map_err(sanitize_error)?.api_base_url();
+        if current_repository.key != binding.repository_key
+            || !current_repository.matches_binding(&binding)
+            || current_auth.workspace_id != auth.workspace_id
+            || current_auth.api_key != auth.api_key
+            || current_origin.trim_end_matches('/') != origin.trim_end_matches('/')
+        {
+            held += 1;
+            break;
+        }
         let now = UtcClock::seconds();
         let Some(row) = store.claim(&binding, now)? else {
             break;

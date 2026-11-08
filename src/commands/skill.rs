@@ -136,6 +136,11 @@ const BUNDLED_SKILL_FILES: &[BundledSkillFile] = &[
         executable: true,
     },
     BundledSkillFile {
+        path: "scripts/approve-mapping.py",
+        contents: include_str!("../../skills/keito-time-track/scripts/approve-mapping.py"),
+        executable: true,
+    },
+    BundledSkillFile {
         path: "scripts/disable.sh",
         contents: include_str!("../../skills/keito-time-track/scripts/disable.sh"),
         executable: true,

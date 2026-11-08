@@ -12,6 +12,8 @@ fn clock(s: i64) -> Clock {
 fn repo() -> Repository {
     Repository {
         key: capture::hash("fixture-repo"),
+        remote_hash: capture::hash("fixture-remote"),
+        linked_without_hint: false,
         hint_hash: capture::hash("fixture-config"),
         disabled: false,
     }
@@ -19,6 +21,7 @@ fn repo() -> Repository {
 fn binding() -> Binding {
     Binding {
         repository_key: repo().key,
+        remote_hash: repo().remote_hash,
         hint_hash: repo().hint_hash,
         id: String::new(),
         version: 0,
@@ -152,7 +155,6 @@ fn pause_excludes_interval_and_does_not_reset_earned_time() {
     let (_dir, mut store, _) = setup();
     event(&mut store, "session", Some("turn"), Prompt, 0);
     store.control(&repo(), "pause", &clock(30)).unwrap();
-    event(&mut store, "session", Some("turn"), Stop, 100);
     store.control(&repo(), "resume", &clock(130)).unwrap();
     event(&mut store, "session", Some("turn"), Stop, 175);
     let s = &store.preview("session").unwrap()[0];
@@ -388,7 +390,8 @@ fn linked_worktrees_share_identity_but_nested_repositories_and_changed_remotes_d
         ],
     );
     let changed = Repository::resolve(&root).unwrap();
-    assert_ne!(original.key, changed.key);
+    assert_eq!(original.key, changed.key);
+    assert_ne!(original.remote_hash, changed.remote_hash);
     assert!(!changed.key.contains("SECRET"));
 }
 
@@ -537,6 +540,7 @@ fn absent_linked_hint_inherits_approval_but_explicit_conflict_is_held() {
     let worktree = Repository::resolve(&linked).unwrap();
     let mut b = binding();
     b.repository_key = main.key.clone();
+    b.remote_hash = main.remote_hash.clone();
     b.hint_hash = main.hint_hash.clone();
     let mut store = Store::open(&temp.path().join("capture")).unwrap();
     store.approve(b).unwrap();
@@ -590,4 +594,56 @@ fn remote_changes_do_not_change_operational_repository_family_identity() {
     );
     let after = Repository::resolve(temp.path()).unwrap();
     assert_eq!(before.key, after.key);
+}
+
+#[test]
+fn remapping_a_native_session_is_held_instead_of_starting_revision_one_again() {
+    let (_dir, mut store, first) = setup();
+    event(&mut store, "native-remap", Some("first"), Prompt, 0);
+    event(&mut store, "native-remap", Some("first"), Stop, 60);
+    let mut changed = binding();
+    changed.project_id = "other_project".into();
+    let next = store.approve(changed).unwrap();
+    assert_ne!(first.id, next.id);
+    assert!(store
+        .event(
+            &repo(),
+            capture::Signal {
+                source: "codex",
+                resumed: false,
+                source_id: "native-remap",
+                turn_id: Some("second"),
+                version: "fixture-v1",
+                event: Prompt,
+                clock: &clock(100)
+            }
+        )
+        .is_err());
+    let sessions = store.preview("native-remap").unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].revision, 1);
+    assert!(sessions[0].needs_attention);
+    assert_eq!(store.status().unwrap().held, 1);
+    assert_eq!(
+        store.status().unwrap().queue[0].reason.as_deref(),
+        Some("MAPPING_CHANGED_REVIEW_REQUIRED")
+    );
+}
+#[test]
+fn all_terminal_events_during_pause_reconcile_without_reopening_the_turn() {
+    for terminal in [Interrupt, SessionEnd] {
+        let (_dir, mut store, _) = setup();
+        event(&mut store, "pause-final", Some("turn"), Prompt, 0);
+        store.control(&repo(), "pause", &clock(30)).unwrap();
+        event(&mut store, "pause-final", Some("turn"), terminal, 60);
+        store.control(&repo(), "resume", &clock(100)).unwrap();
+        event(&mut store, "pause-final", Some("turn"), Stop, 150);
+        let s = &store.preview("pause-final").unwrap()[0];
+        assert_eq!(
+            s.segments.iter().map(|s| s.duration_seconds).sum::<i64>(),
+            30
+        );
+        assert!(s.needs_attention);
+        assert_eq!(store.status().unwrap().unfinished, 0);
+    }
 }

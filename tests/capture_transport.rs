@@ -45,6 +45,7 @@ fn seed(home: &Path, root: &Path, origin: &str) -> (Store, Binding) {
     let b = store
         .approve(Binding {
             repository_key: repo.key.clone(),
+            remote_hash: repo.remote_hash.clone(),
             hint_hash: repo.hint_hash.clone(),
             id: String::new(),
             version: 0,

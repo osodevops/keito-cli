@@ -23,6 +23,7 @@ fn concurrent_real_hook_processes_persist_once_and_discard_raw_content() {
     store
         .approve(Binding {
             repository_key: repo.key.clone(),
+            remote_hash: repo.remote_hash.clone(),
             hint_hash: repo.hint_hash.clone(),
             id: String::new(),
             version: 0,
