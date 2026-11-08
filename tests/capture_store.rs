@@ -461,3 +461,133 @@ fn resumed_harness_keeps_completed_turns_and_marks_the_abandoned_interval_incomp
     assert_eq!(s.segments[1].completeness, "INCOMPLETE");
     assert!(s.needs_attention);
 }
+
+#[test]
+fn stopped_while_paused_never_reopens_or_counts_idle_after_resume() {
+    let (_dir, mut store, _) = setup();
+    event(&mut store, "paused-end", Some("turn"), Prompt, 0);
+    store.control(&repo(), "pause", &clock(30)).unwrap();
+    event(&mut store, "paused-end", Some("turn"), Stop, 60);
+    store.control(&repo(), "resume", &clock(100)).unwrap();
+    event(&mut store, "paused-end", Some("turn"), Stop, 150);
+    assert_eq!(
+        store.preview("paused-end").unwrap()[0]
+            .segments
+            .iter()
+            .map(|s| s.duration_seconds)
+            .sum::<i64>(),
+        30
+    );
+    assert_eq!(store.status().unwrap().unfinished, 0);
+    assert_eq!(store.status().unwrap().pending, 1);
+}
+#[test]
+fn adding_harness_preserves_native_session_revision_and_identical_reenable_keeps_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&temp.path().join("capture")).unwrap();
+    let mut b = binding();
+    b.agents = vec!["codex".into()];
+    let first = store.approve(b).unwrap();
+    event(&mut store, "native", Some("first"), Prompt, 0);
+    event(&mut store, "native", Some("first"), Stop, 60);
+    let (q, _) = body(&mut store, &first, 61);
+    store
+        .finish(&q, "acknowledged", "ACCEPTED", clock(61).wall, None)
+        .unwrap();
+    let second = store.approve(binding()).unwrap();
+    event(&mut store, "native", Some("second"), Prompt, 100);
+    event(&mut store, "native", Some("second"), Stop, 160);
+    let (_, p) = body(&mut store, &second, 161);
+    assert_eq!(p["revision"], 2);
+    store.control(&repo(), "disable", &clock(170)).unwrap();
+    let renewed = store.approve(binding()).unwrap();
+    assert_eq!(renewed.id, second.id);
+}
+#[test]
+fn absent_linked_hint_inherits_approval_but_explicit_conflict_is_held() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("main");
+    std::fs::create_dir(&root).unwrap();
+    git(&root, &["init"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "user.name=Fixture",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+    );
+    std::fs::create_dir(root.join(".keito")).unwrap();
+    std::fs::write(
+        root.join(".keito/config.yml"),
+        "project_id: p_fixture\ntask_id: t_fixture\nagent_tracking:\n  enabled: true\n",
+    )
+    .unwrap();
+    let linked = temp.path().join("linked");
+    git(
+        &root,
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+    let main = Repository::resolve(&root).unwrap();
+    let worktree = Repository::resolve(&linked).unwrap();
+    let mut b = binding();
+    b.repository_key = main.key.clone();
+    b.hint_hash = main.hint_hash.clone();
+    let mut store = Store::open(&temp.path().join("capture")).unwrap();
+    store.approve(b).unwrap();
+    for (kind, s) in [(Prompt, 0), (Stop, 90)] {
+        store
+            .event(
+                &worktree,
+                capture::Signal {
+                    source: "codex",
+                    resumed: false,
+                    source_id: "linked-session",
+                    turn_id: Some("turn"),
+                    version: "0.167.0",
+                    event: kind,
+                    clock: &clock(s),
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.preview("linked-session").unwrap()[0].segments[0].duration_seconds,
+        90
+    );
+    std::fs::create_dir(linked.join(".keito")).unwrap();
+    std::fs::write(linked.join(".keito/config.yml"), "project_id: other\n").unwrap();
+    let conflict = Repository::resolve(&linked).unwrap();
+    store
+        .event(
+            &conflict,
+            capture::Signal {
+                source: "codex",
+                resumed: false,
+                source_id: "wrong-session",
+                turn_id: Some("turn"),
+                version: "0.167.0",
+                event: Prompt,
+                clock: &clock(100),
+            },
+        )
+        .unwrap();
+    assert!(store.preview("wrong-session").unwrap().is_empty());
+}
+#[test]
+fn remote_changes_do_not_change_operational_repository_family_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init"]);
+    let before = Repository::resolve(temp.path()).unwrap();
+    git(
+        temp.path(),
+        &["remote", "add", "origin", "https://example.invalid/other"],
+    );
+    let after = Repository::resolve(temp.path()).unwrap();
+    assert_eq!(before.key, after.key);
+}
