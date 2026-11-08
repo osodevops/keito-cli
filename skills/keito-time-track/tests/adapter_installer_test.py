@@ -78,7 +78,7 @@ if os.environ.get('FAKE_IGNORE_TERM'):
         Path(os.environ['FAKE_TERM_MARKER']).write_text('TERM ignored')
 time.sleep(float(os.environ.get('FAKE_SLEEP', '0')))
 exit_code = int(os.environ.get('FAKE_EXIT', '0'))
-if exit_code == 0 and os.environ.get('FAKE_NO_ACK') != '1' and os.environ.get('KEITO_CAPTURE_ACK_FD'):
+if (exit_code == 0 or os.environ.get('FAKE_ACK_ALWAYS') == '1') and os.environ.get('FAKE_NO_ACK') != '1' and os.environ.get('KEITO_CAPTURE_ACK_FD'):
     os.write(int(os.environ['KEITO_CAPTURE_ACK_FD']), os.environ.get('FAKE_ACK_BYTES', 'KEITO_CAPTURE_DURABLE_V1\\n').encode())
 sys.exit(exit_code)
 """)
@@ -148,13 +148,31 @@ sys.exit(exit_code)
             env = {**self.env, 'FAKE_NO_ACK': '1'} if value == 'missing' else {**self.env, 'FAKE_ACK_BYTES': value}
             result = self.run_script('hooks/stop.sh',payload='PRIVATE_PRELAUNCH_CANARY',env=env)
             self.assertEqual((result.returncode,result.stdout,result.stderr),(0,'',''))
+        crashed = self.run_script('hooks/stop.sh',payload='PRIVATE_CRASH_CANARY',
+            env={**self.env,'FAKE_EXIT':'9','FAKE_ACK_ALWAYS':'1'})
+        self.assertEqual((crashed.returncode,crashed.stdout,crashed.stderr),(0,'',''))
         markers = list(directory.iterdir())
-        self.assertEqual(len(markers),3)
+        self.assertEqual(len(markers),4)
         for marker in markers:
             self.assertRegex(marker.name,r'^[a-f0-9]{64}\.pending$')
             self.assertEqual(marker.read_bytes(),b'KEITO_CAPTURE_PENDING_V1\n')
             self.assertEqual(marker.stat().st_mode & 0o777,0o600)
         self.assertEqual(directory.stat().st_mode & 0o777,0o700)
+
+    def test_guard_rejects_zero_length_storage_write_without_spinning(self):
+        spec = importlib.util.spec_from_file_location('guard_zero_write',SKILL/'hooks/guard.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        directory = self.root/'zero-write-invocations'
+        directory.mkdir(mode=0o700)
+        fd = os.open(directory,os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with mock.patch.object(module.os,'write',side_effect=[0,AssertionError('A zero write must refuse before another write')]):
+                with self.assertRaises(module.GuardRefused):
+                    module.prepare(fd,'a'*64)
+            self.assertEqual((directory/('a'*64+'.preparing')).read_bytes(),b'')
+        finally:
+            os.close(fd)
 
     def test_first_attempt_core_that_never_enters_handler_retains_failure_evidence(self):
         # No preflight/warmup of this executable. Delay is before its first

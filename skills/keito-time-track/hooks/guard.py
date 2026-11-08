@@ -118,7 +118,10 @@ def prepare(invocations, nonce):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         offset = 0
         while offset < len(PENDING):
-            offset += os.write(fd, PENDING[offset:])
+            written = os.write(fd, PENDING[offset:])
+            if written <= 0:
+                raise GuardRefused()
+            offset += written
         os.fsync(fd)
         os.fsync(invocations)
         return fd
@@ -229,7 +232,7 @@ def main():
                     if len(response) > len(ACK):
                         break
             if child.poll() is not None and eof:
-                if bytes(response) == ACK:
+                if child.returncode == 0 and bytes(response) == ACK:
                     remove_acknowledged(root, invocations, nonce, marker)
                 return
             if eof:
