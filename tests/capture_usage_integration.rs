@@ -70,6 +70,9 @@ impl Fixture {
         .unwrap();
     }
     fn event(&mut self, event: CaptureEvent, n: i64, usage: bool) {
+        self.event_turn(event, n, usage, "prompt_1");
+    }
+    fn event_turn(&mut self, event: CaptureEvent, n: i64, usage: bool, turn: &str) {
         let source = UsageSource {
             resolved_home: &self.home,
             exact_hook_path: &self.path,
@@ -83,7 +86,7 @@ impl Fixture {
                     source: "claude-code",
                     resumed: false,
                     source_id: SESSION,
-                    turn_id: Some("prompt_1"),
+                    turn_id: Some(turn),
                     version: "2.1.319",
                     event,
                     clock: &clock(n),
@@ -91,6 +94,22 @@ impl Fixture {
                 if usage { Some(&source) } else { None },
             )
             .unwrap();
+    }
+    fn start(&mut self, n: i64) {
+        self.write(vec![]);
+        self.event(Prompt, n, true);
+    }
+    fn usage_ids(&self) -> Vec<String> {
+        self.bodies()
+            .into_iter()
+            .flat_map(|body| {
+                body["usage"]["records"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .map(|record| record["source_record_id"].as_str().unwrap().to_owned())
+            .collect()
     }
     fn bodies(&self) -> Vec<Value> {
         let db =
@@ -290,4 +309,91 @@ fn provisional_request_does_not_permanently_hold_a_later_final_usage_revision() 
     assert_eq!(bodies[1]["usage"]["records"].as_array().unwrap().len(), 1);
     assert_eq!(bodies[1]["segments"], json!([]));
     assert!(!f.store.preview(SESSION).unwrap()[0].needs_attention);
+}
+
+#[test]
+fn first_enabled_prompt_baseline_excludes_preconsent_history_without_numeric_storage() {
+    let mut f = Fixture::new();
+    let mut old = request("msg_before_consent", 5);
+    old["message"]["usage"]["input_tokens"] = json!(999123457u64);
+    f.write(vec![old.clone()]);
+    f.event(Prompt, 10, true);
+    let db = fs::read(f.dir.path().join("capture/capture.sqlite3")).unwrap();
+    assert!(!String::from_utf8_lossy(&db).contains("999123457"));
+    f.write(vec![old, request("msg_after_consent", 7)]);
+    f.event(Stop, 20, true);
+    assert_eq!(f.usage_ids(), vec!["msg_after_consent"]);
+}
+#[test]
+fn paused_terminals_collect_nothing_and_resume_requires_a_new_prompt_baseline() {
+    let mut f = Fixture::new();
+    f.start(0);
+    f.store.control(&repo(), "pause", &clock(30)).unwrap();
+    let paused = request("msg_created_while_paused", 5);
+    f.write(vec![paused.clone()]);
+    f.event(Stop, 100, true);
+    assert!(f.usage_ids().is_empty());
+    let db = fs::read(f.dir.path().join("capture/capture.sqlite3")).unwrap();
+    assert!(!String::from_utf8_lossy(&db).contains("msg_created_while_paused"));
+    f.store.control(&repo(), "resume", &clock(110)).unwrap();
+    f.event(Stop, 150, true);
+    assert!(f.usage_ids().is_empty());
+    f.event_turn(Prompt, 200, true, "prompt_2");
+    f.write(vec![paused, request("msg_new_enabled_turn", 6)]);
+    f.event_turn(Stop, 250, true, "prompt_2");
+    assert_eq!(f.usage_ids(), vec!["msg_new_enabled_turn"]);
+}
+#[test]
+fn preconsent_provisional_id_stays_excluded_when_its_final_record_arrives() {
+    let mut f = Fixture::new();
+    let mut provisional = request("msg_existing_provisional", 0);
+    provisional["message"]["stop_reason"] = Value::Null;
+    f.write(vec![provisional]);
+    f.event(Prompt, 0, true);
+    f.write(vec![
+        request("msg_existing_provisional", 5),
+        request("msg_new_request", 6),
+    ]);
+    f.event(Stop, 10, true);
+    assert_eq!(f.usage_ids(), vec!["msg_new_request"]);
+}
+#[test]
+fn missing_prompt_baseline_cannot_be_reconstructed_from_a_later_terminal_snapshot() {
+    let mut f = Fixture::new();
+    f.event(Prompt, 0, true);
+    f.write(vec![request("msg_unknown_epoch", 5)]);
+    f.event(Stop, 10, true);
+    assert!(f.usage_ids().is_empty());
+    f.event_turn(Prompt, 20, true, "prompt_2");
+    f.write(vec![
+        request("msg_unknown_epoch", 5),
+        request("msg_baselined_epoch", 6),
+    ]);
+    f.event_turn(Stop, 30, true, "prompt_2");
+    assert_eq!(f.usage_ids(), vec!["msg_baselined_epoch"]);
+}
+#[test]
+fn terminal_capability_without_prompt_capability_never_retroactively_imports_usage() {
+    let mut f = Fixture::new();
+    f.write(vec![]);
+    f.event(Prompt, 0, false);
+    f.write(vec![request("msg_not_authorized_at_prompt", 5)]);
+    f.event(Stop, 10, true);
+    assert!(f.usage_ids().is_empty());
+}
+#[test]
+fn incomplete_prompt_baseline_requires_another_new_prompt_not_terminal_repair() {
+    let mut f = Fixture::new();
+    fs::write(&f.path, "{\"type\":\"assistant\",\"sessionId\":").unwrap();
+    f.event(Prompt, 0, true);
+    f.write(vec![request("msg_after_unsafe_baseline", 5)]);
+    f.event(Stop, 10, true);
+    assert!(f.usage_ids().is_empty());
+    f.event_turn(Prompt, 20, true, "prompt_2");
+    f.write(vec![
+        request("msg_after_unsafe_baseline", 5),
+        request("msg_after_complete_baseline", 6),
+    ]);
+    f.event_turn(Stop, 30, true, "prompt_2");
+    assert_eq!(f.usage_ids(), vec!["msg_after_complete_baseline"]);
 }
