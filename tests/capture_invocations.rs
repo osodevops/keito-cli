@@ -1,0 +1,18 @@
+#![cfg(unix)]
+use keito_cli::capture::{self, Binding, Clock, Repository, Signal, Store};
+use keito_cli::cli::capture::CaptureEvent::*;
+use std::{fs,io::Write,os::fd::AsRawFd,os::unix::fs::OpenOptionsExt,path::Path};
+const PENDING:&[u8]=b"KEITO_CAPTURE_PENDING_V1\n";
+fn clock(n:i64)->Clock{Clock{wall:1794067200+n,monotonic:1000+n,boot:"fixture".into()}}
+fn repo()->Repository{Repository{key:capture::hash("r"),remote_hash:capture::hash("remote"),hint_hash:capture::hash("hint"),linked_without_hint:false,disabled:false}}
+fn fixture()->(tempfile::TempDir,Store,Binding){let t=tempfile::tempdir().unwrap();let mut s=Store::open(t.path()).unwrap();let b=s.approve(Binding{repository_key:repo().key,remote_hash:repo().remote_hash,hint_hash:repo().hint_hash,id:String::new(),version:0,workspace_id:"co_test".into(),owner_id:"owner".into(),origin_hash:capture::hash("origin"),project_id:"p".into(),task_id:"t".into(),agents:vec!["codex".into()],paused:false,revoked:false}).unwrap();(t,s,b)}
+fn marker(root:&Path,nonce:&str,live:bool)->fs::File{use std::os::unix::fs::PermissionsExt;let root=root.join("capture-invocations");fs::create_dir_all(&root).unwrap();fs::set_permissions(&root,fs::Permissions::from_mode(0o700)).unwrap();let mut file=fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(root.join(format!("{nonce}.pending"))).unwrap();file.write_all(PENDING).unwrap();file.sync_all().unwrap();if live{assert_eq!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);}file}
+fn event(s:&mut Store,e:keito_cli::cli::capture::CaptureEvent,n:i64){s.event(&repo(),Signal{source:"codex",resumed:false,source_id:"session",turn_id:Some("turn"),version:"0.167.0",event:e,clock:&clock(n)}).unwrap();}
+#[test]
+fn core_never_entered_marker_prevents_a_later_stop_from_inventing_complete_seconds(){let(t,mut s,b)=fixture();event(&mut s,Prompt,0);let nonce=capture::hash("never-entered");drop(marker(&t.path().canonicalize().unwrap(),&nonce,false));event(&mut s,Stop,150);let v=s.preview("session").unwrap();assert_eq!(v[0].segments[0].duration_seconds,0);assert!(v[0].needs_attention);assert!(s.claim(&b,clock(160).wall).unwrap().is_none());assert!(s.status().unwrap().storage_paused);}
+#[test]
+fn live_guard_blocks_delivery_and_only_own_live_nonce_allows_hook_accounting(){let(t,mut s,b)=fixture();let root=t.path().canonicalize().unwrap();let nonce=capture::hash("live");let _guard=marker(&root,&nonce,true);s.hook_invocation(&nonce).unwrap();event(&mut s,Prompt,0);event(&mut s,Stop,30);assert!(!s.has_ready(&b,clock(31).wall).unwrap());assert!(s.claim(&b,clock(31).wall).unwrap().is_none());assert!(s.recover(&clock(32)).is_err());assert_eq!(s.preview("session").unwrap()[0].segments[0].duration_seconds,30);}
+#[test]
+fn dead_guard_cannot_be_impersonated_or_acknowledged_by_a_late_core(){let(t,mut s,_)=fixture();let nonce=capture::hash("dead");drop(marker(&t.path().canonicalize().unwrap(),&nonce,false));assert!(s.hook_invocation(&nonce).is_err());}
+#[test]
+fn dead_invocation_quarantines_existing_frozen_complete_bodies_through_recovery(){let(t,mut s,b)=fixture();event(&mut s,Prompt,0);event(&mut s,Stop,30);let row=s.claim(&b,clock(31).wall).unwrap().unwrap();let nonce=capture::hash("missing-ack");drop(marker(&t.path().canonicalize().unwrap(),&nonce,false));s.maintain(clock(32).wall).unwrap();s.recover(&clock(40)).unwrap();assert!(s.claim(&b,clock(50).wall).unwrap().is_none());let db=rusqlite::Connection::open(t.path().join("capture.sqlite3")).unwrap();let frozen:String=db.query_row("SELECT body FROM outbox",[],|r|r.get(0)).unwrap();assert_eq!(frozen,row.body);assert!(!s.status().unwrap().storage_paused);assert_eq!(s.status().unwrap().held,1);}
