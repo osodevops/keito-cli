@@ -727,3 +727,36 @@ fn queue_ceiling_reports_paused_reason_without_evicting_existing_evidence() {
         .unwrap();
     assert_eq!(body, q.body);
 }
+
+#[test]
+fn typed_acknowledgement_retires_only_expired_acknowledged_payloads() {
+    let (_dir, mut store, b) = setup();
+    for n in 0..2 {
+        let id = format!("turn-{n}");
+        event(&mut store, "retention", Some(&id), Prompt, n * 100);
+        event(&mut store, "retention", Some(&id), Stop, n * 100 + 90);
+    }
+    let (q, _) = body(&mut store, &b, 300);
+    store
+        .acknowledge(&q, "canonical-retention", clock(300).wall - 8 * 24 * 3600)
+        .unwrap();
+    let (next, _) = body(&mut store, &b, 301);
+    store
+        .acknowledge(&next, "canonical-retention", clock(301).wall)
+        .unwrap();
+    // Domain revision/session state remains, but an old local transport receipt is disposable.
+    let state = store.preview("retention").unwrap();
+    assert_eq!(state[0].revision, 2);
+    assert_eq!(
+        state[0].canonical_server_id.as_deref(),
+        Some("canonical-retention")
+    );
+    let dbpath = _dir.path().join("capture/capture.sqlite3");
+    let db = rusqlite::Connection::open(dbpath).unwrap();
+    let old: i64 = db
+        .query_row("SELECT COUNT(*) FROM outbox WHERE id=?1", [q.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(old, 0);
+}
