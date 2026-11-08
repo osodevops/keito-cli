@@ -1,6 +1,7 @@
 //! The numeric shapes/counts below are minimized actual 2026-11-08 probe
-//! observations. Metadata envelopes, malformed/stream variants and edge cases
-//! are synthetic validation fixtures, not harness qualification evidence.
+//! observations. Envelopes reconstruct allowlisted fields from the initial and
+//! envelope-session probes; raw content was discarded. Malformed/stream variants
+//! and edge cases are synthetic validation, not harness qualification evidence.
 #[path = "../src/capture_usage.rs"]
 mod capture_usage;
 use capture_usage::*;
@@ -64,10 +65,10 @@ impl Fixture {
     }
 }
 fn claude(id: &str, output: u64) -> Value {
-    json!({"type":"assistant","sessionId":SESSION,"message":{"id":id,"model":"claude-opus-5-5","usage":{"input_tokens":2,"cache_creation_input_tokens":2280,"cache_read_input_tokens":0,"output_tokens":output},"content":[{"text":"PRIVATE_PROMPT_CANARY /private/path sk-secret"}]}})
+    json!({"type":"assistant","sessionId":SESSION,"message":{"id":id,"model":"claude-opus-5-5","stop_reason":"end_turn","usage":{"input_tokens":2,"cache_creation_input_tokens":2280,"cache_read_input_tokens":0,"output_tokens":output},"content":[{"text":"PRIVATE_PROMPT_CANARY /private/path sk-secret"}]}})
 }
 fn meta() -> Value {
-    json!({"type":"session_meta","payload":{"id":SESSION,"cwd":"PRIVATE_PATH_CANARY"}})
+    json!({"type":"session_meta","payload":{"id":SESSION,"session_id":SESSION,"cli_version":"0.167.0","cwd":"PRIVATE_PATH_CANARY"}})
 }
 fn context(turn: &str) -> Value {
     json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-6.1-sol","instructions":"PRIVATE_INSTRUCTION_CANARY"}})
@@ -79,6 +80,148 @@ fn codex(id: &str, turn: &str, resumed: bool) -> Value {
         (20309, 19328)
     };
     json!({"type":"token_usage_record","payload":{"thread_id":SESSION,"session_id":SESSION,"turn_id":turn,"root_turn_id":turn,"response_id":id,"usage":{"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":0,"output_tokens":6,"reasoning_output_tokens":0,"total_tokens":input+6},"thread_token_usage":{"input_tokens":40642,"output_tokens":12},"turn_token_usage":{"input_tokens":999999}}})
+}
+fn lifecycle(kind: &str, turn: &str) -> Value {
+    json!({"type":"event_msg","payload":{"type":kind,"turn_id":turn,"message":"PRIVATE_EVENT_CANARY"}})
+}
+
+#[test]
+fn observed_claude_tool_turn_and_model_change_retain_three_request_deltas() {
+    // Exact observed counts/IDs; the approved test session envelope is synthetic.
+    let observations = [
+        (
+            "msg_011CgqR9eX293BGPxqbyYPK6",
+            "claude-opus-5-5",
+            "tool_use",
+            2,
+            4224,
+            0,
+            81,
+        ),
+        (
+            "msg_011CgqR9p5zFhFpDa2WMG2VG",
+            "claude-opus-5-5",
+            "end_turn",
+            2,
+            125,
+            4224,
+            5,
+        ),
+        (
+            "msg_011CgqR9whPUXYvaWyNJXFaj",
+            "claude-sonnet-5-5",
+            "end_turn",
+            2,
+            4665,
+            0,
+            7,
+        ),
+    ];
+    let rows = observations.into_iter().map(|(id,model,stop,input,write,read,output)| {
+        json!({"type":"assistant","sessionId":SESSION,"message":{"id":id,"model":model,"stop_reason":stop,
+            "usage":{"input_tokens":input,"cache_creation_input_tokens":write,"cache_read_input_tokens":read,"output_tokens":output},
+            "content":[{"type":if stop=="tool_use" {"tool_use"} else {"text"},"text":"PRIVATE_PROSE_CANARY"}]}})
+    }).collect();
+    let f = Fixture::new(Harness::ClaudeCode, rows);
+    let e = f.read().unwrap();
+    assert_eq!(e.requests.len(), 3);
+    assert_eq!(
+        e.requests
+            .iter()
+            .map(|r| r.output_tokens.unwrap())
+            .sum::<u64>(),
+        93
+    );
+    assert_eq!(
+        e.requests
+            .iter()
+            .map(|r| r.cached_input_tokens.unwrap())
+            .sum::<u64>(),
+        4224
+    );
+    assert_eq!(
+        e.requests
+            .iter()
+            .filter(|r| r.model.as_deref() == Some("claude-sonnet-5-5"))
+            .count(),
+        1
+    );
+    assert_eq!(e.coverage, "PARTIAL");
+    assert!(!serde_json::to_string(&e).unwrap().contains("PRIVATE"));
+}
+
+#[test]
+fn stale_or_missing_codex_source_version_and_missing_native_id_are_refused() {
+    let f = Fixture::new(Harness::Codex, vec![]);
+    for version in [json!("0.166.0"), Value::Null] {
+        let mut record = meta();
+        record["payload"]["cli_version"] = version;
+        f.write(vec![
+            record,
+            context("turn_1"),
+            codex("resp_1", "turn_1", false),
+        ]);
+        assert_eq!(f.read(), Err(UsageReadError::UnsupportedVersion));
+    }
+    let mut record = meta();
+    record["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("session_id");
+    f.write(vec![
+        record,
+        context("turn_1"),
+        codex("resp_1", "turn_1", false),
+    ]);
+    assert_eq!(f.read(), Err(UsageReadError::InvalidSession));
+}
+
+#[test]
+fn unqualified_claude_request_finality_is_held_even_if_other_snapshot_looks_final() {
+    for stop in [Value::Null, json!("unknown"), json!("max_tokens")] {
+        let mut partial = claude("msg_1", 5);
+        partial["message"]["stop_reason"] = stop;
+        let f = Fixture::new(
+            Harness::ClaudeCode,
+            vec![partial, claude("msg_1", 5), claude("msg_2", 3)],
+        );
+        let e = f.read().unwrap();
+        assert_eq!(e.requests.len(), 1);
+        assert_eq!(e.requests[0].source_record_id, "msg_2");
+        assert!(e.limitations.contains(&"UNKNOWN_REQUEST_FINALITY"));
+    }
+}
+
+#[test]
+fn observed_codex_abort_without_usage_is_unknown_not_zero() {
+    let mut record = codex(
+        "resp_08030d9a2a9f256b016af0634fb21487d28fc0d98709899918",
+        "turn_1",
+        false,
+    );
+    record["payload"]["usage"]["input_tokens"] = json!(17975);
+    record["payload"]["usage"]["cached_input_tokens"] = json!(0);
+    record["payload"]["usage"]["total_tokens"] = json!(17981);
+    let f = Fixture::new(
+        Harness::Codex,
+        vec![
+            meta(),
+            context("turn_1"),
+            lifecycle("task_started", "turn_1"),
+            record,
+            lifecycle("task_complete", "turn_1"),
+            context("turn_2"),
+            lifecycle("task_started", "turn_2"),
+            lifecycle("turn_aborted", "turn_2"),
+        ],
+    );
+    let e = f.read().unwrap();
+    assert_eq!(e.requests.len(), 1);
+    assert_eq!(e.requests[0].input_tokens, Some(17975));
+    assert!(e.limitations.contains(&"INTERRUPTED_TURN"));
+    assert!(e.limitations.contains(&"MISSING_TURN_USAGE"));
+    assert_eq!(e.coverage, "PARTIAL");
+    assert!(!serde_json::to_string(&e).unwrap().contains("PRIVATE"));
 }
 
 #[test]

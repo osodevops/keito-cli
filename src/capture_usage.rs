@@ -264,6 +264,15 @@ struct ClaudeMessage {
     id: String,
     model: Option<String>,
     usage: Option<ClaudeTokens>,
+    stop_reason: Option<ClaudeStopReason>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ClaudeStopReason {
+    ToolUse,
+    EndTurn,
+    #[serde(other)]
+    Unqualified,
 }
 #[derive(Deserialize)]
 struct ClaudeTokens {
@@ -279,12 +288,21 @@ struct Envelope<T> {
 #[derive(Deserialize)]
 struct SessionMeta {
     id: String,
-    session_id: Option<String>,
+    session_id: String,
+    cli_version: Option<String>,
 }
 #[derive(Deserialize)]
 struct TurnContext {
     turn_id: Option<String>,
     model: Option<String>,
+    session_id: Option<String>,
+    thread_id: Option<String>,
+}
+#[derive(Deserialize)]
+struct LifecycleEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    turn_id: Option<String>,
     session_id: Option<String>,
     thread_id: Option<String>,
 }
@@ -413,6 +431,10 @@ fn parse_snapshot(
     let mut limitations = BTreeSet::new();
     let mut contexts: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut candidates = Vec::new();
+    let mut held_requests = BTreeSet::new();
+    let mut started_turns = BTreeSet::new();
+    let mut completed_turns = BTreeSet::new();
+    let mut interrupted_turns = BTreeSet::new();
     let mut saw_meta = false;
     let mut records = 0;
     let mut start = 0;
@@ -450,6 +472,17 @@ fn parse_snapshot(
                 if !raw.message.id.starts_with("msg_") {
                     return Err(UsageReadError::InvalidRecord);
                 }
+                // Only these request boundaries were actually observed in the
+                // pinned probe. Unknown/partial snapshots are not final usage.
+                // A later snapshot cannot silently repair an unqualified stream.
+                if !matches!(
+                    raw.message.stop_reason,
+                    Some(ClaudeStopReason::ToolUse | ClaudeStopReason::EndTurn)
+                ) {
+                    held_requests.insert(raw.message.id);
+                    limitations.insert("UNKNOWN_REQUEST_FINALITY");
+                    continue;
+                }
                 let usage = raw.message.usage;
                 if usage.is_none() {
                     limitations.insert("MISSING_USAGE");
@@ -483,14 +516,40 @@ fn parse_snapshot(
                 let meta: Envelope<SessionMeta> =
                     decode(line).map_err(|_| UsageReadError::InvalidSession)?;
                 if meta.payload.id != approved.session_id
-                    || meta
-                        .payload
-                        .session_id
-                        .is_some_and(|id| id != approved.session_id)
+                    || meta.payload.session_id != approved.session_id
                 {
                     return Err(UsageReadError::InvalidSession);
                 }
+                if meta.payload.cli_version.as_deref() != Some(approved.harness.version()) {
+                    return Err(UsageReadError::UnsupportedVersion);
+                }
                 saw_meta = true;
+            }
+            (Harness::Codex, "event_msg") => {
+                let event: Envelope<LifecycleEvent> = decode(line)?;
+                let event = event.payload;
+                if event.session_id.is_some_and(|id| id != approved.session_id)
+                    || event.thread_id.is_some_and(|id| id != approved.session_id)
+                {
+                    return Err(UsageReadError::InvalidSession);
+                }
+                if ["task_started", "task_complete", "turn_aborted"].contains(&event.kind.as_str())
+                {
+                    let turn = event.turn_id.ok_or(UsageReadError::InvalidRecord)?;
+                    identifier(&turn)?;
+                    match event.kind.as_str() {
+                        "task_started" => {
+                            started_turns.insert(turn);
+                        }
+                        "task_complete" => {
+                            completed_turns.insert(turn);
+                        }
+                        "turn_aborted" => {
+                            interrupted_turns.insert(turn);
+                        }
+                        _ => (),
+                    }
+                }
             }
             (Harness::Codex, "turn_context") => {
                 let raw: Envelope<TurnContext> = decode(line)?;
@@ -593,8 +652,32 @@ fn parse_snapshot(
     let requests: Vec<_> = requests
         .into_values()
         .flatten()
+        .filter(|r| !held_requests.contains(&r.source_record_id))
         .filter(|r| r.input_tokens.is_some() || r.output_tokens.is_some())
         .collect();
+    let observed_turns: BTreeSet<_> = requests
+        .iter()
+        .filter_map(|r| r.source_turn_id.as_ref())
+        .collect();
+    if !interrupted_turns.is_empty() {
+        limitations.insert("INTERRUPTED_TURN");
+    }
+    if started_turns
+        .iter()
+        .any(|turn| !completed_turns.contains(turn) && !interrupted_turns.contains(turn))
+    {
+        limitations.insert("IN_PROGRESS_TURN");
+    }
+    if started_turns
+        .iter()
+        .chain(completed_turns.iter())
+        .chain(interrupted_turns.iter())
+        .any(|turn| !observed_turns.contains(turn))
+    {
+        // The aborted probe emitted no usage record. Absence cannot establish
+        // zero provider consumption, even after an explicit terminal event.
+        limitations.insert("MISSING_TURN_USAGE");
+    }
     if requests.is_empty() {
         limitations.insert("NO_OBSERVED_REQUEST_RECORDS");
     }
