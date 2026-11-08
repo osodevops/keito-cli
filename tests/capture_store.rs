@@ -803,3 +803,57 @@ fn malformed_and_duplicate_mapping_keys_are_refused_without_source_excerpt() {
         assert!(!error.contains("PRIVATE_CANARY"));
     }
 }
+
+#[test]
+fn global_revoke_and_reenable_cannot_resurrect_an_active_turn() {
+    let (_dir, mut store, _) = setup();
+    event(&mut store, "revoked-live", Some("turn"), Prompt, 0);
+    store.disable_all().unwrap();
+    event(&mut store, "revoked-live", Some("turn"), Stop, 60);
+    store.approve(binding()).unwrap();
+    event(&mut store, "revoked-live", Some("turn"), Stop, 150);
+    let s = &store.preview("revoked-live").unwrap()[0];
+    assert_eq!(
+        s.segments.iter().map(|s| s.duration_seconds).sum::<i64>(),
+        0
+    );
+    assert!(s.needs_attention);
+    assert_eq!(store.status().unwrap().unfinished, 0);
+}
+#[test]
+fn removed_harness_and_reapproval_cannot_count_the_unapproved_interval() {
+    let (_dir, mut store, _) = setup();
+    event(&mut store, "removed-live", Some("turn"), Prompt, 0);
+    let mut remaining = binding();
+    remaining.agents = vec!["claude-code".into()];
+    store.approve(remaining).unwrap();
+    event(&mut store, "removed-live", Some("turn"), Stop, 60);
+    store.approve(binding()).unwrap();
+    event(&mut store, "removed-live", Some("turn"), Stop, 150);
+    let s = &store.preview("removed-live").unwrap()[0];
+    assert_eq!(
+        s.segments.iter().map(|s| s.duration_seconds).sum::<i64>(),
+        0
+    );
+    assert!(s.needs_attention);
+}
+#[test]
+fn refused_stop_cannot_be_replaced_by_the_time_of_a_later_duplicate_stop() {
+    let (dir, mut store, _) = setup();
+    event(&mut store, "refused-stop", Some("turn"), Prompt, 0);
+    capture::record_failure(
+        &dir.path().join("capture"),
+        &capture::hash("refused-stop"),
+        "STORAGE_UNAVAILABLE",
+    )
+    .unwrap();
+    event(&mut store, "refused-stop", Some("turn"), Stop, 150);
+    let s = &store.preview("refused-stop").unwrap()[0];
+    assert_eq!(
+        s.segments.iter().map(|s| s.duration_seconds).sum::<i64>(),
+        0
+    );
+    assert!(s.needs_attention);
+    assert!(s.segments.iter().all(|s| s.completeness == "INCOMPLETE"));
+    assert!(store.status().unwrap().storage_paused);
+}

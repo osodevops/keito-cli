@@ -184,4 +184,24 @@ exit 1
         s.uninstall(&workers[0].worker_id).unwrap();
         assert!(s.list().unwrap().is_empty());
     }
+    #[test]
+    fn failed_permission_observation_cannot_prove_worker_absence_or_remove_settings() {
+        let (_temp, s, exe, root, capture) = fixture();
+        let conf = config(&exe, &root, &capture);
+        s.install(&conf).unwrap();
+        let owned = std::fs::read_dir(s.home.join("Library/LaunchAgents"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let prior = std::fs::read(&owned).unwrap();
+        std::fs::write(
+            &s.launchctl,
+            "#!/bin/sh\nprintf 'Operation not permitted\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        assert!(s.uninstall(conf.repository_key).is_err());
+        assert_eq!(std::fs::read(&owned).unwrap(), prior);
+    }
 }
