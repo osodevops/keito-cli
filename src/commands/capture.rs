@@ -78,6 +78,8 @@ pub async fn run(
                     &repo,
                     capture::Signal {
                         source: agent.namespace(),
+                        resumed: event == crate::cli::capture::CaptureEvent::SessionStart
+                            && value.get("source").and_then(Value::as_str) == Some("resume"),
                         source_id,
                         turn_id,
                         version: &harness_version,
@@ -96,6 +98,7 @@ pub async fn run(
             project,
             task,
             confirm,
+            install_worker,
         } => {
             if !confirm {
                 return Err(AppError::InvalidInput(
@@ -110,29 +113,35 @@ pub async fn run(
                     "Repository hint disables capture; enable it before approving".into(),
                 ));
             }
-            let auth = ResolvedAuth::resolve(global)?;
-            let config = AppConfig::load()?;
+            let auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
+            let config = AppConfig::load().map_err(sanitize_error)?;
             let client = KeitorClient::new(&auth, &config.api_base_url())?;
-            let me = client.get_me().await?;
+            let me = client.get_me().await.map_err(sanitize_error)?;
             if me.is_personal_read_only_sync() {
                 return Err(AppError::Auth(
                     "Capture requires a full-access credential".into(),
                 ));
             }
             capture::identifier(&me.id)?;
-            let projects = client.list_projects().await?;
+            let projects = client.list_projects().await.map_err(sanitize_error)?;
             if !projects.iter().any(|p| p.id == project && p.is_active) {
                 return Err(AppError::NotFound(
                     "Project unavailable; choose an active accessible project".into(),
                 ));
             }
-            let tasks = client.list_tasks_for_project(Some(&project)).await?;
+            let tasks = client
+                .list_tasks_for_project(Some(&project))
+                .await
+                .map_err(sanitize_error)?;
             if !tasks.iter().any(|t| t.id == task && t.is_active) {
                 return Err(AppError::NotFound(
                     "Task unavailable on the selected project".into(),
                 ));
             }
             let mut store = Store::open(&directory()?)?;
+            if install_worker && config.api_key.as_deref().is_none_or(str::is_empty) {
+                return Err(AppError::Config("The supervised worker requires credentials saved by keito auth login; environment-only credentials are never copied to service settings".into()));
+            }
             let approved = store.approve(Binding {
                 repository_key: repo.key,
                 hint_hash: repo.hint_hash,
@@ -150,8 +159,17 @@ pub async fn run(
                 paused: false,
                 revoked: false,
             })?;
+            let worker = if install_worker {
+                Some(install_worker_service(
+                    &approved,
+                    &origin_for_worker(&config),
+                    &directory()?,
+                )?)
+            } else {
+                None
+            };
             print(
-                json!({"status":"approved","policy":"METADATA_ONLY_OBSERVED_TURNS_V1","binding":approved,
+                json!({"status":"approved","worker":worker,"policy":"METADATA_ONLY_OBSERVED_TURNS_V1","binding":approved,
                 "notice":"Only minimized timing metadata leaves this device. Captures require review before charging. Start capture worker for automatic delivery.","usage":"UNAVAILABLE"}),
                 global.quiet,
             )
@@ -188,6 +206,51 @@ pub async fn run(
             }
             Ok(())
         }
+        CaptureSubcommand::WorkerStatus => {
+            let value = match (
+                current_repo(),
+                crate::capture_supervisor::Supervisor::system(),
+            ) {
+                (Ok(repo), Ok(supervisor)) => {
+                    let executable = std::env::current_exe()
+                        .map_err(|_| AppError::Config("Cannot identify worker runtime".into()))?;
+                    let cwd = std::env::current_dir().map_err(|_| {
+                        AppError::Config("Cannot identify worker repository".into())
+                    })?;
+                    let store = Store::open(&directory()?)?;
+                    let binding = store.binding(&repo.key)?;
+                    let config = AppConfig::load().map_err(sanitize_error)?;
+                    let origin = config.api_base_url();
+                    let capture_home = directory()?;
+                    let expected =
+                        binding
+                            .as_ref()
+                            .map(|binding| crate::capture_supervisor::WorkerConfig {
+                                repository_key: &repo.key,
+                                repository_root: &cwd,
+                                executable: &executable,
+                                capture_home: &capture_home,
+                                workspace_id: &binding.workspace_id,
+                                api_origin: &origin,
+                            });
+                    serde_json::to_value(supervisor.status(&repo.key, expected.as_ref())?)
+                        .map_err(|_| AppError::Config("Cannot inspect worker service".into()))?
+                }
+                _ => {
+                    json!({"supported":cfg!(target_os="macos"),"installed":false,"running":false,"stale":false})
+                }
+            };
+            print(value, global.quiet)
+        }
+        CaptureSubcommand::WorkerUninstall { .. } => {
+            let repo = current_repo()?;
+            let supervisor = crate::capture_supervisor::Supervisor::system()?;
+            print(
+                serde_json::to_value(supervisor.uninstall(&repo.key)?)
+                    .map_err(|_| AppError::Config("Cannot inspect worker service".into()))?,
+                global.quiet,
+            )
+        }
         CaptureSubcommand::Pause { .. }
         | CaptureSubcommand::Resume { .. }
         | CaptureSubcommand::Disable { .. } => {
@@ -216,11 +279,11 @@ pub async fn run(
 }
 
 async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
-    let auth = ResolvedAuth::resolve(global)?;
-    let config = AppConfig::load()?;
+    let auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
+    let config = AppConfig::load().map_err(sanitize_error)?;
     let origin = config.api_base_url();
     let client = KeitorClient::new(&auth, &origin)?;
-    let me = client.get_me().await?;
+    let me = client.get_me().await.map_err(sanitize_error)?;
     let mut store = Store::open(&directory()?)?;
     let mut accepted = 0;
     let mut held = 0;
@@ -358,4 +421,57 @@ async fn bounded_ack(mut response: reqwest::Response) -> Option<Value> {
         body.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&body).ok()
+}
+
+fn origin_for_worker(config: &AppConfig) -> String {
+    config.api_base_url()
+}
+fn install_worker_service(
+    binding: &Binding,
+    origin: &str,
+    capture_home: &Path,
+) -> Result<crate::capture_supervisor::WorkerStatus, AppError> {
+    let supervisor = crate::capture_supervisor::Supervisor::system()?;
+    let cwd = std::env::current_dir()
+        .map_err(|_| AppError::Config("Cannot identify worker repository".into()))?;
+    let executable = std::env::current_exe()
+        .map_err(|_| AppError::Config("Cannot identify CLI runtime".into()))?;
+    let config = crate::capture_supervisor::WorkerConfig {
+        repository_key: &binding.repository_key,
+        repository_root: &cwd,
+        executable: &executable,
+        capture_home,
+        workspace_id: &binding.workspace_id,
+        api_origin: origin,
+    };
+    supervisor.install(&config)
+}
+
+fn sanitize_error(error: AppError) -> AppError {
+    match error {
+        AppError::Auth(_) => AppError::Auth(
+            "Capture preflight needs valid current credentials and workspace permission".into(),
+        ),
+        AppError::RateLimited {
+            retry_after_seconds,
+        } => AppError::RateLimited {
+            retry_after_seconds,
+        },
+        AppError::Network(_) => AppError::Network(
+            "Capture preflight network unavailable; frozen evidence retained".into(),
+        ),
+        AppError::NotFound(_) => AppError::NotFound(
+            "Capture mapping unavailable; review the selected project and task".into(),
+        ),
+        AppError::Conflict(_) => {
+            AppError::Conflict("Capture preflight conflicted; review current authority".into())
+        }
+        AppError::InvalidInput(_) => {
+            AppError::InvalidInput("Capture preflight rejected the request".into())
+        }
+        AppError::Config(_)=>AppError::Config("Capture configuration unavailable; repair local settings without printing their contents".into()),
+        _ => AppError::ServerError(
+            "Capture preflight unavailable; no response content retained".into(),
+        ),
+    }
 }

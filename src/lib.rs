@@ -1,5 +1,6 @@
 pub mod api;
 pub mod capture;
+pub mod capture_supervisor;
 pub mod cli;
 pub mod commands;
 pub mod config;

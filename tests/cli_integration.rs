@@ -79,7 +79,12 @@ case "$agent" in
 set -euo pipefail
 echo "fake codex installer output"
 mkdir -p "$HOME/.codex"
-printf '{"hooks":{"SessionStart":[{"hooks":[{"command":"keito-time-track/hooks/session-start.sh"}]}],"Stop":[{"hooks":[{"command":"keito-time-track/hooks/session-end.sh"}]}]}}\n' > "$HOME/.codex/hooks.json"
+python3 - "$HOME/.codex/hooks.json" "codex" <<'PY'
+import json,sys
+events={'SessionStart':'session-start','UserPromptSubmit':'prompt','Stop':'stop','SessionEnd':'session-end'}
+hooks={event:[{'hooks':[{'type':'command','command':'keito-time-track/hooks/dispatch.sh --agent '+sys.argv[2]+' --event '+name}]}] for event,name in events.items()}
+open(sys.argv[1],'w').write(json.dumps({'hooks':hooks}))
+PY
 SH
     chmod +x "$root/installers/install-codex.sh"
     ;;
@@ -91,7 +96,12 @@ SH
 set -euo pipefail
 echo "fake claude installer output"
 mkdir -p "$HOME/.claude"
-printf '{"hooks":{"SessionStart":[{"hooks":[{"command":"keito-time-track/hooks/session-start.sh"}]}],"Stop":[{"hooks":[{"command":"keito-time-track/hooks/session-end.sh"}]}]}}\n' > "$HOME/.claude/settings.json"
+python3 - "$HOME/.claude/settings.json" "claude-code" <<'PY'
+import json,sys
+events={'SessionStart':'session-start','UserPromptSubmit':'prompt','Stop':'stop','SessionEnd':'session-end'}
+hooks={event:[{'hooks':[{'type':'command','command':'keito-time-track/hooks/dispatch.sh --agent '+sys.argv[2]+' --event '+name}]}] for event,name in events.items()}
+open(sys.argv[1],'w').write(json.dumps({'hooks':hooks}))
+PY
 SH
     chmod +x "$root/installers/install-claude-code.sh"
     ;;
@@ -280,7 +290,9 @@ fn skill_install_configures_agent_hooks_with_fake_skills_cli() {
         .clone();
 
     let status_json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(status_json["authenticated"], true);
+    assert_eq!(status_json["credentials_configured"], true);
+    assert_eq!(status_json["authenticated"], false);
+    assert_eq!(status_json["ready"], false);
     assert_eq!(status_json["codex"]["hooks_configured"], true);
     assert_eq!(status_json["claude_code"]["hooks_configured"], true);
 
@@ -300,7 +312,11 @@ fn skill_install_configures_agent_hooks_with_fake_skills_cli() {
 #[test]
 #[cfg(unix)]
 fn skill_install_uses_bundled_skill_by_default() {
-    if StdCommand::new("jq").arg("--version").output().is_err() {
+    if StdCommand::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         return;
     }
 
@@ -329,7 +345,9 @@ fn skill_install_uses_bundled_skill_by_default() {
         .clone();
 
     let status_json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(status_json["authenticated"], true);
+    assert_eq!(status_json["credentials_configured"], true);
+    assert_eq!(status_json["authenticated"], false);
+    assert_eq!(status_json["ready"], false);
     assert_eq!(status_json["codex"]["skill_installed"], true);
     assert_eq!(status_json["codex"]["hooks_configured"], true);
     assert_eq!(status_json["claude_code"]["skill_installed"], true);

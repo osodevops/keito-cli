@@ -1,7 +1,7 @@
 //! Metadata-only durable capture. Raw hook JSON is never a storage type.
 use crate::cli::capture::CaptureEvent;
 use crate::error::AppError;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -97,7 +97,7 @@ impl Clock {
         #[cfg(not(target_os = "macos"))]
         let boot = fs::read("/proc/sys/kernel/random/boot_id").ok().map(hash);
         Ok(Self {
-            wall: Utc::now().timestamp(),
+            wall: chrono::Utc::now().timestamp(),
             monotonic: time.tv_sec,
             boot: boot.ok_or_else(|| {
                 AppError::Config("Boot identity unavailable; capture paused".into())
@@ -325,7 +325,7 @@ impl Session {
                     start.wall
                 };
                 self.segments.push(Segment {
-                    segment_key: format!("{}-{}", active.key, active.part),
+                    segment_key: hash(format!("{}-{}", active.key, active.part)),
                     started_at: timestamp(start.wall)?,
                     ended_at: timestamp(end)?,
                     duration_seconds: seconds,
@@ -369,6 +369,7 @@ impl Session {
 
 pub struct Signal<'a> {
     pub source: &'a str,
+    pub resumed: bool,
     pub source_id: &'a str,
     pub turn_id: Option<&'a str>,
     pub version: &'a str,
@@ -380,6 +381,15 @@ pub struct Store {
     connection: Connection,
 }
 #[derive(Debug, Serialize)]
+pub struct QueueState {
+    pub source_session_id: String,
+    pub revision: i64,
+    pub state: String,
+    pub reason: Option<String>,
+    pub attempts: i64,
+    pub retry_at: i64,
+}
+#[derive(Debug, Serialize)]
 pub struct Status {
     pub policy: &'static str,
     pub pending: i64,
@@ -388,6 +398,9 @@ pub struct Status {
     pub delivery_verified: bool,
     pub trusted: &'static str,
     pub bindings: Vec<Binding>,
+    pub unfinished: i64,
+    pub queue: Vec<QueueState>,
+    pub queue_truncated: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Queued {
@@ -542,6 +555,7 @@ impl Store {
     pub fn event(&mut self, repository: &Repository, signal: Signal<'_>) -> Result<(), AppError> {
         let Signal {
             source,
+            resumed,
             source_id,
             turn_id,
             version,
@@ -585,6 +599,9 @@ impl Store {
             .map(|v| serde_json::from_str(&v).map_err(storage_error))
             .transpose()?
             .unwrap_or_else(|| Session::begin(&binding, source, source_id, version, clock));
+        if resumed && event == CaptureEvent::SessionStart {
+            session.close(clock, false)?;
+        }
         match event {
             CaptureEvent::SessionStart => {} // Resume must never reset the baseline.
             CaptureEvent::Prompt => {
@@ -674,6 +691,11 @@ impl Store {
                     ));
                 }
             }
+            if session.revision >= i32::MAX as i64 {
+                return Err(AppError::Config(
+                    "Capture revision limit reached; evidence held for review".into(),
+                ));
+            }
             session.revision += 1;
             tx.execute(
                 "INSERT INTO outbox(session_id,revision,body,payload_hash) VALUES(?1,?2,?3,?4)",
@@ -699,6 +721,9 @@ impl Store {
             return Err(AppError::Config(
                 "Binding changed or revoked; run capture setup to approve again".into(),
             ));
+        }
+        if (action == "resume" && !binding.paused) || (action == "pause" && binding.paused) {
+            return Ok(());
         }
         let mut statement = tx
             .prepare("SELECT data FROM sessions WHERE binding_id=?1")
@@ -803,6 +828,31 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(storage_error)?;
+        let unfinished: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE json_type(data,'$.active')='object'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?;
+        let mut queue_statement=self.connection.prepare("SELECT s.source_id,o.revision,o.state,o.reason,o.attempts,o.retry_at FROM outbox o JOIN sessions s ON s.id=o.session_id WHERE o.state!='acknowledged' ORDER BY o.id LIMIT 101").map_err(storage_error)?;
+        let mut queue: Vec<QueueState> = queue_statement
+            .query_map([], |r| {
+                Ok(QueueState {
+                    source_session_id: r.get(0)?,
+                    revision: r.get(1)?,
+                    state: r.get(2)?,
+                    reason: r.get(3)?,
+                    attempts: r.get(4)?,
+                    retry_at: r.get(5)?,
+                })
+            })
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        let queue_truncated = queue.len() > 100;
+        queue.truncate(100);
         let delivered: i64 = self
             .connection
             .query_row(
@@ -819,6 +869,9 @@ impl Store {
             delivery_verified: delivered > 0,
             trusted: "UNKNOWN",
             bindings,
+            unfinished,
+            queue,
+            queue_truncated,
         })
     }
     pub fn preview(&self, source_id: &str) -> Result<Vec<Session>, AppError> {

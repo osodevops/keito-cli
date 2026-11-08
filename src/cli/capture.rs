@@ -20,6 +20,9 @@ pub enum CaptureSubcommand {
         /// Confirm the displayed metadata-only mapping policy; never bill automatically
         #[arg(long, required = true)]
         confirm: bool,
+        /// Install/update this repository's macOS launchd worker (device-only paths)
+        #[arg(long)]
+        install_worker: bool,
     },
     /// Inspect local consent, queue and delivery state (no network)
     Status,
@@ -34,6 +37,13 @@ pub enum CaptureSubcommand {
     Worker {
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=60))]
         interval_seconds: u64,
+    },
+    /// Inspect the current repository's macOS worker service without network writes
+    WorkerStatus,
+    /// Stop/remove only this repository's integration-owned launchd service
+    WorkerUninstall {
+        #[arg(long, required = true)]
+        repo: bool,
     },
     /// Exclude paused intervals and hold this repository's queued deliveries
     Pause {

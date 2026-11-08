@@ -44,3 +44,30 @@ fn capture_hook_discards_sensitive_input_without_a_mapping() {
         }
     }
 }
+
+#[test]
+fn scripted_skill_install_without_targets_has_no_side_effects() {
+    let home = tempfile::tempdir().unwrap();
+    Command::cargo_bin("keito")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["skill", "install", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--agent"));
+    assert!(!home.path().join(".codex").exists());
+    assert!(!home.path().join(".claude").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn scripted_source_setup_without_targets_stops_before_installation() {
+    let home = tempfile::tempdir().unwrap();
+    Command::new("bash")
+        .arg("setup")
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--host"));
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}

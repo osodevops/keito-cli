@@ -50,6 +50,7 @@ fn event(
             &repo(),
             capture::Signal {
                 source: "codex",
+                resumed: false,
                 source_id: session,
                 turn_id: turn,
                 version: "fixture-v1",
@@ -176,6 +177,7 @@ fn interrupt_missing_stop_and_reboot_never_invent_complete_time() {
             &repo(),
             capture::Signal {
                 source: "codex",
+                resumed: false,
                 source_id: "session",
                 turn_id: Some("turn-3"),
                 version: "fixture-v1",
@@ -214,6 +216,7 @@ fn no_native_turn_identity_is_a_refusal_not_fabricated_elapsed_time() {
             &repo(),
             capture::Signal {
                 source: "claude-code",
+                resumed: false,
                 source_id: "session",
                 turn_id: None,
                 version: "fixture-v1",
@@ -237,6 +240,7 @@ fn changed_mapping_or_revoked_consent_holds_new_collection_and_pending_delivery(
             &changed,
             capture::Signal {
                 source: "codex",
+                resumed: false,
                 source_id: "new-session",
                 turn_id: Some("turn"),
                 version: "fixture-v1",
@@ -386,4 +390,74 @@ fn linked_worktrees_share_identity_but_nested_repositories_and_changed_remotes_d
     let changed = Repository::resolve(&root).unwrap();
     assert_ne!(original.key, changed.key);
     assert!(!changed.key.contains("SECRET"));
+}
+
+#[test]
+fn repeated_resume_does_not_reset_an_active_interval() {
+    let (_dir, mut store, _) = setup();
+    event(&mut store, "session", Some("turn"), Prompt, 0);
+    store.control(&repo(), "resume", &clock(30)).unwrap();
+    store.control(&repo(), "resume", &clock(45)).unwrap();
+    event(&mut store, "session", Some("turn"), Stop, 90);
+    assert_eq!(
+        store.preview("session").unwrap()[0].segments[0].duration_seconds,
+        90
+    );
+}
+#[test]
+fn repeated_setup_preserves_approval_identity_and_pause() {
+    let (_dir, mut store, b) = setup();
+    store.control(&repo(), "pause", &clock(0)).unwrap();
+    let same = store.approve(binding()).unwrap();
+    assert_eq!(same.id, b.id);
+    assert_eq!(same.version, b.version);
+    assert!(same.paused);
+}
+#[test]
+fn old_completed_prompt_replay_cannot_close_or_duplicate_a_newer_turn() {
+    let (_dir, mut store, _) = setup();
+    for n in 1..=2 {
+        let id = format!("turn-{n}");
+        event(&mut store, "session", Some(&id), Prompt, n * 100);
+        event(&mut store, "session", Some(&id), Stop, n * 100 + 90);
+    }
+    event(&mut store, "session", Some("turn-3"), Prompt, 300);
+    event(&mut store, "session", Some("turn-1"), Prompt, 310);
+    event(&mut store, "session", Some("turn-3"), Stop, 390);
+    assert_eq!(
+        store.preview("session").unwrap()[0]
+            .segments
+            .iter()
+            .map(|s| s.duration_seconds)
+            .sum::<i64>(),
+        270
+    );
+}
+
+#[test]
+fn resumed_harness_keeps_completed_turns_and_marks_the_abandoned_interval_incomplete() {
+    let (_dir, mut store, _) = setup();
+    event(&mut store, "session", Some("first"), Prompt, 0);
+    event(&mut store, "session", Some("first"), Stop, 90);
+    event(&mut store, "session", Some("abandoned"), Prompt, 100);
+    store
+        .event(
+            &repo(),
+            capture::Signal {
+                source: "codex",
+                resumed: true,
+                source_id: "session",
+                turn_id: None,
+                version: "0.167.0",
+                event: SessionStart,
+                clock: &clock(1000),
+            },
+        )
+        .unwrap();
+    let s = &store.preview("session").unwrap()[0];
+    assert_eq!(s.segments.len(), 2);
+    assert_eq!(s.segments[0].duration_seconds, 90);
+    assert_eq!(s.segments[1].duration_seconds, 0);
+    assert_eq!(s.segments[1].completeness, "INCOMPLETE");
+    assert!(s.needs_attention);
 }

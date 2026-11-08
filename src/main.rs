@@ -1,5 +1,6 @@
 mod api;
 mod capture;
+mod capture_supervisor;
 mod cli;
 mod commands;
 mod config;

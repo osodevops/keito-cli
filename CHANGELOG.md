@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-11-08
+
+### Added
+
+- Add opt-in metadata-only coding-agent capture with exact native turn identities, integer seconds, private SQLite durability, explicit repository consent, frozen canonical revisions and server-review-first delivery.
+- Add capture setup/status/preview/sync, pause/resume/disable controls, bounded foreground worker, and explicit macOS launchd worker installation/status/removal with integration-owned rollback-safe settings.
+- Add real SQLite/process concurrency, privacy, retry, authentication-binding, repository-boundary, transport and supervisor acceptance checks.
+- Add live authentication diagnostics and selected-agent uninstall while leaving harness trust decisions to the user.
+
+### Changed
+
+- Install only explicitly selected adapters in scripts; interactive installation presents a target picker and authentication no longer defaults to installing both tools.
+- Bundle thin lifecycle adapters that discard prose and transcript data, preserve unrelated host configuration and use native prompt/turn identities instead of the legacy list-then-create logging path.
+- Distinguish credentials configured, authentication verified, trust unknown and delivery unverified. Structural configuration alone never reports ready.
+
+### Compatibility and qualification
+
+- Existing manual timer/log/session-record commands retain their legacy contracts. Automatic capture requires the canonical API and workspace eligibility and never falls back to legacy ordinary writes.
+- New captures remain nonbillable pending authorized review. Usage/cost capture is explicitly unavailable until qualified numeric evidence exists.
+- Native capture/launchd qualification targets macOS; release/artifact availability is separate from verified harness trust, lifecycle coverage, live delivery and invoice acceptance.
+
 ## [0.1.9] - 2026-09-01
 
 ### Fixed
