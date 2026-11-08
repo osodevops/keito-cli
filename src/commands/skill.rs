@@ -637,7 +637,8 @@ fn hook_configured(path: &Path) -> bool {
                     hooks.iter().any(|hook| {
                         hook["type"] == "command"
                             && hook["command"].as_str().is_some_and(|command| {
-                                command.contains(SKILL_NAME)
+                                (command.contains(SKILL_NAME)
+                                    || command.contains("/.keito-capture-generations/"))
                                     && command.contains("dispatch.sh")
                                     && command.contains(&format!("--event {lifecycle}"))
                             })
