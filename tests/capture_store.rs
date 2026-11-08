@@ -1074,3 +1074,75 @@ fn a_stop_from_an_unapproved_repository_cannot_leave_the_same_native_clock_alive
     assert_eq!(session.segments[0].duration_seconds, 0);
     assert!(session.needs_attention);
 }
+
+#[test]
+fn native_resume_during_capture_pause_abandons_old_turn_for_both_harnesses() {
+    for source in ["codex", "claude-code"] {
+        let (_dir, mut store, binding) = setup();
+        for (event, resumed, n) in [(Prompt, false, 0), (SessionStart, true, 100)] {
+            if event == SessionStart {
+                store.control(&repo(), "pause", &clock(30)).unwrap();
+            }
+            store
+                .event(
+                    &repo(),
+                    capture::Signal {
+                        source,
+                        resumed,
+                        source_id: "paused-native-resume",
+                        turn_id: Some("native-turn"),
+                        version: "fixture-v1",
+                        event,
+                        clock: &clock(n),
+                    },
+                )
+                .unwrap();
+        }
+        let paused = store.status().unwrap();
+        assert!(paused.bindings[0].paused);
+        assert_eq!(
+            paused.unfinished, 0,
+            "native resume must remove the old continuation for {source}"
+        );
+        assert_eq!(
+            paused.pending, 1,
+            "earned fragments must be checkpointed for {source}"
+        );
+        store.control(&repo(), "resume", &clock(150)).unwrap();
+        store
+            .event(
+                &repo(),
+                capture::Signal {
+                    source,
+                    resumed: false,
+                    source_id: "paused-native-resume",
+                    turn_id: Some("native-turn"),
+                    version: "fixture-v1",
+                    event: Stop,
+                    clock: &clock(200),
+                },
+            )
+            .unwrap();
+        let session = &store.preview("paused-native-resume").unwrap()[0];
+        assert_eq!(
+            session
+                .segments
+                .iter()
+                .map(|v| v.duration_seconds)
+                .sum::<i64>(),
+            30,
+            "{source}"
+        );
+        assert!(session.needs_attention);
+        let (_, payload) = body(&mut store, &binding, 210);
+        assert_eq!(
+            payload["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["duration_seconds"].as_i64().unwrap())
+                .sum::<i64>(),
+            30
+        );
+    }
+}
