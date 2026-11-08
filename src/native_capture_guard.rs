@@ -1,4 +1,4 @@
-//! Small, content-blind prelaunch guardian. This module uses only std and libc.
+//! Small, content-blind prelaunch guardian: std, libc and SHA-256 only.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod unix {
     use sha2::{Digest, Sha256};
