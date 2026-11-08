@@ -21,7 +21,7 @@ case "$event" in session-start|prompt|stop|interrupt|session-end) ;; *) exit 0 ;
 [[ "$version" != *..* ]] || exit 0
 keito_cmd=${KEITO_CLI_BIN:-keito}
 command -v python3 >/dev/null 2>&1 || exit 0
-python3 "${BASH_SOURCE[0]%/*}/guard.py" "$keito_cmd" "$agent" "$event" "$version" \
+python3 -I -S "${BASH_SOURCE[0]%/*}/guard.py" "$keito_cmd" "$agent" "$event" "$version" \
   <&0 >/dev/null 2>&1 &
 worker=$!
 # The guard publishes a locked, content-free flag before the heavy core starts.

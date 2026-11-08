@@ -80,6 +80,12 @@ time.sleep(float(os.environ.get('FAKE_SLEEP', '0')))
 exit_code = int(os.environ.get('FAKE_EXIT', '0'))
 if (exit_code == 0 or os.environ.get('FAKE_ACK_ALWAYS') == '1') and os.environ.get('FAKE_NO_ACK') != '1' and os.environ.get('KEITO_CAPTURE_ACK_FD'):
     os.write(int(os.environ['KEITO_CAPTURE_ACK_FD']), os.environ.get('FAKE_ACK_BYTES', 'KEITO_CAPTURE_DURABLE_V1\\n').encode())
+    if os.environ.get('FAKE_EDIT_ACKNOWLEDGED_MARKER'):
+        original = b'KEITO_CAPTURE_PENDING_V1\\n'
+        edited = {'same-length':b'X'*len(original),'short':b'changed','long':original+b'changed'}[os.environ['FAKE_EDIT_ACKNOWLEDGED_MARKER']]
+        pending = Path(os.environ['KEITO_CAPTURE_HOME']) / 'capture-invocations' / (os.environ['KEITO_CAPTURE_INVOCATION_NONCE'] + '.pending')
+        with pending.open('wb') as changed:
+            changed.write(edited);changed.flush();os.fsync(changed.fileno())
 sys.exit(exit_code)
 """)
         self.bin.chmod(0o700)
@@ -174,6 +180,19 @@ sys.exit(exit_code)
         finally:
             os.close(fd)
 
+    def test_ack_cleanup_preserves_changed_same_inode_marker_bytes_and_sizes(self):
+        directory = Path(self.env['KEITO_CAPTURE_HOME'])/'capture-invocations'
+        expected = {'same-length':b'X'*len(b'KEITO_CAPTURE_PENDING_V1\n'),'short':b'changed','long':b'KEITO_CAPTURE_PENDING_V1\nchanged'}
+        for index,(kind,content) in enumerate(expected.items(),1):
+            with self.subTest(kind=kind):
+                result = self.run_script('hooks/stop.sh',payload='PRIVATE_ACK_EDIT_CANARY',
+                    env={**self.env,'FAKE_EDIT_ACKNOWLEDGED_MARKER':kind})
+                self.assertEqual((result.returncode,result.stdout,result.stderr),(0,'',''))
+                flags = list(directory.iterdir())
+                self.assertEqual(len(flags),index,'Exact ACK cannot authorize removal of changed evidence')
+                self.assertIn(content,[flag.read_bytes() for flag in flags])
+                self.assertTrue(all(flag.stat().st_mode & 0o777 == 0o600 for flag in flags))
+
     def test_first_attempt_core_that_never_enters_handler_retains_failure_evidence(self):
         # No preflight/warmup of this executable. Delay is before its first
         # observable handler action, matching the retained cold-core failure.
@@ -195,6 +214,24 @@ sys.exit(exit_code)
         import fcntl
         with markers[0].open('rb') as marker:
             fcntl.flock(marker,fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_guard_startup_ignores_injected_sitecustomize_before_first_durable_instruction(self):
+        site = self.root/'injected-python-site'
+        site.mkdir()
+        sentinel = self.root/'unexpected-site-startup'
+        (site/'sitecustomize.py').write_text('import os,time\nopen(os.environ["SITE_STARTUP_SENTINEL"],"w").write("unexpected startup")\ntime.sleep(2)\n')
+        core = self.root/'isolated-ack-shell'
+        core.write_text('#!/bin/bash\ncat >/dev/null\nprintf "KEITO_CAPTURE_DURABLE_V1\\n" >&"$KEITO_CAPTURE_ACK_FD"\n')
+        core.chmod(0o700)
+        started = time.monotonic()
+        result = self.run_script('hooks/prompt.sh',payload='PRIVATE_SITE_CANARY',
+            env={**self.env,'KEITO_CLI_BIN':str(core),'PYTHONPATH':str(site),'SITE_STARTUP_SENTINEL':str(sentinel)})
+        self.assertLess(time.monotonic()-started,1.0)
+        self.assertEqual((result.returncode,result.stdout,result.stderr),(0,'',''))
+        self.assertFalse(sentinel.exists(),'The thin guard must not execute external Python startup code')
+        directory = Path(self.env['KEITO_CAPTURE_HOME'])/'capture-invocations'
+        self.assertTrue(directory.is_dir(),'The first invocation must publish evidence before core startup')
+        self.assertEqual(list(directory.iterdir()),[],'Exact ACK should clear the unchanged flag')
 
     def test_guard_refuses_symlinked_capture_root_or_invocation_directory(self):
         external = self.root / 'external-capture'

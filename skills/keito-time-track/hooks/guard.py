@@ -160,8 +160,17 @@ def remove_acknowledged(root, invocations, nonce, marker):
         name = nonce + '.pending'
         expected = regular_file(marker)
         current = os.stat(name, dir_fd=invocations, follow_symlinks=False)
-        if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino) or not stat.S_ISREG(current.st_mode):
+        if ((current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+                or not stat.S_ISREG(current.st_mode) or current.st_uid != UID
+                or current.st_nlink != 1 or stat.S_IMODE(current.st_mode) != 0o600
+                or current.st_size != len(PENDING) or expected.st_size != len(PENDING)):
             raise GuardRefused()
+        os.lseek(marker, 0, os.SEEK_SET)
+        if os.read(marker, len(PENDING) + 1) != PENDING or regular_file(marker).st_size != len(PENDING):
+            raise GuardRefused()
+        # Cooperating writers/recovery share this publication lock. An unrelated
+        # same-user writer can still race the final check and unlink; this is not
+        # universal filesystem compare-and-swap.
         os.unlink(name, dir_fd=invocations)
         os.fsync(invocations)
     finally:
