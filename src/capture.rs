@@ -954,6 +954,7 @@ impl Store {
                 event,
                 CaptureEvent::Stop | CaptureEvent::Interrupt | CaptureEvent::SessionEnd
             )
+            && !(resumed && event == CaptureEvent::SessionStart)
         {
             tx.ensure_no_new_refusal(self_failure_present)?;
             tx.commit().map_err(storage_error)?;
