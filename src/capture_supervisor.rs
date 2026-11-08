@@ -30,6 +30,7 @@ pub struct Supervisor {
 pub struct WorkerStatus {
     pub supported: bool,
     pub installed: bool,
+    pub loaded: bool,
     pub running: bool,
     pub stale: bool,
     pub policy: &'static str,
@@ -201,17 +202,18 @@ impl Supervisor {
     ) -> Result<WorkerStatus, AppError> {
         let contents = self.read(key)?;
         let installed = contents.is_some();
-        let running = installed
-            && Command::new(&self.launchctl)
-                .args(["print", &self.service(key)])
-                .output()
-                .is_ok_and(|o| {
-                    o.status.success()
-                        && String::from_utf8_lossy(&o.stdout).contains("state = running")
-                        && String::from_utf8_lossy(&o.stdout)
-                            .lines()
-                            .any(|line| line.trim().starts_with("pid = "))
-                });
+        let observation = Command::new(&self.launchctl)
+            .args(["print", &self.service(key)])
+            .output()
+            .ok();
+        let loaded = observation.as_ref().is_some_and(|o| o.status.success());
+        let running = loaded
+            && observation.as_ref().is_some_and(|o| {
+                String::from_utf8_lossy(&o.stdout).contains("state = running")
+                    && String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .any(|line| line.trim().starts_with("pid = "))
+            });
         let stale = if let (Some(existing), Some(config)) = (&contents, config) {
             *existing != self.render(config)?.as_bytes()
         } else if let Some(existing) = &contents {
@@ -226,6 +228,7 @@ impl Supervisor {
         Ok(WorkerStatus {
             supported: true,
             installed,
+            loaded,
             running,
             stale,
             policy: MARKER,
@@ -264,13 +267,21 @@ impl Supervisor {
     }
     pub fn uninstall(&self, key: &str) -> Result<WorkerStatus, AppError> {
         if self.read(key)?.is_none() {
-            return self.status(key, None);
+            let status = self.status(key, None)?;
+            if status.loaded {
+                return Err(AppError::Config("Worker remains loaded without its settings; review launchd state before cleanup".into()));
+            }
+            return Ok(status);
         }
-        let result = Command::new(&self.launchctl)
+        let _ = Command::new(&self.launchctl)
             .args(["bootout", &self.service(key)])
             .output();
-        if !result.is_ok_and(|o| o.status.success()) && self.status(key, None)?.running {
-            return Err(failure());
+        // A waiting/throttled KeepAlive service is still loaded. Only absence
+        // after bootout authorizes removing its recoverable owned settings.
+        if self.status(key, None)?.loaded {
+            return Err(AppError::Config(
+                "Worker could not be unloaded; owned service settings retained for recovery".into(),
+            ));
         }
         fs::remove_file(self.file(key)).map_err(|_| failure())?;
         self.status(key, None)
