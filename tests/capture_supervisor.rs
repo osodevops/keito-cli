@@ -152,4 +152,21 @@ exit 1
         assert!(s.install(&conf).is_err());
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
+    #[test]
+    fn failed_bootout_of_loaded_waiting_job_keeps_its_owned_settings() {
+        let (_temp, s, exe, root, capture) = fixture();
+        let conf = config(&exe, &root, &capture);
+        s.install(&conf).unwrap();
+        let agents = s.home.join("Library/LaunchAgents");
+        let owned = std::fs::read_dir(&agents)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let original = std::fs::read(&owned).unwrap();
+        std::fs::write(&s.launchctl,"#!/bin/sh\ncase \"$1\" in\nprint) printf 'state = waiting\\n'; exit 0;;\nbootout) exit 1;;\n*) exit 0;;\nesac\n".replace("\\\"","\"")).unwrap();
+        assert!(s.uninstall(conf.repository_key).is_err());
+        assert_eq!(std::fs::read(&owned).unwrap(), original);
+    }
 }
