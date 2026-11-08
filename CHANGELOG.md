@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Bundle thin lifecycle adapters that discard prose and transcript data, preserve unrelated host configuration and use native prompt/turn identities instead of the legacy list-then-create logging path.
 - Distinguish credentials configured, authentication verified, trust unknown and delivery unverified. Structural configuration alone never reports ready.
 
+### Security
+
+- Patch inherited QUIC/TLS trust dependencies to the fixed quinn-proto, rustls, rustls-webpki and webpki-roots releases reported by the current security audit.
+- Parse legacy YAML/JSON mapping hints with a maintained deserializer and explicit depth/event/alias budgets; no include or filesystem-expansion features are enabled.
+
 ### Compatibility and qualification
 
 - Existing manual timer/log/session-record commands retain their legacy contracts. Automatic capture requires the canonical API and workspace eligibility and never falls back to legacy ordinary writes.

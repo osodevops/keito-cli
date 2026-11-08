@@ -45,7 +45,10 @@ keito capture setup --agent claude-code --agent codex \
 ```
 
 The runtime verifies current authentication and the selected project/task before storing
-approval outside the repository. A cloned `.keito/config.yml` cannot authorize collection.
+approval outside the repository. A cloned `.keito/config.yml` cannot authorize collection. Legacy YAML and JSON hints
+use the same minimized mapping identity; ambiguous duplicate keys, malformed documents
+and over-budget depth/alias input are refused without quoting the source. The parser has
+no filesystem include or environment expansion feature enabled.
 Changed mapping/policy or Git remote identity holds evidence until renewed approval. Linked
 worktrees use the Git common repository identity; nested repositories remain separate.
 A repeated identical setup preserves the binding and its pause state. Adding another

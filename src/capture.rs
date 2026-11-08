@@ -194,8 +194,25 @@ impl Repository {
                 return Err(AppError::Config("Repository mapping hint too large".into()));
             }
             // Hash only mapping/policy fields, never persist the original YAML.
-            let yaml: serde_yaml::Value = serde_yaml::from_slice(&bytes)
-                .map_err(|_| AppError::Config("Invalid repository mapping hint".into()))?;
+            let mut budget = serde_saphyr::Budget::default();
+            budget.max_depth = 16;
+            budget.max_events = 4096;
+            budget.max_nodes = 2048;
+            budget.max_documents = 1;
+            budget.max_aliases = 64;
+            budget.max_anchors = 16;
+            budget.max_recorded_anchor_events = 4096;
+            budget.max_recorded_anchor_bytes = 64 * 1024;
+            budget.max_total_scalar_bytes = 64 * 1024;
+            let mut options = serde_saphyr::Options::default();
+            options.budget = Some(budget);
+            options.alias_limits.max_total_replayed_events = 4096;
+            options.alias_limits.max_replay_stack_depth = 16;
+            options.alias_limits.max_alias_expansions_per_anchor = 64;
+            let yaml: serde_json::Value = serde_saphyr::from_slice_with_options(&bytes, options)
+                .map_err(|_| {
+                    AppError::Config("Invalid or over-budget repository mapping hint".into())
+                })?;
             disabled = yaml
                 .get("agent_tracking")
                 .and_then(|v| v.get("enabled"))
