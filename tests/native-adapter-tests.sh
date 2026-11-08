@@ -31,5 +31,5 @@ verify_baseline() {
 }
 trap verify_baseline EXIT
 cd "$repo"
-cargo test --offline --lib skill_adapter::tests:: -- --nocapture
-cargo test --offline --lib capture_mapping::tests:: -- --nocapture
+cargo test --offline --lib skill_adapter::implementation::tests:: -- --nocapture
+cargo test --offline --lib capture_mapping::implementation::tests:: -- --nocapture

@@ -1,5 +1,6 @@
 //! Descriptor-relative, no-follow filesystem operations for adapter publication.
 //! Errors intentionally omit local paths and file contents.
+#![cfg(unix)]
 use crate::error::AppError;
 use sha2::{Digest, Sha256};
 use std::ffi::{CStr, CString, OsString};
