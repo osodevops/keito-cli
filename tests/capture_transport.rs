@@ -325,7 +325,9 @@ async fn mapping_change_between_queued_revisions_stops_before_next_upload() {
             .count(),
         1
     );
-    assert_eq!(store.status().unwrap().pending, 1);
+    assert_eq!(store.status().unwrap().pending, 0);
+    assert_eq!(store.status().unwrap().held, 1);
+    assert!(store.status().unwrap().bindings[0].revoked);
 }
 
 #[tokio::test]

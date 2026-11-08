@@ -116,8 +116,51 @@ fn sqlite_contention_exposes_lost_boundary_as_storage_pause_in_status() {
         .success());
     let capture = temp.path().join("capture");
     let _store = Store::open(&capture).unwrap();
+    // Hold the independent authority lock as well as real SQLite contention:
+    // refusal publication must use its nonblocking immutable-marker fallback.
+    let mut authority=Command::new("python3").args(["-c","import fcntl,sys; f=open(sys.argv[1],'a+'); fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); sys.stdin.read()"])
+        .arg(capture.join("capture-authority.lock")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    use std::io::BufRead;
+    let mut ready = String::new();
+    std::io::BufReader::new(authority.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "locked");
     let database = rusqlite::Connection::open(capture.join("capture.sqlite3")).unwrap();
     database.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // The core admission+durable marker bound is independent of OS first-launch
+    // admission before main. The actual CLI path below remains a separate safety
+    // check; its first-launch timing is retained as qualification evidence.
+    let mut probe = Store::open(&capture).unwrap();
+    let diagnostic_repo = Repository::resolve(&root).unwrap();
+    let diagnostic_clock = Clock::now().unwrap();
+    let core_start = std::time::Instant::now();
+    assert!(probe
+        .event(
+            &diagnostic_repo,
+            Signal {
+                source: "codex",
+                resumed: false,
+                source_id: "core-contention",
+                turn_id: Some("turn"),
+                version: "0.167.0",
+                event: Prompt,
+                clock: &diagnostic_clock
+            }
+        )
+        .is_err());
+    capture::record_failure(
+        &capture,
+        &capture::hash("core-contention"),
+        "STORAGE_UNAVAILABLE",
+    )
+    .unwrap();
+    assert!(
+        core_start.elapsed() < std::time::Duration::from_millis(700),
+        "core admission and marker exceeded watchdog budget"
+    );
+    drop(probe);
+    let start = std::time::Instant::now();
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("keito"))
         .current_dir(&root)
         .env("KEITO_CAPTURE_HOME", &capture)
@@ -139,6 +182,13 @@ fn sqlite_contention_exposes_lost_boundary_as_storage_pause_in_status() {
     child.stdin.take().unwrap().write_all(serde_json::json!({"cwd":root,"session_id":"session-contention","turn_id":"turn-contention","prompt":"PRIVATE_CANARY"}).to_string().as_bytes()).unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
+    let elapsed = start.elapsed();
+    println!(
+        "combined SQLite/authority refusal completed in {}ms",
+        elapsed.as_millis()
+    );
+    authority.kill().unwrap();
+    authority.wait().unwrap();
     database.execute_batch("ROLLBACK").unwrap();
     let result = Command::new(assert_cmd::cargo::cargo_bin!("keito"))
         .current_dir(&root)
@@ -254,4 +304,60 @@ fn refused_stop_under_real_lock_cannot_be_completed_by_another_hook_process() {
     assert_eq!(body["segments"][0]["duration_seconds"], 0);
     assert_eq!(body["segments"][0]["completeness"], "INCOMPLETE");
     assert!(!queued.body.contains("PRIVATE_CANARY"));
+}
+
+#[test]
+fn authority_lock_contention_never_blocks_refusal_publication_and_kill_releases_lock() {
+    use std::io::BufRead;
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("capture");
+    let mut store = Store::open(&directory).unwrap();
+    let mut child=Command::new("python3").args(["-c","import fcntl,sys; f=open(sys.argv[1],'a+'); fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); sys.stdin.read()"])
+        .arg(directory.join("capture-authority.lock")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut ready = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "locked");
+    let start = std::time::Instant::now();
+    capture::record_failure(
+        &directory,
+        &capture::hash("refused-with-authority-held"),
+        "STORAGE_UNAVAILABLE",
+    )
+    .unwrap();
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(100),
+        "refusal publication added an authority wait"
+    );
+    let clock = Clock::now().unwrap();
+    assert!(store.recover(&clock).is_err());
+    assert!(store.status().unwrap().storage_paused);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    store.recover(&clock).unwrap();
+    assert!(!store.status().unwrap().storage_paused);
+}
+
+#[test]
+fn distinct_refusals_are_immutable_and_recovery_cannot_confuse_replayed_boundary_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(temp.path()).unwrap();
+    let boundary = capture::hash("same-boundary");
+    for _ in 0..4 {
+        capture::record_failure(temp.path(), &boundary, "BOUNDARY_REFUSED").unwrap();
+    }
+    let count = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("capture-refusal-")
+        })
+        .count();
+    assert_eq!(count, 4);
+    store.recover(&Clock::now().unwrap()).unwrap();
+    assert!(!store.status().unwrap().storage_paused);
 }

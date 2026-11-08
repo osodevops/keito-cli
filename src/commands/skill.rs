@@ -1074,12 +1074,23 @@ fn capture_diagnostics(global: &GlobalFlags) -> (serde_json::Value, serde_json::
             default_worker,
         );
     };
-    let Ok(store) = crate::capture::Store::open(&directory) else {
+    let Ok(mut store) = crate::capture::Store::open(&directory) else {
         return (
             serde_json::json!({"storage_paused":true,"reason":"STORAGE_UNAVAILABLE"}),
             default_worker,
         );
     };
+    let repository = std::env::current_dir()
+        .ok()
+        .and_then(|path| crate::capture::Repository::resolve(&path).ok());
+    if let Some(repository) = &repository {
+        if store.observe_repository(repository).is_err() {
+            return (
+                serde_json::json!({"storage_paused":true,"reason":"CAPTURE_AUTHORITY_UNAVAILABLE"}),
+                default_worker,
+            );
+        }
+    }
     let Ok(status) = store.status() else {
         return (
             serde_json::json!({"storage_paused":true,"reason":"STORAGE_UNAVAILABLE"}),
@@ -1094,9 +1105,6 @@ fn capture_diagnostics(global: &GlobalFlags) -> (serde_json::Value, serde_json::
     let origin = crate::config::AppConfig::load()
         .ok()
         .map(|config| crate::capture::hash(config.api_base_url().trim_end_matches('/')));
-    let repository = std::env::current_dir()
-        .ok()
-        .and_then(|path| crate::capture::Repository::resolve(&path).ok());
     let worker = if let Some(repository) = repository {
         capture["current_repository"] = match store.binding(&repository.key) {
             Ok(Some(binding)) => {

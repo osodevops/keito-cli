@@ -1,6 +1,7 @@
 pub mod api;
 pub mod capture;
 pub mod capture_supervisor;
+mod capture_authority;
 mod capture_usage;
 mod capture_usage_ledger;
 pub mod cli;

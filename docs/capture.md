@@ -117,8 +117,10 @@ Pause excludes its interval and holds queued uploads. Resume preserves earned ti
 requires an unchanged approved binding. Disable revokes local consent; re-enabling requires
 explicit setup again. None of these commands rewrites submitted accounting records. Revoking global or
 harness consent abandons any unmeasured active interval as incomplete; reapproval
-cannot resurrect the clock or count time while capture was disabled. A refused Stop
-also prevents a delayed duplicate from supplying a later completion time.
+cannot resurrect the clock or count time while capture was disabled. Observing a disabled
+or changed repository hint or remote also persists revocation; restoring its previous digest
+requires explicit setup again. A refused Stop prevents later duplicate or pause/resume
+commands from supplying a later completion time.
 
 Prompt opens a supported turn and Stop checkpoints it. Session starts/resumes do not erase
 previous completed intervals. Native Claude `prompt_id` and Codex `turn_id` identify turns;
@@ -128,14 +130,23 @@ than fabricated elapsed time. A short first turn remains exact; inter-turn idle 
 
 Local storage is a private SQLite transaction ledger with full synchronization, a 100 MiB
 ceiling and no silent eviction of unsent evidence. Frozen request bodies are limited to
-16 KiB and 100 segments. Acknowledged request payloads have seven-day local retention;
+16 KiB and 100 segments. Worker maintenance expires acknowledged request payloads after
+seven days, including idle and consent-held queues;
 minimized session/consent state remains for replay integrity until the bounded store is
 explicitly managed. A full or damaged queue pauses capture with a recovery error. If SQLite refuses a
-boundary (for example lock contention), a separate bounded, private failure marker
-records its hashed identity and safe reason. The missed boundary is explicitly refused,
+boundary (for example lock contention), separate bounded, private failure markers
+record only hashed identities, timestamps and safe reasons. Publication never waits on
+the authority lock; each marker has a unique immutable name and is synchronized before
+acknowledgement. Clock transitions acquire SQLite before a bounded 25 ms authority lock,
+then recheck refusal state; no network runs under that lock. The missed boundary is explicitly refused,
 not described as saved. Status exposes storage_paused and the failure reason.
 After fixing storage, explicitly run `keito capture recover --confirm`; it marks unfinished
-intervals incomplete, never reconstructs missing seconds, then clears the refusal marker.
+intervals incomplete and never reconstructs missing seconds. Because markers contain no
+customer or session identity, potentially affected unacknowledged complete revisions are
+conservatively held across the local queue with `REFUSED_BOUNDARY_REVIEW_REQUIRED`.
+Their frozen bytes remain unchanged, and recovery or reapproval cannot release them.
+Recovery clears only the exact marker snapshot it reconciled; a concurrent new refusal
+remains paused and requires another explicit recovery.
 
 Canonical request data contains only harness/session identifiers, versioned mapping,
 absolute lifecycle instants, exact integer seconds, completeness and explicit usage

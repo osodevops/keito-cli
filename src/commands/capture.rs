@@ -203,10 +203,14 @@ pub async fn run(
             )
         }
         CaptureSubcommand::Status => {
-            let store = Store::open(&directory()?)?;
+            let mut store = Store::open(&directory()?)?;
+            let repository = current_repo();
+            if let Ok(repository) = &repository {
+                store.observe_repository(repository)?;
+            }
             let mut value = serde_json::to_value(store.status()?)
                 .map_err(|_| AppError::Config("Cannot render capture status".into()))?;
-            value["current_repository"] = match current_repo() {
+            value["current_repository"] = match repository {
                 Ok(repo) => match store.binding(&repo.key)? {
                     Some(b) => {
                         json!({"approved":!b.revoked,"paused":b.paused,"mapping_current":repo.matches_binding(&b),"binding_id":b.id})
@@ -227,7 +231,7 @@ pub async fn run(
             let mut store = Store::open(&directory()?)?;
             store.recover(&Clock::now()?)?;
             print(
-                json!({"status":"recovered","notice":"Unfinished intervals were marked incomplete. Refused boundaries cannot be reconstructed; inspect needs-attention evidence before charging."}),
+                json!({"status":"recovered","notice":"Unfinished intervals were marked incomplete. Potentially affected frozen complete revisions remain held for review; recovery does not release uncertain evidence."}),
                 global.quiet,
             )
         }
@@ -272,7 +276,8 @@ pub async fn run(
                     let cwd = std::env::current_dir().map_err(|_| {
                         AppError::Config("Cannot identify worker repository".into())
                     })?;
-                    let store = Store::open(&directory()?)?;
+                    let mut store = Store::open(&directory()?)?;
+                    store.observe_repository(&repo)?;
                     let binding = store.binding(&repo.key)?;
                     let config = AppConfig::load().map_err(sanitize_error)?;
                     let origin = config.api_base_url();
@@ -342,7 +347,9 @@ pub async fn run(
 
 async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
     let mut store = Store::open(&directory()?)?;
+    store.maintain(UtcClock::seconds())?;
     let repo = current_repo()?;
+    store.observe_repository(&repo)?;
     let Some(binding) = store.binding(&repo.key)? else {
         return Ok(json!({"accepted":0,"held":0,"reason":"LOCAL_APPROVAL_REQUIRED"}));
     };
@@ -376,6 +383,7 @@ async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
     // A sync invocation has bounded work; queued revisions remain durable.
     for _ in 0..100 {
         let current_repository = current_repo()?;
+        store.observe_repository(&current_repository)?;
         let current_auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
         let current_origin = AppConfig::load().map_err(sanitize_error)?.api_base_url();
         if current_repository.key != binding.repository_key
@@ -391,6 +399,9 @@ async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
         let Some(row) = store.claim(&binding, now)? else {
             break;
         };
+        if store.status()?.storage_paused {
+            break;
+        }
         // Current consent was checked atomically at claim. The server rechecks
         // authority before accepting every revision and replay.
         let response = http

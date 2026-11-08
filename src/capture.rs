@@ -1,4 +1,5 @@
 //! Metadata-only durable capture. Raw hook JSON is never a storage type.
+use crate::capture_authority::AuthorityGuard;
 use crate::capture_usage::{read_active_session, ApprovedActiveSession, Harness};
 use crate::capture_usage_ledger::UsageLedger;
 use crate::cli::capture::CaptureEvent;
@@ -445,6 +446,43 @@ pub struct Signal<'a> {
     pub clock: &'a Clock,
 }
 
+struct CaptureTransaction<'a> {
+    inner: Transaction<'a>,
+    _authority: AuthorityGuard,
+    directory: PathBuf,
+}
+impl<'a> std::ops::Deref for CaptureTransaction<'a> {
+    type Target = Transaction<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl CaptureTransaction<'_> {
+    fn failure(&self) -> Result<Option<CaptureFailure>, AppError> {
+        Ok(read_failure_markers(&self.directory)?
+            .into_iter()
+            .next()
+            .map(|(_, failure)| failure))
+    }
+    fn ensure_no_new_refusal(&self, was_refused: bool) -> Result<(), AppError> {
+        if !was_refused && self.failure()?.is_some() {
+            return Err(AppError::Config(
+                "Capture authority changed during this boundary; collection remains paused".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn commit(self) -> rusqlite::Result<()> {
+        let Self {
+            inner,
+            _authority,
+            directory: _,
+        } = self;
+        let result = inner.commit();
+        drop(_authority);
+        result
+    }
+}
 pub struct Store {
     connection: Connection,
     directory: PathBuf,
@@ -556,10 +594,19 @@ impl Store {
             directory: directory.to_owned(),
         })
     }
-    fn transaction(&mut self) -> Result<Transaction<'_>, AppError> {
-        self.connection
+    fn transaction(&mut self) -> Result<CaptureTransaction<'_>, AppError> {
+        let directory = self.directory.clone();
+        let inner = self
+            .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(storage_error)
+            .map_err(storage_error)?;
+        // Never hold the filesystem lock during SQLite's bounded busy wait.
+        let authority = AuthorityGuard::acquire(&directory, true)?;
+        Ok(CaptureTransaction {
+            inner,
+            _authority: authority,
+            directory,
+        })
     }
     fn check_size(tx: &Transaction<'_>) -> Result<(), AppError> {
         let pages: i64 = tx
@@ -586,6 +633,10 @@ impl Store {
             identifier(value)?;
         }
         let tx = self.transaction()?;
+        let refused = tx.failure()?.is_some();
+        if refused {
+            Self::reconcile_refusal(&tx)?;
+        }
         Self::check_size(&tx)?;
         let previous = Self::binding_in(&tx, &binding.repository_key)?;
         if let Some(old) = &previous {
@@ -627,7 +678,10 @@ impl Store {
                     if !binding.agents.contains(&source) {
                         tx.execute("UPDATE outbox SET state='held',reason='HARNESS_CONSENT_REVOKED' WHERE id=?1",[id]).map_err(storage_error)?;
                     } else if state == "held"
-                        && reason.as_deref() == Some("HARNESS_CONSENT_REVOKED")
+                        && matches!(
+                            reason.as_deref(),
+                            Some("HARNESS_CONSENT_REVOKED" | "REPOSITORY_CONSENT_INVALIDATED")
+                        )
                     {
                         tx.execute(
                             "UPDATE outbox SET state='pending',reason=NULL WHERE id=?1",
@@ -636,6 +690,7 @@ impl Store {
                         .map_err(storage_error)?;
                     }
                 }
+                tx.ensure_no_new_refusal(refused)?;
                 tx.commit().map_err(storage_error)?;
                 return Ok(binding);
             }
@@ -658,8 +713,50 @@ impl Store {
         binding.revoked = false;
         tx.execute("INSERT INTO bindings(repo_key,data) VALUES(?1,?2) ON CONFLICT(repo_key) DO UPDATE SET data=excluded.data",
             params![binding.repository_key, serde_json::to_string(&binding).map_err(storage_error)?]).map_err(storage_error)?;
+        tx.ensure_no_new_refusal(refused)?;
         tx.commit().map_err(storage_error)?;
         Ok(binding)
+    }
+    fn hold_binding(tx: &Transaction<'_>, binding_id: &str, reason: &str) -> Result<(), AppError> {
+        tx.execute("UPDATE outbox SET state='held',reason=?2,claimed_until=0 WHERE session_id IN (SELECT id FROM sessions WHERE binding_id=?1) AND state!='acknowledged' AND (state='pending' OR reason IN ('HARNESS_CONSENT_REVOKED','REPOSITORY_CONSENT_INVALIDATED'))",params![binding_id,reason]).map_err(storage_error)?;
+        Ok(())
+    }
+    fn invalidate_binding(
+        tx: &Transaction<'_>,
+        binding: &Binding,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        Self::abandon_revoked_turns(tx, &binding.id, &[])?;
+        let mut revoked = binding.clone();
+        revoked.revoked = true;
+        revoked.paused = true;
+        tx.execute(
+            "UPDATE bindings SET data=?2 WHERE repo_key=?1",
+            params![
+                binding.repository_key,
+                serde_json::to_string(&revoked).map_err(storage_error)?
+            ],
+        )
+        .map_err(storage_error)?;
+        Self::hold_binding(tx, &binding.id, reason)
+    }
+    fn reconcile_refusal(tx: &Transaction<'_>) -> Result<(), AppError> {
+        let mut statement=tx.prepare("SELECT DISTINCT binding_id FROM sessions WHERE json_type(data,'$.active')='object'").map_err(storage_error)?;
+        let bindings: Vec<String> = statement
+            .query_map([], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for binding in bindings {
+            Self::abandon_revoked_turns(tx, &binding, &[])?;
+        }
+        // Refusal markers have no customer/session identifiers. Conservatively
+        // quarantine all unacknowledged complete bodies; never rewrite frozen bytes
+        // or automatically release an uncertain body during explicit recovery.
+        tx.execute("UPDATE outbox SET state='held',reason='REFUSED_BOUNDARY_REVIEW_REQUIRED',claimed_until=0 WHERE state!='acknowledged' AND EXISTS(SELECT 1 FROM json_each(outbox.body,'$.segments') segment WHERE json_extract(segment.value,'$.completeness')='COMPLETE' AND json_extract(segment.value,'$.duration_seconds')>0)",[]).map_err(storage_error)?;
+        tx.execute("UPDATE sessions SET data=json_set(data,'$.needs_attention',json('true')) WHERE id IN(SELECT session_id FROM outbox WHERE reason='REFUSED_BOUNDARY_REVIEW_REQUIRED')",[]).map_err(storage_error)?;
+        Ok(())
     }
     fn abandon_revoked_turns(
         tx: &Transaction<'_>,
@@ -702,6 +799,20 @@ impl Store {
             .map(|v| serde_json::from_str(&v).map_err(storage_error))
             .transpose()
     }
+    /// Observing changed consent invalidates the old clock durably, even if a
+    /// later command sees the original digest again.
+    pub fn observe_repository(&mut self, repository: &Repository) -> Result<(), AppError> {
+        let tx = self.transaction()?;
+        if tx.failure()?.is_some() {
+            Self::reconcile_refusal(&tx)?;
+        }
+        if let Some(binding) = Self::binding_in(&tx, &repository.key)? {
+            if !repository.matches_binding(&binding) {
+                Self::invalidate_binding(&tx, &binding, "REPOSITORY_CONSENT_INVALIDATED")?;
+            }
+        }
+        tx.commit().map_err(storage_error)
+    }
     pub fn binding(&self, key: &str) -> Result<Option<Binding>, AppError> {
         Self::binding_in(&self.connection, key)
     }
@@ -728,14 +839,6 @@ impl Store {
         } = signal;
         identifier(source_id)?;
         version_identifier(version)?;
-        if self.failure()?.is_some()
-            && matches!(event, CaptureEvent::Prompt | CaptureEvent::SessionStart)
-        {
-            return Err(AppError::Config(
-                "Capture is paused after a refused boundary; inspect status and explicitly recover"
-                    .into(),
-            ));
-        }
         if matches!(event, CaptureEvent::Prompt | CaptureEvent::Stop) && turn_id.is_none() {
             return Err(AppError::InvalidInput(
                 "Missing native turn identity; capture requires qualified prompt_id/turn_id".into(),
@@ -744,16 +847,30 @@ impl Store {
         if let Some(id) = turn_id {
             identifier(id)?;
         }
-        let self_failure_present = self.failure()?.is_some();
         let tx = self.transaction()?;
+        let self_failure_present = tx.failure()?.is_some();
+        if self_failure_present {
+            Self::reconcile_refusal(&tx)?;
+            if matches!(event, CaptureEvent::Prompt | CaptureEvent::SessionStart) {
+                tx.commit().map_err(storage_error)?;
+                return Err(AppError::Config("Capture is paused after a refused boundary; inspect status and explicitly recover".into()));
+            }
+        }
         Self::check_size(&tx)?;
         let Some(binding) = Self::binding_in(&tx, &repository.key)? else {
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            tx.commit().map_err(storage_error)?;
             return Ok(());
         };
-        if !repository.matches_binding(&binding)
-            || binding.revoked
-            || !binding.agents.iter().any(|a| a == source)
-        {
+        if !repository.matches_binding(&binding) {
+            Self::invalidate_binding(&tx, &binding, "REPOSITORY_CONSENT_INVALIDATED")?;
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(());
+        }
+        if binding.revoked || !binding.agents.iter().any(|a| a == source) {
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            tx.commit().map_err(storage_error)?;
             return Ok(());
         }
         if binding.paused
@@ -762,6 +879,8 @@ impl Store {
                 CaptureEvent::Stop | CaptureEvent::Interrupt | CaptureEvent::SessionEnd
             )
         {
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            tx.commit().map_err(storage_error)?;
             return Ok(());
         }
         let mut statement=tx.prepare("SELECT data FROM sessions WHERE source_id=?1 AND json_extract(data,'$.source_namespace')=?2 AND json_extract(data,'$.binding.workspace_id')=?3 AND json_extract(data,'$.binding.owner_id')=?4 AND json_extract(data,'$.binding.origin_hash')=?5 LIMIT 2").map_err(storage_error)?;
@@ -787,6 +906,8 @@ impl Store {
         }
         let raw = matches.into_iter().next();
         if raw.is_none() && !matches!(event, CaptureEvent::SessionStart | CaptureEvent::Prompt) {
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            tx.commit().map_err(storage_error)?;
             return Ok(());
         }
         let mut session: Session = raw
@@ -814,16 +935,22 @@ impl Store {
             CaptureEvent::SessionStart => {} // Resume must never reset the baseline.
             CaptureEvent::Prompt => {
                 if turn_id.is_some_and(|id| session.seen_turns.contains(id)) {
+                    tx.ensure_no_new_refusal(self_failure_present)?;
+                    tx.commit().map_err(storage_error)?;
                     return Ok(());
                 }
                 if let Some(active) = &session.active {
                     if turn_id.is_some_and(|key| key != active.key) {
                         session.close(clock, false)?;
                     } else {
+                        tx.ensure_no_new_refusal(self_failure_present)?;
+                        tx.commit().map_err(storage_error)?;
                         return Ok(());
                     } // Concurrent duplicate hook registrations.
                 }
                 if turn_id.is_some_and(|key| session.last_turn.as_deref() == Some(key)) {
+                    tx.ensure_no_new_refusal(self_failure_present)?;
+                    tx.commit().map_err(storage_error)?;
                     return Ok(());
                 }
                 session.generation += 1;
@@ -843,6 +970,8 @@ impl Store {
                     .as_ref()
                     .is_some_and(|a| turn_id.is_some_and(|id| id != a.key))
                 {
+                    tx.ensure_no_new_refusal(self_failure_present)?;
+                    tx.commit().map_err(storage_error)?;
                     return Ok(());
                 }
                 session.close(clock, true)?;
@@ -854,6 +983,8 @@ impl Store {
                         .as_ref()
                         .is_some_and(|a| turn_id.is_some_and(|id| id != a.key))
                 {
+                    tx.ensure_no_new_refusal(self_failure_present)?;
+                    tx.commit().map_err(storage_error)?;
                     return Ok(());
                 }
                 session.close(clock, false)?;
@@ -904,12 +1035,14 @@ impl Store {
                 }
             }
         }
+        tx.ensure_no_new_refusal(self_failure_present)?;
         Self::queue(&tx, &mut session)?;
         if session.usage_ledger.held {
             tx.execute("UPDATE outbox SET state='held',reason='USAGE_RECORD_CONFLICT',claimed_until=0 WHERE session_id=?1 AND state!='acknowledged'",[&session.id]).map_err(storage_error)?;
         }
         tx.execute("INSERT INTO sessions(id,binding_id,source_id,data) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
             params![id,binding.id,source_id,serde_json::to_string(&session).map_err(storage_error)?]).map_err(storage_error)?;
+        tx.ensure_no_new_refusal(self_failure_present)?;
         tx.commit().map_err(storage_error)
     }
     fn queue(tx: &Transaction<'_>, session: &mut Session) -> Result<(), AppError> {
@@ -979,14 +1112,33 @@ impl Store {
         clock: &Clock,
     ) -> Result<(), AppError> {
         let tx = self.transaction()?;
+        let refused = tx.failure()?.is_some();
+        if refused {
+            Self::reconcile_refusal(&tx)?;
+        }
         let mut binding = Self::binding_in(&tx, &repository.key)?
             .ok_or_else(|| AppError::Config("Repository not approved; run capture setup".into()))?;
-        if action == "resume" && (binding.revoked || !repository.matches_binding(&binding)) {
+        if !repository.matches_binding(&binding) {
+            Self::invalidate_binding(&tx, &binding, "REPOSITORY_CONSENT_INVALIDATED")?;
+            tx.commit().map_err(storage_error)?;
+            return Err(AppError::Config(
+                "Binding changed; explicit reapproval required".into(),
+            ));
+        }
+        if refused && action == "resume" {
+            tx.commit().map_err(storage_error)?;
+            return Err(AppError::Config(
+                "Storage refusal remains paused; explicitly recover before resuming".into(),
+            ));
+        }
+        if action == "resume" && binding.revoked {
             return Err(AppError::Config(
                 "Binding changed or revoked; run capture setup to approve again".into(),
             ));
         }
         if (action == "resume" && !binding.paused) || (action == "pause" && binding.paused) {
+            tx.ensure_no_new_refusal(refused)?;
+            tx.commit().map_err(storage_error)?;
             return Ok(());
         }
         let mut statement = tx
@@ -1020,6 +1172,7 @@ impl Store {
                     session.close(clock, false)?;
                 }
             }
+            Self::queue(&tx, &mut session)?;
             tx.execute(
                 "UPDATE sessions SET data=?2 WHERE id=?1",
                 params![
@@ -1041,11 +1194,31 @@ impl Store {
             ],
         )
         .map_err(storage_error)?;
+        if binding.revoked {
+            Self::hold_binding(&tx, &binding.id, "HARNESS_CONSENT_REVOKED")?;
+        }
+        tx.ensure_no_new_refusal(refused)?;
         tx.commit().map_err(storage_error)
     }
     pub fn disable_all(&mut self) -> Result<(), AppError> {
-        let bindings = self.status()?.bindings;
         let tx = self.transaction()?;
+        let refused = tx.failure()?.is_some();
+        if refused {
+            Self::reconcile_refusal(&tx)?;
+        }
+        let mut statement = tx
+            .prepare("SELECT data FROM bindings")
+            .map_err(storage_error)?;
+        let rows: Vec<String> = statement
+            .query_map([], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        let bindings: Vec<Binding> = rows
+            .into_iter()
+            .map(|raw| serde_json::from_str(&raw).map_err(storage_error))
+            .collect::<Result<_, _>>()?;
         for mut binding in bindings {
             Self::abandon_revoked_turns(&tx, &binding.id, &[])?;
             binding.paused = true;
@@ -1058,7 +1231,9 @@ impl Store {
                 ],
             )
             .map_err(storage_error)?;
+            Self::hold_binding(&tx, &binding.id, "HARNESS_CONSENT_REVOKED")?;
         }
+        tx.ensure_no_new_refusal(refused)?;
         tx.commit().map_err(storage_error)
     }
     pub fn binding_delivery_history(&self, binding_id: &str) -> Result<bool, AppError> {
@@ -1162,38 +1337,20 @@ impl Store {
         })
     }
     fn failure(&self) -> Result<Option<CaptureFailure>, AppError> {
-        let path = self.directory.join("capture-failure.json");
-        if !path.exists() {
-            return Ok(None);
-        }
-        let metadata = fs::symlink_metadata(&path).map_err(storage_error)?;
-        if metadata.file_type().is_symlink() || metadata.len() > 1024 {
-            return Err(AppError::Config(
-                "Capture failure marker needs local inspection; collection remains paused".into(),
-            ));
-        }
-        let value: CaptureFailure = serde_json::from_slice(&fs::read(path).map_err(storage_error)?)
-            .map_err(|_| {
-                AppError::Config(
-                    "Capture failure marker needs local inspection; collection remains paused"
-                        .into(),
-                )
-            })?;
-        if !matches!(
-            value.reason.as_str(),
-            "STORAGE_UNAVAILABLE" | "QUEUE_LIMIT_REACHED" | "BOUNDARY_REFUSED"
-        ) || value.boundary_id.len() != 64
-            || !value.boundary_id.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err(storage_error("invalid failure marker"));
-        }
-        Ok(Some(value))
+        Ok(read_failure_markers(&self.directory)?
+            .into_iter()
+            .next()
+            .map(|(_, failure)| failure))
     }
     pub fn recover(&mut self, clock: &Clock) -> Result<(), AppError> {
         let tx = self.transaction()?;
         Self::check_size(&tx)?;
+        let markers = read_failure_markers(&tx.directory)?;
+        if !markers.is_empty() {
+            Self::reconcile_refusal(&tx)?;
+        }
         let mut statement = tx
-            .prepare("SELECT data FROM sessions WHERE json_type(data,'$.active')='object'")
+            .prepare("SELECT data FROM sessions")
             .map_err(storage_error)?;
         let rows: Vec<String> = statement
             .query_map([], |r| r.get(0))
@@ -1214,13 +1371,37 @@ impl Store {
             )
             .map_err(storage_error)?;
         }
-        tx.commit().map_err(storage_error)?;
-        let path = self.directory.join("capture-failure.json");
-        if path.exists() {
-            self.failure()?;
+        let directory = tx.directory.clone();
+        // Hold authority through commit and exact snapshot removal. New fallback
+        // publications have unique names and therefore cannot be removed here.
+        let CaptureTransaction {
+            inner,
+            _authority,
+            directory: _,
+        } = tx;
+        inner.commit().map_err(storage_error)?;
+        for (path, _) in markers {
             fs::remove_file(path).map_err(storage_error)?;
         }
+        fs::File::open(&directory)
+            .and_then(|f| f.sync_all())
+            .map_err(storage_error)?;
+        if !read_failure_markers(&directory)?.is_empty() {
+            return Err(AppError::Config(
+                "Another boundary was refused during recovery; collection remains paused".into(),
+            ));
+        }
+        drop(_authority);
         Ok(())
+    }
+    /// Bounded worker maintenance also runs on empty, disabled and held queues.
+    pub fn maintain(&mut self, now: i64) -> Result<(), AppError> {
+        let tx = self.transaction()?;
+        if tx.failure()?.is_some() {
+            Self::reconcile_refusal(&tx)?;
+        }
+        tx.execute("DELETE FROM outbox WHERE id IN (SELECT id FROM outbox WHERE state='acknowledged' AND acknowledged_at<?1 LIMIT 1000)",[now-7*24*3600]).map_err(storage_error)?;
+        tx.commit().map_err(storage_error)
     }
     pub fn preview(&self, source_id: &str) -> Result<Vec<Session>, AppError> {
         identifier(source_id)?;
@@ -1236,13 +1417,21 @@ impl Store {
         result
     }
     pub fn has_ready(&self, binding: &Binding, now: i64) -> Result<bool, AppError> {
+        if self.failure()?.is_some() {
+            return Ok(false);
+        }
         self.connection.query_row("SELECT EXISTS(SELECT 1 FROM outbox o JOIN sessions s ON s.id=o.session_id WHERE s.binding_id=?1 AND o.state='pending' AND o.retry_at<=?2 AND o.claimed_until<=?2 AND NOT EXISTS(SELECT 1 FROM outbox prior WHERE prior.session_id=o.session_id AND prior.revision<o.revision AND prior.state!='acknowledged'))",params![binding.id,now],|r|r.get(0)).map_err(storage_error)
     }
     /// Claims only the next revision of each session. Lease expiry permits lost-response replay.
     pub fn claim(&mut self, binding: &Binding, now: i64) -> Result<Option<Queued>, AppError> {
         let tx = self.transaction()?;
+        let refused = tx.failure()?.is_some();
+        if refused {
+            Self::reconcile_refusal(&tx)?;
+        }
         let current = Self::binding_in(&tx, &binding.repository_key)?;
         if !current.is_some_and(|b| b.id == binding.id && !b.paused && !b.revoked) {
+            tx.commit().map_err(storage_error)?;
             return Ok(None);
         }
         let row = tx.query_row("SELECT o.id,o.session_id,o.body,o.payload_hash,o.attempts,o.revision,json_extract(s.data,'$.canonical_server_id'),s.data FROM outbox o JOIN sessions s ON s.id=o.session_id
@@ -1271,6 +1460,7 @@ impl Store {
         } else {
             None
         };
+        tx.ensure_no_new_refusal(refused)?;
         tx.commit().map_err(storage_error)?;
         Ok(row)
     }
@@ -1313,16 +1503,19 @@ impl Store {
         let delay = retry_after
             .unwrap_or_else(|| (2_i64.pow((row.attempts as u32).min(8)) + (row.id % 7)).min(300))
             .clamp(1, 3600);
-        self.connection.execute("UPDATE outbox SET state=?2,reason=?3,attempts=attempts+1,retry_at=?4,claimed_until=0,acknowledged_at=?5 WHERE id=?1 AND payload_hash=?6",
+        let tx = self.transaction()?;
+        if tx.failure()?.is_some() {
+            Self::reconcile_refusal(&tx)?;
+        }
+        tx.execute("UPDATE outbox SET state=?2,reason=?3,attempts=attempts+1,retry_at=?4,claimed_until=0,acknowledged_at=?5 WHERE id=?1 AND payload_hash=?6 AND state!='held'",
             params![row.id,state,reason,now+delay,if state=="acknowledged" {Some(now)} else {None},row.hash]).map_err(storage_error)?;
         // Only acknowledged payloads expire. Never silently evict unsent evidence.
-        self.connection
-            .execute(
-                "DELETE FROM outbox WHERE state='acknowledged' AND acknowledged_at<?1",
-                [now - 7 * 24 * 3600],
-            )
-            .map_err(storage_error)?;
-        Ok(())
+        tx.execute(
+            "DELETE FROM outbox WHERE state='acknowledged' AND acknowledged_at<?1",
+            [now - 7 * 24 * 3600],
+        )
+        .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)
     }
 }
 
@@ -1411,8 +1604,59 @@ fn validate_frozen(
     true
 }
 
-/// Separate reserved, metadata-only failure marker remains writable when SQLite
-/// is busy/full. It records refusal, never claims the missed boundary was saved.
+/// Bounded metadata-only refusal state. Unique immutable filenames prevent a
+/// recovering process from deleting a concurrently published refusal.
+fn read_failure_markers(directory: &Path) -> Result<Vec<(PathBuf, CaptureFailure)>, AppError> {
+    let mut markers = Vec::new();
+    for entry in fs::read_dir(directory).map_err(storage_error)? {
+        let entry = entry.map_err(storage_error)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name != "capture-failure.json"
+            && !(name.starts_with("capture-refusal-") && name.ends_with(".json"))
+        {
+            continue;
+        }
+        if markers.len() >= 1024 {
+            return Err(storage_error("refusal marker limit"));
+        }
+        let path = entry.path();
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let file = options.open(&path).map_err(storage_error)?;
+        let metadata = file.metadata().map_err(storage_error)?;
+        if !metadata.is_file() || metadata.len() > 1024 {
+            return Err(storage_error("invalid refusal marker"));
+        }
+        let mut bytes = Vec::new();
+        file.take(1025)
+            .read_to_end(&mut bytes)
+            .map_err(storage_error)?;
+        if bytes.len() > 1024 {
+            return Err(storage_error("invalid refusal marker"));
+        }
+        let value: CaptureFailure = serde_json::from_slice(&bytes).map_err(storage_error)?;
+        if !matches!(
+            value.reason.as_str(),
+            "STORAGE_UNAVAILABLE" | "QUEUE_LIMIT_REACHED" | "BOUNDARY_REFUSED"
+        ) || value.boundary_id.len() != 64
+            || !value.boundary_id.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(storage_error("invalid refusal marker"));
+        }
+        markers.push((path, value));
+    }
+    markers.sort_by(|(ap, a), (bp, b)| a.observed_at.cmp(&b.observed_at).then_with(|| ap.cmp(bp)));
+    Ok(markers)
+}
+
 pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Result<(), AppError> {
     if !matches!(
         reason,
@@ -1436,16 +1680,35 @@ pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Resu
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(storage_error)?;
     }
-    let path = directory.join("capture-failure.json");
-    if path.exists()
-        && fs::symlink_metadata(&path)
-            .map_err(storage_error)?
-            .file_type()
-            .is_symlink()
-    {
-        return Err(storage_error("symlink"));
+    // Bound reserved refusal storage as well as each marker. At exhaustion,
+    // existing durable refusal state still keeps collection paused; this new
+    // boundary is explicitly reported unsaved rather than silently evicted.
+    let existing = fs::read_dir(directory)
+        .map_err(storage_error)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("capture-refusal-") && name.ends_with(".json"))
+        })
+        .take(1024)
+        .count();
+    if existing >= 1024 {
+        return Err(storage_error("refusal marker limit"));
     }
-    let temporary = directory.join(format!(".capture-failure-{}.tmp", std::process::id()));
+    // Never add another busy wait after SQLite's 500ms timeout. Failure of the
+    // nonblocking lock still permits this append-only emergency publication.
+    let _authority = AuthorityGuard::acquire(directory, false).ok();
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = hash(format!(
+        "{}-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let temporary = directory.join(format!(".capture-refusal-{unique}.tmp"));
+    let path = directory.join(format!("capture-refusal-{unique}.json"));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1460,11 +1723,14 @@ pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Resu
             boundary_id: boundary_id.into(),
             observed_at: chrono::Utc::now().timestamp(),
         };
-        let body = serde_json::to_vec(&failure).map_err(storage_error)?;
         use std::io::Write;
-        file.write_all(&body).map_err(storage_error)?;
+        file.write_all(&serde_json::to_vec(&failure).map_err(storage_error)?)
+            .map_err(storage_error)?;
         file.sync_all().map_err(storage_error)?;
         fs::rename(&temporary, &path).map_err(storage_error)?;
+        fs::File::open(directory)
+            .and_then(|f| f.sync_all())
+            .map_err(storage_error)?;
         Ok(())
     })();
     if temporary.exists() {
