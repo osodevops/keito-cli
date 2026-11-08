@@ -73,6 +73,9 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
+      - name: Prepare locked dependencies before the offline macOS test boundary
+        if: runner.os == 'macOS'
+        run: cargo fetch --locked
       - name: Run macOS tests inside the proved service/network boundary
         if: runner.os == 'macOS'
         run: KEITO_TEST_REAL_PROFILE_HOME="$HOME" tests/run-macos-isolated.sh

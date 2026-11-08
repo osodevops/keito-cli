@@ -64,3 +64,27 @@ dispatcher and actual plugin command, with direct-guard controls. Dispatch deleg
 core refusals to the available guard so publication precedes refusal. A guard that
 cannot start remains a separate pre-instruction limitation; no corrupted-guardian
 startup durability claim follows from the core-refusal tests.
+
+
+## Locked dependency preparation and output compatibility
+
+The macOS CI job fetches locked dependencies before applying the offline test
+boundary. A cache hit is optional. Local callers likewise run `cargo fetch --locked`
+before `tests/run-macos-isolated.sh`; product tests retain inherited service-exec
+and network denial.
+
+The cold-cache regression was reproduced as a setup-gate failure with an empty
+private Cargo cache. Locked public dependency preparation then populated that
+cache, and an offline checker compilation check succeeded. Both stages denied access to the
+operator HOME and denied real service execution after owned native marker/alias
+and allowed controls. This is dependency-preparation evidence, not capture
+latency qualification.
+
+The source now requires Tokio 1.53.3 or later and locks that fixed release, locks
+anyhow 1.0.103, and uses tabled 0.22/derive 0.12 to remove the unmaintained
+proc-macro-error2 build dependency. Seven retained synthetic human-table outputs
+cover typed tables, multiline/truncated notes, rounded borders, headers, fallback
+and empty results; the migration preserves their exact output strings. These
+source changes require a new reviewed build and first-artifact qualification.
+The earlier 1e234ee paired build remains unexecuted evidence, not a qualified
+artifact for the updated dependency set.

@@ -415,7 +415,10 @@ man ./man/keito.1
 
 ### Protected macOS tests
 
-Run macOS CLI tests with `KEITO_TEST_REAL_PROFILE_HOME="$HOME" tests/run-macos-isolated.sh`.
+Prepare locked dependencies with `cargo fetch --locked`, then run macOS CLI tests
+with `KEITO_TEST_REAL_PROFILE_HOME="$HOME" tests/run-macos-isolated.sh`.
+CI performs this explicit preparation before the offline boundary, so cache hits
+are an optimization rather than a prerequisite.
 The runner proves one inherited kernel policy using owned native marker and alias
 executables plus an allowed control, then permits loopback fixtures while denying
 execution of the real service utility. Doctor and transport assertions remain active.
