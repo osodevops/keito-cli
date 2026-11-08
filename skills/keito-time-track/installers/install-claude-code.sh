@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
+# Native CLI owns installation, preservation and recovery.
 set -euo pipefail
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-exec python3 "$script_dir/manage-hooks.py" install --agent claude-code "$@"
+exec "${KEITO_CLI_BIN:-keito}" skill install --agent claude-code "$@"

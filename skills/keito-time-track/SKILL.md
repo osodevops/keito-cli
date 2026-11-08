@@ -24,6 +24,8 @@ keito skill install --agent claude-code --agent codex
 scripts/setup-wizard.sh --agent claude-code --agent codex --install-worker
 ```
 
+The native Rust CLI and its verified matching `keito-capture-guard` must be installed.
+Capture, installer and mapping setup have no production Python runtime dependency.
 The CLI must expose `keito capture --help`. If it does not, install a qualified
 CLI release before proceeding. `scripts/install-cli.sh` installs the public CLI;
 it does not establish capture support or harness qualification. Authentication
@@ -35,6 +37,9 @@ only approves local queuing, so do not claim automatic delivery. The CLI owns
 service setup and must report its actual running/verified state.
 
 The setup picker uses existing accessible clients, projects and project tasks.
+It delegates mapping publication and recovery to native `capture setup --client
+<client-id> --project <project-id> --task <task-id> --write-hint --confirm` in the
+canonical Git root; it never shells back into the CLI from an installer service.
 It previews metadata-only collection and requires explicit mapping consent on
 this device. A repository-carried `.keito/config.yml` is only a hint; it cannot
 approve capture, choose a billing rate or authorize historical import. Failed setup restores the previous hint. After an
@@ -76,7 +81,9 @@ Claude plugin registrations do not snapshot the running executable version.
 They use `KEITO_HARNESS_VERSION` when explicitly provided, otherwise `unknown`.
 Unknown means unqualified: never report a plugin as ready or live-delivery
 verified from installed files. The direct installer records the selected
-observed version; both routes still need real trust/dispatch qualification.
+observed version. The native guard/core pair is configured by managed direct
+installation; a plugin-only installation does not establish that pair and
+remains unqualified. All routes still need real trust/dispatch qualification.
 These scripts do not run a version-discovery subprocess on every hook.
 
 ## Capture and privacy contract
@@ -84,14 +91,22 @@ These scripts do not run a version-discovery subprocess on every hook.
 - `SessionStart` preserves session identity; `UserPromptSubmit` opens a turn;
   `Stop` checkpoints it; interruption/failure/finalization retain incomplete
   evidence. A session may have many completed turns.
-- Hooks synchronously invoke the local CLI only, with a one-second fail-open
-  ceiling. CLI SQLite durability precedes acknowledgement; workers handle
+- Hooks invoke the paired native Rust guard/core locally, with the unchanged
+  one-second fail-open ceiling. A content-free durable prelaunch marker precedes
+  core startup; only exact durable acknowledgement, successful exit and pipe EOF
+  permit cleanup. The guard performs no network or SQLite work. Core SQLite
+  durability precedes acknowledgement; workers handle
   network I/O and frozen retries separately.
 - Default capture never uploads prompts, assistant prose, transcripts, source
   code, full local paths, branch names or Git diffs. The raw harness JSON is
   transient stdin to the allowlisting CLI and is never logged by these scripts.
 - Observed agent duration is not human labour, CPU time, vendor expenditure or
   permission to charge. New evidence remains nonbillable pending review.
+- A separately qualified numeric parser may read the exact active-session file
+  locally after current consent and baseline checks. It discards prompts, prose,
+  code and tool arguments; only allowlisted counters/identifiers/provenance can
+  persist. Paused/revoked terminal events do not read transcripts. No arbitrary
+  history scans, backfill, model summaries or transcript uploads are authorized.
 - Numeric usage and cost claims require separately qualified versioned evidence.
   These adapters alone establish no automatic usage or actual-cost claim.
 - Installation cannot grant host trust, mapping consent, rate authority or live

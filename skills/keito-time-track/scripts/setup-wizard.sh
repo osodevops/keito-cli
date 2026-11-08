@@ -71,10 +71,10 @@ fi
 printf 'Approve this repository mapping and metadata-only capture on this device? [y/N] '
 read -r confirm
 case "$confirm" in y|Y|yes|YES) ;; *) echo 'Setup cancelled; no mapping approved.'; exit 0 ;; esac
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 if [ "${#worker[@]}" -gt 0 ]; then
   agents+=(--install-worker)
 fi
-exec python3 "$script_dir/approve-mapping.py" --root "$repo_root" \
-  --workspace "$workspace_id" --client "$client_id" --project "$project_id" --task "$task_id" \
+cd "$repo_root"
+exec "$keito_cmd" --workspace "$workspace_id" capture setup \
+  --client "$client_id" --project "$project_id" --task "$task_id" --write-hint \
   "${agents[@]}" --confirm
