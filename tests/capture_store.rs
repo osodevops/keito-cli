@@ -760,3 +760,46 @@ fn typed_acknowledgement_retires_only_expired_acknowledged_payloads() {
         .unwrap();
     assert_eq!(old, 0);
 }
+
+#[test]
+fn legacy_yaml_and_json_mapping_hints_have_the_same_minimized_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init"]);
+    std::fs::create_dir(temp.path().join(".keito")).unwrap();
+    let file = temp.path().join(".keito/config.yml");
+    std::fs::write(&file,"workspace_id: co_fixture\nproject_id: p_fixture\ntask_id: t_fixture\nagent_tracking:\n  enabled: true\n  privacy: metadata-only\nmetadata:\n  ignored: PRIVATE_CANARY\n").unwrap();
+    let yaml = Repository::resolve(temp.path()).unwrap();
+    std::fs::write(&file,r#"{"workspace_id":"co_fixture","project_id":"p_fixture","task_id":"t_fixture","agent_tracking":{"enabled":true,"privacy":"metadata-only"},"metadata":{"ignored":"OTHER_IGNORED_CANARY"}}"#).unwrap();
+    let json = Repository::resolve(temp.path()).unwrap();
+    assert_eq!(yaml.hint_hash, json.hint_hash);
+}
+#[test]
+fn mapping_parser_refuses_deep_resource_amplification_without_echo() {
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init"]);
+    std::fs::create_dir(temp.path().join(".keito")).unwrap();
+    let file = temp.path().join(".keito/config.yml");
+    let body = format!(
+        "project_id: p_fixture\nmetadata:\n  deep: {}PRIVATE_CANARY{}\n",
+        "[".repeat(32),
+        "]".repeat(32)
+    );
+    std::fs::write(&file, body).unwrap();
+    let error = Repository::resolve(temp.path()).unwrap_err().to_string();
+    assert!(!error.contains("PRIVATE_CANARY"));
+}
+#[test]
+fn malformed_and_duplicate_mapping_keys_are_refused_without_source_excerpt() {
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init"]);
+    std::fs::create_dir(temp.path().join(".keito")).unwrap();
+    let file = temp.path().join(".keito/config.yml");
+    for body in [
+        "project_id: p_fixture\nproject_id: another_project\n",
+        "project_id: [PRIVATE_CANARY\n",
+    ] {
+        std::fs::write(&file, body).unwrap();
+        let error = Repository::resolve(temp.path()).unwrap_err().to_string();
+        assert!(!error.contains("PRIVATE_CANARY"));
+    }
+}
