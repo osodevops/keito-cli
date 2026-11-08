@@ -84,6 +84,11 @@ const BUNDLED_SKILL_FILES: &[BundledSkillFile] = &[
         executable: true,
     },
     BundledSkillFile {
+        path: "hooks/guard.py",
+        contents: include_str!("../../skills/keito-time-track/hooks/guard.py"),
+        executable: true,
+    },
+    BundledSkillFile {
         path: "hooks/interrupt.sh",
         contents: include_str!("../../skills/keito-time-track/hooks/interrupt.sh"),
         executable: true,
@@ -1061,13 +1066,7 @@ fn relative_display(path: &Path) -> String {
 
 fn capture_diagnostics(global: &GlobalFlags) -> (serde_json::Value, serde_json::Value) {
     let default_worker = serde_json::json!({"installed":false,"loaded":false,"running":false,"stale":false,"state":"UNKNOWN"});
-    let directory = std::env::var_os("KEITO_CAPTURE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            crate::config::AppConfig::config_dir()
-                .ok()
-                .map(|p| p.join("capture"))
-        });
+    let directory = crate::capture_invocations::directory().ok();
     let Some(directory) = directory else {
         return (
             serde_json::json!({"storage_paused":true,"reason":"STORAGE_UNAVAILABLE"}),

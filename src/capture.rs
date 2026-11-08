@@ -1,5 +1,6 @@
 //! Metadata-only durable capture. Raw hook JSON is never a storage type.
 use crate::capture_authority::AuthorityGuard;
+use crate::capture_invocations::{self, Permit};
 use crate::capture_usage::{read_active_session, ApprovedActiveSession, Harness};
 use crate::capture_usage_ledger::UsageLedger;
 use crate::cli::capture::CaptureEvent;
@@ -450,6 +451,7 @@ struct CaptureTransaction<'a> {
     inner: Transaction<'a>,
     _authority: AuthorityGuard,
     directory: PathBuf,
+    invocation: Option<Permit>,
 }
 impl<'a> std::ops::Deref for CaptureTransaction<'a> {
     type Target = Transaction<'a>;
@@ -472,20 +474,25 @@ impl CaptureTransaction<'_> {
         }
         Ok(())
     }
-    fn commit(self) -> rusqlite::Result<()> {
+    fn commit(self) -> Result<(), AppError> {
         let Self {
             inner,
             _authority,
-            directory: _,
+            directory,
+            invocation,
         } = self;
-        let result = inner.commit();
+        if let Some(invocation) = invocation {
+            invocation.validate(&directory)?;
+        }
+        inner.commit().map_err(storage_error)?;
         drop(_authority);
-        result
+        Ok(())
     }
 }
 pub struct Store {
     connection: Connection,
     directory: PathBuf,
+    invocation: Option<Permit>,
 }
 #[derive(Debug, Serialize)]
 pub struct QueueState {
@@ -518,6 +525,7 @@ pub struct Status {
     pub storage_paused: bool,
     pub storage_reason: Option<String>,
     pub capture_failure: Option<CaptureFailure>,
+    pub pending_invocations: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Queued {
@@ -592,21 +600,59 @@ impl Store {
         Ok(Self {
             connection,
             directory: directory.to_owned(),
+            invocation: None,
         })
     }
+    pub fn hook_invocation(&mut self, nonce: &str) -> Result<(), AppError> {
+        self.invocation = Some(Permit::new(&self.directory, nonce)?);
+        Ok(())
+    }
+    pub fn acknowledge_hook(&self, fd: i32) -> Result<(), AppError> {
+        self.invocation
+            .as_ref()
+            .ok_or_else(|| storage_error("missing invocation"))?
+            .acknowledge(&self.directory, fd)
+    }
+    pub fn invocations_pending(&self) -> Result<bool, AppError> {
+        Ok(!capture_invocations::snapshot(&self.directory)?.is_empty())
+    }
     fn transaction(&mut self) -> Result<CaptureTransaction<'_>, AppError> {
+        self.transaction_for_event(false)
+    }
+    fn transaction_for_event(&mut self, event: bool) -> Result<CaptureTransaction<'_>, AppError> {
         let directory = self.directory.clone();
+        let invocation = if event { self.invocation.clone() } else { None };
+        if let Some(permit) = &invocation {
+            permit.validate(&directory)?;
+        }
         let inner = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(storage_error)?;
-        // Never hold the filesystem lock during SQLite's bounded busy wait.
         let authority = AuthorityGuard::acquire(&directory, true)?;
-        Ok(CaptureTransaction {
+        if let Some(permit) = &invocation {
+            permit.validate(&directory)?;
+        }
+        let tx = CaptureTransaction {
             inner,
             _authority: authority,
             directory,
-        })
+            invocation,
+        };
+        let markers = capture_invocations::snapshot(&tx.directory)?;
+        for marker in markers.iter().filter(|m| !m.live) {
+            let boundary = hash(format!("INVOCATION\0{}", marker.nonce));
+            if !read_failure_markers(&tx.directory)?
+                .iter()
+                .any(|(_, f)| f.boundary_id == boundary)
+            {
+                record_failure(&tx.directory, &boundary, "BOUNDARY_REFUSED")?;
+            }
+        }
+        if markers.iter().any(|m| !m.live) {
+            Self::reconcile_refusal(&tx)?;
+        }
+        Ok(tx)
     }
     fn check_size(tx: &Transaction<'_>) -> Result<(), AppError> {
         let pages: i64 = tx
@@ -716,6 +762,33 @@ impl Store {
         tx.ensure_no_new_refusal(refused)?;
         tx.commit().map_err(storage_error)?;
         Ok(binding)
+    }
+    fn abandon_native_gap(
+        tx: &Transaction<'_>,
+        source_id: &str,
+        source: &str,
+    ) -> Result<(), AppError> {
+        let mut statement=tx.prepare("SELECT data FROM sessions WHERE source_id=?1 AND json_extract(data,'$.source_namespace')=?2 AND json_type(data,'$.active')='object'").map_err(storage_error)?;
+        let rows: Vec<String> = statement
+            .query_map(params![source_id, source], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for raw in rows {
+            let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            session.abandon_active()?;
+            Self::queue(tx, &mut session)?;
+            tx.execute(
+                "UPDATE sessions SET data=?2 WHERE id=?1",
+                params![
+                    session.id,
+                    serde_json::to_string(&session).map_err(storage_error)?
+                ],
+            )
+            .map_err(storage_error)?;
+        }
+        Ok(())
     }
     fn hold_binding(tx: &Transaction<'_>, binding_id: &str, reason: &str) -> Result<(), AppError> {
         tx.execute("UPDATE outbox SET state='held',reason=?2,claimed_until=0 WHERE session_id IN (SELECT id FROM sessions WHERE binding_id=?1) AND state!='acknowledged' AND (state='pending' OR reason IN ('HARNESS_CONSENT_REVOKED','REPOSITORY_CONSENT_INVALIDATED'))",params![binding_id,reason]).map_err(storage_error)?;
@@ -847,7 +920,7 @@ impl Store {
         if let Some(id) = turn_id {
             identifier(id)?;
         }
-        let tx = self.transaction()?;
+        let tx = self.transaction_for_event(true)?;
         let self_failure_present = tx.failure()?.is_some();
         if self_failure_present {
             Self::reconcile_refusal(&tx)?;
@@ -858,6 +931,9 @@ impl Store {
         }
         Self::check_size(&tx)?;
         let Some(binding) = Self::binding_in(&tx, &repository.key)? else {
+            // A known native session leaving approved repositories is an
+            // unobserved gap, not authority to keep its old clock alive.
+            Self::abandon_native_gap(&tx, source_id, source)?;
             tx.ensure_no_new_refusal(self_failure_present)?;
             tx.commit().map_err(storage_error)?;
             return Ok(());
@@ -1314,11 +1390,16 @@ impl Store {
             .query_row("PRAGMA page_size", [], |r| r.get(0))
             .map_err(storage_error)?;
         let full = pages * page_size >= MAX_QUEUE_BYTES - 64 * 1024;
-        let storage_paused = full || capture_failure.is_some();
+        let invocation_markers = capture_invocations::snapshot(&self.directory)?;
+        let dead_invocation = invocation_markers.iter().any(|marker| !marker.live);
+        let storage_paused = full || capture_failure.is_some() || dead_invocation;
         let storage_reason = if full {
             Some("QUEUE_LIMIT_REACHED".into())
         } else {
-            capture_failure.as_ref().map(|f| f.reason.clone())
+            capture_failure
+                .as_ref()
+                .map(|f| f.reason.clone())
+                .or_else(|| dead_invocation.then(|| "UNACKNOWLEDGED_INVOCATION".into()))
         };
         Ok(Status {
             policy: POLICY,
@@ -1334,6 +1415,7 @@ impl Store {
             storage_paused,
             storage_reason,
             capture_failure,
+            pending_invocations: invocation_markers.len(),
         })
     }
     fn failure(&self) -> Result<Option<CaptureFailure>, AppError> {
@@ -1344,6 +1426,10 @@ impl Store {
     }
     pub fn recover(&mut self, clock: &Clock) -> Result<(), AppError> {
         let tx = self.transaction()?;
+        let invocations = capture_invocations::snapshot(&tx.directory)?;
+        if invocations.iter().any(|marker| marker.live) {
+            return Err(storage_error("live invocation prevents recovery"));
+        }
         Self::check_size(&tx)?;
         let markers = read_failure_markers(&tx.directory)?;
         if !markers.is_empty() {
@@ -1378,15 +1464,19 @@ impl Store {
             inner,
             _authority,
             directory: _,
+            invocation: _,
         } = tx;
         inner.commit().map_err(storage_error)?;
+        capture_invocations::remove_dead(&directory, &invocations)?;
         for (path, _) in markers {
             fs::remove_file(path).map_err(storage_error)?;
         }
         fs::File::open(&directory)
             .and_then(|f| f.sync_all())
             .map_err(storage_error)?;
-        if !read_failure_markers(&directory)?.is_empty() {
+        if !read_failure_markers(&directory)?.is_empty()
+            || !capture_invocations::snapshot(&directory)?.is_empty()
+        {
             return Err(AppError::Config(
                 "Another boundary was refused during recovery; collection remains paused".into(),
             ));
@@ -1417,7 +1507,7 @@ impl Store {
         result
     }
     pub fn has_ready(&self, binding: &Binding, now: i64) -> Result<bool, AppError> {
-        if self.failure()?.is_some() {
+        if self.failure()?.is_some() || self.invocations_pending()? {
             return Ok(false);
         }
         self.connection.query_row("SELECT EXISTS(SELECT 1 FROM outbox o JOIN sessions s ON s.id=o.session_id WHERE s.binding_id=?1 AND o.state='pending' AND o.retry_at<=?2 AND o.claimed_until<=?2 AND NOT EXISTS(SELECT 1 FROM outbox prior WHERE prior.session_id=o.session_id AND prior.revision<o.revision AND prior.state!='acknowledged'))",params![binding.id,now],|r|r.get(0)).map_err(storage_error)
@@ -1428,6 +1518,10 @@ impl Store {
         let refused = tx.failure()?.is_some();
         if refused {
             Self::reconcile_refusal(&tx)?;
+        }
+        if !capture_invocations::snapshot(&tx.directory)?.is_empty() {
+            tx.commit().map_err(storage_error)?;
+            return Ok(None);
         }
         let current = Self::binding_in(&tx, &binding.repository_key)?;
         if !current.is_some_and(|b| b.id == binding.id && !b.paused && !b.revoked) {

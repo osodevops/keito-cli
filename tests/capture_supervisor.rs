@@ -7,6 +7,7 @@ fn capture_worker_status_never_claims_an_uninstalled_service_running() {
     Command::cargo_bin("keito")
         .unwrap()
         .env("HOME", home.path())
+        .env("KEITO_CAPTURE_HOME", home.path().join("capture"))
         .args(["capture", "worker-status", "--json"])
         .assert()
         .success()

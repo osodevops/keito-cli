@@ -31,6 +31,7 @@ fn write_test_config(home: &Path, api_url: &str) {
 fn command_with_mock_config(home: &Path, api_url: &str) -> Command {
     let mut cmd = Command::cargo_bin("keito").unwrap();
     cmd.env("HOME", home)
+        .env("KEITO_CAPTURE_HOME", home.join("capture"))
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("APPDATA", home.join("AppData").join("Roaming"))
         .env("KEITO_API_URL", api_url)
@@ -267,6 +268,7 @@ fn skill_install_configures_agent_hooks_with_fake_skills_cli() {
     prepend_path(&mut cmd, &bin);
     let output = cmd
         .env("HOME", temp_dir.path())
+        .env("KEITO_CAPTURE_HOME", temp_dir.path().join("capture"))
         .env("XDG_CONFIG_HOME", temp_dir.path().join("config"))
         .env("APPDATA", temp_dir.path().join("AppData").join("Roaming"))
         .env("KEITO_FAKE_NPX_LOG", &npx_log)
@@ -325,6 +327,7 @@ fn skill_install_uses_bundled_skill_by_default() {
     let output = Command::cargo_bin("keito")
         .unwrap()
         .env("HOME", temp_dir.path())
+        .env("KEITO_CAPTURE_HOME", temp_dir.path().join("capture"))
         .env("XDG_CONFIG_HOME", temp_dir.path().join("config"))
         .env("APPDATA", temp_dir.path().join("AppData").join("Roaming"))
         .env("KEITO_API_KEY", "kto_test_key")
@@ -415,6 +418,7 @@ fn whoami_without_auth_fails() {
         .unwrap()
         .args(["auth", "whoami"])
         .env("HOME", temp_dir.path())
+        .env("KEITO_CAPTURE_HOME", temp_dir.path().join("capture"))
         .env("XDG_CONFIG_HOME", temp_dir.path().join("config"))
         .env_remove("KEITO_API_KEY")
         .env_remove("KEITO_ACCOUNT_ID")

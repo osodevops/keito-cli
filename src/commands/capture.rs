@@ -11,10 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 fn directory() -> Result<PathBuf, AppError> {
-    if let Some(path) = std::env::var_os("KEITO_CAPTURE_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    Ok(AppConfig::config_dir()?.join("capture"))
+    crate::capture_invocations::directory()
 }
 fn current_repo() -> Result<Repository, AppError> {
     let cwd = std::env::current_dir()
@@ -45,6 +42,12 @@ pub async fn run(
         } => {
             // A malformed/unknown hook must never block coding or echo raw input.
             let mut boundary_id = None;
+            let invocation_nonce = std::env::var("KEITO_CAPTURE_INVOCATION_NONCE").ok();
+            let ack_fd = std::env::var("KEITO_CAPTURE_ACK_FD")
+                .ok()
+                .and_then(|fd| fd.parse::<i32>().ok())
+                .filter(|fd| crate::capture_invocations::protect_ack(*fd).is_ok());
+            let mut accepted_store = None;
             let result = (|| {
                 let mut bytes = Vec::new();
                 std::io::stdin()
@@ -62,11 +65,7 @@ pub async fn run(
                     .get("session_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| AppError::InvalidInput("Missing session identity".into()))?;
-                let cwd = value
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| AppError::InvalidInput("Missing repository identity".into()))?;
-                let repo = Repository::resolve(Path::new(cwd))?;
+                capture::identifier(source_id)?;
                 let turn_id = value
                     .get(if agent.namespace() == "claude-code" {
                         "prompt_id"
@@ -74,6 +73,9 @@ pub async fn run(
                         "turn_id"
                     })
                     .and_then(Value::as_str);
+                if let Some(turn) = turn_id {
+                    capture::identifier(turn)?;
+                }
                 boundary_id = Some(capture::hash(format!(
                     "{}\0{}\0{}\0{:?}",
                     agent.namespace(),
@@ -81,7 +83,15 @@ pub async fn run(
                     turn_id.unwrap_or("no-turn"),
                     event
                 )));
+                let cwd = value
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AppError::InvalidInput("Missing repository identity".into()))?;
+                let repo = Repository::resolve(Path::new(cwd))?;
                 let mut store = Store::open(&directory()?)?;
+                if let Some(nonce) = &invocation_nonce {
+                    store.hook_invocation(nonce)?;
+                }
                 store.event(
                     &repo,
                     capture::Signal {
@@ -94,7 +104,9 @@ pub async fn run(
                         event,
                         clock: &Clock::now()?,
                     },
-                )
+                )?;
+                accepted_store = Some(store);
+                Ok(())
             })();
             if let Err(error) = result {
                 let reason = match error {
@@ -104,11 +116,21 @@ pub async fn run(
                     AppError::Config(_) => "STORAGE_UNAVAILABLE",
                     _ => "BOUNDARY_REFUSED",
                 };
-                let saved = boundary_id.as_deref().is_some_and(|id| {
-                    directory().ok().is_some_and(|directory| {
-                        capture::record_failure(&directory, id, reason).is_ok()
-                    })
+                let failure_identity = boundary_id
+                    .clone()
+                    .unwrap_or_else(|| capture::hash("UNIDENTIFIED_REFUSED_BOUNDARY"));
+                let saved = directory().ok().is_some_and(|directory| {
+                    capture::record_failure(&directory, &failure_identity, reason).is_ok()
                 });
+                if saved && boundary_id.is_some() {
+                    if let (Some(nonce), Some(fd)) = (&invocation_nonce, ack_fd) {
+                        if let Ok(mut store) = Store::open(&directory()?) {
+                            if store.hook_invocation(nonce).is_ok() {
+                                let _ = store.acknowledge_hook(fd);
+                            }
+                        }
+                    }
+                }
                 eprintln!(
                     "Keito capture refused this boundary; no time was invented. {}",
                     if saved {
@@ -117,6 +139,8 @@ pub async fn run(
                         "The boundary could not be saved; inspect local storage and capture status before resuming."
                     }
                 );
+            } else if let (Some(store), Some(fd)) = (accepted_store, ack_fd) {
+                let _ = store.acknowledge_hook(fd);
             }
             Ok(())
         }
@@ -399,7 +423,7 @@ async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
         let Some(row) = store.claim(&binding, now)? else {
             break;
         };
-        if store.status()?.storage_paused {
+        if store.status()?.storage_paused || store.invocations_pending()? {
             break;
         }
         // Current consent was checked atomically at claim. The server rechecks

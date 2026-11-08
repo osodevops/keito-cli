@@ -111,10 +111,12 @@ impl UsageLedger {
             self.incomplete = true;
             return;
         }
-        if evidence
-            .limitations
-            .contains(&"CONFLICTING_REQUEST_RECORDS")
-        {
+        if evidence.limitations.iter().any(|reason| {
+            matches!(
+                *reason,
+                "CONFLICTING_REQUEST_RECORDS" | "UNKNOWN_REQUEST_FINALITY"
+            )
+        }) {
             self.held = true;
             self.incomplete = true;
             return;

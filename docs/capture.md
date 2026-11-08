@@ -148,6 +148,22 @@ Their frozen bytes remain unchanged, and recovery or reapproval cannot release t
 Recovery clears only the exact marker snapshot it reconciled; a concurrent new refusal
 remains paused and requires another explicit recovery.
 
+Installed hooks publish a private, content-free invocation flag before starting the CLI.
+The guard alone holds its file lock and removes the exact flag only after a fixed-byte
+acknowledgement from a durable core result. Startup stalls, watchdog termination, missing
+acknowledgements and abandoned preparations therefore remain visible to the next core
+operation. Any pending invocation blocks delivery; an abandoned one pauses collection and
+holds potentially affected frozen complete evidence for review. Explicit recovery cannot
+clear a live invocation. The flag contains no native session identity, hook JSON or paths.
+This protects failures after the guard first creates durable local state; it cannot observe
+a guard that never reaches its first filesystem instruction.
+
+Capture state defaults to the effective OS user's configuration directory, independently
+of hook `HOME`, `XDG_CONFIG_HOME` and repository input. An explicit `KEITO_CAPTURE_HOME`
+is an operator or supervisor setting and must name the same private ledger for both guard
+and core. Invocation directories require owned, private permissions and paths without
+symlink components.
+
 Canonical request data contains only harness/session identifiers, versioned mapping,
 absolute lifecycle instants, exact integer seconds, completeness and explicit usage
 unavailability. It contains no prompts, assistant prose, transcript, source code, tool

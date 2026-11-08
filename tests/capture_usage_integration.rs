@@ -105,7 +105,7 @@ impl Fixture {
     }
 }
 fn request(id: &str, output: u64) -> Value {
-    json!({"type":"assistant","sessionId":SESSION,"message":{"id":id,"model":"claude-opus-5-5","usage":{"input_tokens":2,"cache_read_input_tokens":null,"cache_creation_input_tokens":2280,"output_tokens":output},"content":[{"text":"PRIVATE_CANARY sk-secret /private/customer"}]}})
+    json!({"type":"assistant","sessionId":SESSION,"message":{"id":id,"model":"claude-opus-5-5","stop_reason":"end_turn","usage":{"input_tokens":2,"cache_read_input_tokens":null,"cache_creation_input_tokens":2280,"output_tokens":output},"content":[{"text":"PRIVATE_CANARY sk-secret /private/customer"}]}})
 }
 #[test]
 fn exact_session_usage_and_time_commit_atomically_without_prose_or_paths() {
@@ -269,4 +269,25 @@ fn legacy_metadata_capture_never_reads_transcripts_without_explicit_internal_gat
     f.event(Prompt, 0, false);
     f.event(Stop, 2, false);
     assert_eq!(f.bodies()[0]["usage"]["status"], "UNAVAILABLE");
+}
+
+#[test]
+fn provisional_request_does_not_permanently_hold_a_later_final_usage_revision() {
+    let mut f = Fixture::new();
+    let mut provisional = request("msg_later_final", 0);
+    provisional["message"]["stop_reason"] = Value::Null;
+    f.write(vec![provisional]);
+    f.event(Prompt, 0, false);
+    f.event(Stop, 2, true);
+    let initial = f.bodies();
+    assert_eq!(initial[0]["usage"]["status"], "UNAVAILABLE");
+    assert!(!f.store.preview(SESSION).unwrap()[0].needs_attention);
+    f.write(vec![request("msg_later_final", 5)]);
+    f.event(Stop, 4, true);
+    let bodies = f.bodies();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], initial[0]);
+    assert_eq!(bodies[1]["usage"]["records"].as_array().unwrap().len(), 1);
+    assert_eq!(bodies[1]["segments"], json!([]));
+    assert!(!f.store.preview(SESSION).unwrap()[0].needs_attention);
 }
