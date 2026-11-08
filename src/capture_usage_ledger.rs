@@ -100,10 +100,50 @@ pub struct UsageLedger {
     pub queued: usize,
     pub incomplete: bool,
     pub held: bool,
+    #[serde(default)]
+    pub consent_epoch: u64,
+    #[serde(default)]
+    pub baseline_epoch: Option<u64>,
+    #[serde(default)]
+    pub excluded_request_ids: std::collections::BTreeSet<String>,
 }
 impl UsageLedger {
+    pub fn baseline_ready(&self) -> bool {
+        self.baseline_epoch == Some(self.consent_epoch)
+    }
+    pub fn require_baseline(&mut self) {
+        self.consent_epoch = self.consent_epoch.saturating_add(1);
+        self.baseline_epoch = None;
+        self.incomplete = true;
+    }
+    /// Persist identifiers only. Prior immutable accepted records remain eligible
+    /// for conflict checking; no excluded record's counters enter this ledger.
+    pub fn establish_baseline(&mut self, ids: std::collections::BTreeSet<String>) -> bool {
+        self.baseline_epoch = None;
+        if ids.len() > 4096 || ids.iter().any(|id| !opaque(id)) {
+            self.incomplete = true;
+            return false;
+        }
+        let mut excluded = self.excluded_request_ids.clone();
+        excluded.extend(
+            ids.into_iter()
+                .filter(|id| !self.records.iter().any(|old| old.source_record_id == *id)),
+        );
+        if excluded.len() > 16384 {
+            self.incomplete = true;
+            return false;
+        }
+        self.incomplete |= !excluded.is_empty();
+        self.excluded_request_ids = excluded;
+        self.baseline_epoch = Some(self.consent_epoch);
+        true
+    }
     /// Validate the whole snapshot before changing any minimized records.
     pub fn observe(&mut self, evidence: UsageEvidence, source: &str, version: &str, session: &str) {
+        if !self.baseline_ready() {
+            self.incomplete = true;
+            return;
+        }
         if evidence.source_session_id != session
             || evidence.harness_version != version
             || evidence.coverage != "PARTIAL"
@@ -129,6 +169,16 @@ impl UsageLedger {
             self.incomplete = true;
             return;
         };
+        let candidate: Vec<_> = candidate
+            .into_iter()
+            .filter(|r| {
+                !self.excluded_request_ids.contains(&r.source_record_id)
+                    || self
+                        .records
+                        .iter()
+                        .any(|old| old.source_record_id == r.source_record_id)
+            })
+            .collect();
         if candidate.iter().any(|r| {
             self.records
                 .iter()

@@ -898,8 +898,9 @@ run `/track-time-keito` from Codex or Claude Code to create the repo-local
 `.keito/config.yml` project/task mapping.
 
 Do not commit `.keito/config.yml`; it is specific to one Keito account,
-client, project, and task. The lifecycle hooks create one `source=agent` time
-entry when a tracked session ends, so do not create duplicate manual entries.
+client, project, and task. After explicit local approval, supported turn hooks create
+pending-review capture records. Do not create duplicate manual time entries for
+captured activity. Review the evidence before approving any client charge.
 ",
             claude: "\
 ## Keito Time Tracking
@@ -910,8 +911,9 @@ run `/track-time-keito` to create the repo-local `.keito/config.yml`
 project/task mapping.
 
 Do not commit `.keito/config.yml`; it is specific to one Keito account,
-client, project, and task. The lifecycle hooks create one `source=agent` time
-entry when a tracked session ends, so do not create duplicate manual entries.
+client, project, and task. After explicit local approval, supported turn hooks create
+pending-review capture records. Do not create duplicate manual time entries for
+captured activity. Review the evidence before approving any client charge.
 ",
         },
         SkillTeamMode::Required => TeamGuidance {

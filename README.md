@@ -165,8 +165,8 @@ cd ~/.keito/keito-cli
 
 `./setup` installs the CLI if needed, installs the bundled `keito-time-track`
 skill, and configures hooks for Claude Code, Codex, or both. In an interactive
-terminal it asks which host to configure. In non-interactive runs it defaults
-to both.
+terminal it asks which host to configure. Non-interactive runs require an explicit
+`--host claude`, `--host codex`, or `--host both`.
 
 Target one host explicitly when needed:
 

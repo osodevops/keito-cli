@@ -1135,6 +1135,15 @@ fn native_resume_during_capture_pause_abandons_old_turn_for_both_harnesses() {
         );
         assert!(session.needs_attention);
         let (_, payload) = body(&mut store, &binding, 210);
+        assert!(
+            payload["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|segment| segment["completeness"] == "INCOMPLETE"
+                    && segment["duration_seconds"] == 0),
+            "incomplete continuation must reach canonical review for {source}"
+        );
         assert_eq!(
             payload["segments"]
                 .as_array()

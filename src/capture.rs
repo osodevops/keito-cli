@@ -1,7 +1,10 @@
 //! Metadata-only durable capture. Raw hook JSON is never a storage type.
 use crate::capture_authority::AuthorityGuard;
 use crate::capture_invocations::{self, Permit};
-use crate::capture_usage::{read_active_session, ApprovedActiveSession, Harness};
+use crate::capture_usage::{
+    read_active_session, read_active_session_excluding_request_ids,
+    read_active_session_request_ids, ApprovedActiveSession, Harness,
+};
 use crate::capture_usage_ledger::UsageLedger;
 use crate::cli::capture::CaptureEvent;
 use crate::error::AppError;
@@ -391,6 +394,26 @@ impl Session {
         self.observed_through = self.observed_through.max(clock.wall);
         Ok(())
     }
+    fn abandon_native_resume(&mut self, clock: &Clock) -> Result<(), AppError> {
+        let paused = self
+            .active
+            .as_ref()
+            .filter(|active| active.clock.is_none())
+            .map(|active| (active.key.clone(), active.part, self.observed_through));
+        self.close(clock, false)?;
+        if let Some((turn, part, anchor)) = paused {
+            // The pause boundary is known; the resumed continuation was never
+            // measured. Preserve a zero-second incomplete marker for reviewers.
+            self.segments.push(Segment {
+                segment_key: hash(format!("{turn}-{part}")),
+                started_at: timestamp(anchor)?,
+                ended_at: timestamp(anchor)?,
+                duration_seconds: 0,
+                completeness: "INCOMPLETE".into(),
+            });
+        }
+        Ok(())
+    }
     fn abandon_active(&mut self) -> Result<(), AppError> {
         let clock = self
             .active
@@ -768,7 +791,7 @@ impl Store {
         source_id: &str,
         source: &str,
     ) -> Result<(), AppError> {
-        let mut statement=tx.prepare("SELECT data FROM sessions WHERE source_id=?1 AND json_extract(data,'$.source_namespace')=?2 AND json_type(data,'$.active')='object'").map_err(storage_error)?;
+        let mut statement=tx.prepare("SELECT data FROM sessions WHERE source_id=?1 AND json_extract(data,'$.source_namespace')=?2").map_err(storage_error)?;
         let rows: Vec<String> = statement
             .query_map(params![source_id, source], |r| r.get(0))
             .map_err(storage_error)?
@@ -777,6 +800,7 @@ impl Store {
         drop(statement);
         for raw in rows {
             let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            session.usage_ledger.require_baseline();
             session.abandon_active()?;
             Self::queue(tx, &mut session)?;
             tx.execute(
@@ -836,7 +860,9 @@ impl Store {
         binding_id: &str,
         remaining_agents: &[String],
     ) -> Result<(), AppError> {
-        let mut statement=tx.prepare("SELECT data FROM sessions WHERE binding_id=?1 AND json_type(data,'$.active')='object'").map_err(storage_error)?;
+        let mut statement = tx
+            .prepare("SELECT data FROM sessions WHERE binding_id=?1")
+            .map_err(storage_error)?;
         let rows: Vec<String> = statement
             .query_map([binding_id], |r| r.get(0))
             .map_err(storage_error)?
@@ -848,6 +874,7 @@ impl Store {
             if remaining_agents.contains(&session.source_namespace) {
                 continue;
             }
+            session.usage_ledger.require_baseline();
             session.abandon_active()?;
             Self::queue(tx, &mut session)?;
             tx.execute(
@@ -1006,7 +1033,8 @@ impl Store {
             session.abandon_active()?;
         }
         if resumed && event == CaptureEvent::SessionStart {
-            session.close(clock, false)?;
+            session.usage_ledger.require_baseline();
+            session.abandon_native_resume(clock)?;
         }
         match event {
             CaptureEvent::SessionStart => {} // Resume must never reset the baseline.
@@ -1075,15 +1103,16 @@ impl Store {
                 }
             }
         }
-        if matches!(event, CaptureEvent::Stop | CaptureEvent::SessionEnd) {
-            if let Some(input) = usage_source {
-                // Consent and canonical session checks above precede all transcript I/O.
+        // Timing terminal reconciliation remains available during a pause. It
+        // never authorizes a transcript read or changes the numeric consent epoch.
+        if !binding.paused && !self_failure_present {
+            let approved = usage_source.and_then(|input| {
                 let harness = match source {
                     "claude-code" => Some(Harness::ClaudeCode),
                     "codex" => Some(Harness::Codex),
                     _ => None,
                 };
-                let evidence = harness
+                harness
                     .filter(|_| {
                         usage_version_matches
                             && input.qualified_source == source
@@ -1099,18 +1128,63 @@ impl Store {
                         )
                         .ok()
                     })
-                    .and_then(|approved| read_active_session(&approved).ok());
-                if let Some(evidence) = evidence {
-                    session
-                        .usage_ledger
-                        .observe(evidence, source, version, source_id);
+            });
+            if event == CaptureEvent::Prompt {
+                if let Some(approved) = &approved {
+                    if !session.usage_ledger.baseline_ready() {
+                        let baseline =
+                            read_active_session_request_ids(approved)
+                                .ok()
+                                .filter(|baseline| {
+                                    baseline.source_session_id == source_id
+                                        && baseline.harness_version == version
+                                        && baseline.limitations.is_empty()
+                                        && baseline.source_adapter
+                                            == if source == "claude-code" {
+                                                "CLAUDE_JSONL_2_1_319_V1"
+                                            } else {
+                                                "CODEX_ROLLOUT_0_167_0_V1"
+                                            }
+                                });
+                        if let Some(baseline) = baseline {
+                            session.usage_ledger.establish_baseline(baseline.record_ids);
+                        } else {
+                            session.usage_ledger.baseline_epoch = None;
+                            session.usage_ledger.incomplete = true;
+                        }
+                    }
                 } else {
+                    // This turn was not opted into qualified usage at its prompt.
+                    // A terminal capability cannot retroactively authorize it.
+                    session.usage_ledger.require_baseline();
+                }
+            } else if matches!(event, CaptureEvent::Stop | CaptureEvent::SessionEnd) {
+                if session.usage_ledger.baseline_ready() {
+                    let evidence = approved.and_then(|approved| {
+                        if session.usage_ledger.excluded_request_ids.is_empty() {
+                            read_active_session(&approved).ok()
+                        } else {
+                            read_active_session_excluding_request_ids(
+                                &approved,
+                                &session.usage_ledger.excluded_request_ids,
+                            )
+                            .ok()
+                        }
+                    });
+                    if let Some(evidence) = evidence {
+                        session
+                            .usage_ledger
+                            .observe(evidence, source, version, source_id);
+                    } else {
+                        session.usage_ledger.incomplete = true;
+                    }
+                } else if usage_source.is_some() {
                     session.usage_ledger.incomplete = true;
                 }
-                if session.usage_ledger.held {
-                    session.needs_attention = true;
-                }
             }
+        }
+        if session.usage_ledger.held {
+            session.needs_attention = true;
         }
         tx.ensure_no_new_refusal(self_failure_present)?;
         Self::queue(&tx, &mut session)?;
@@ -1229,6 +1303,9 @@ impl Store {
         drop(statement);
         for raw in sessions {
             let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            if action != "resume" {
+                session.usage_ledger.require_baseline();
+            }
             if let Some(mut active) = session.active.take() {
                 if action == "pause" {
                     let key = active.key.clone();
@@ -1447,6 +1524,7 @@ impl Store {
         drop(statement);
         for raw in rows {
             let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            session.usage_ledger.require_baseline();
             session.close(clock, false)?;
             Self::queue(&tx, &mut session)?;
             tx.execute(

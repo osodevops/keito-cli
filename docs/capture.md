@@ -164,6 +164,15 @@ is an operator or supervisor setting and must name the same private ledger for b
 and core. Invocation directories require owned, private permissions and paths without
 symlink components.
 
+The numeric-usage candidate remains disabled in normal commands. Its internal qualification
+path establishes an identifier-only baseline at a new enabled native prompt before reading
+new request counters. Pauses, revocation, refused boundaries and known native gaps require
+another prompt baseline; a terminal event cannot supply missing consent retrospectively.
+Baseline identifiers include provisional requests, so their later final records remain
+excluded. Already accepted request records keep their immutable identity across epochs.
+Missing or unsafe baselines leave usage unknown, and no transcript reads occur while paused.
+These controls do not qualify native transcript lag, streaming finality or actual provider cost.
+
 Canonical request data contains only harness/session identifiers, versioned mapping,
 absolute lifecycle instants, exact integer seconds, completeness and explicit usage
 unavailability. It contains no prompts, assistant prose, transcript, source code, tool
