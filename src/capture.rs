@@ -1,4 +1,6 @@
 //! Metadata-only durable capture. Raw hook JSON is never a storage type.
+use crate::capture_usage::{read_active_session, ApprovedActiveSession, Harness};
+use crate::capture_usage_ledger::UsageLedger;
 use crate::cli::capture::CaptureEvent;
 use crate::error::AppError;
 use chrono::{DateTime, SecondsFormat};
@@ -294,6 +296,8 @@ pub struct Session {
     pub needs_attention: bool,
     #[serde(default)]
     pub canonical_server_id: Option<String>,
+    #[serde(default)]
+    usage_ledger: UsageLedger,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -349,6 +353,7 @@ impl Session {
             queued_lifecycle: "ACTIVE".into(),
             needs_attention: false,
             canonical_server_id: None,
+            usage_ledger: UsageLedger::default(),
         }
     }
     fn close(&mut self, clock: &Clock, complete: bool) -> Result<(), AppError> {
@@ -417,6 +422,17 @@ impl Session {
             usage: serde_json::json!({"status":"UNAVAILABLE","reason":"NO_QUALIFIED_USAGE_EVIDENCE","models":[]}),
         })
     }
+}
+
+/// Transient synthetic qualification capability, scoped to one source/native session.
+/// The hook command does not construct this while native qualification is pending.
+/// No paths from this object are serialized, logged, or stored.
+#[doc(hidden)]
+pub struct UsageSource<'a> {
+    pub resolved_home: &'a Path,
+    pub exact_hook_path: &'a Path,
+    pub qualified_source: &'a str,
+    pub qualified_native_session: &'a str,
 }
 
 pub struct Signal<'a> {
@@ -690,6 +706,17 @@ impl Store {
         Self::binding_in(&self.connection, key)
     }
     pub fn event(&mut self, repository: &Repository, signal: Signal<'_>) -> Result<(), AppError> {
+        self.event_with_usage(repository, signal, None)
+    }
+    /// Numeric usage is opt-in through an internal, session-scoped qualification capability.
+    /// Ordinary production hooks stay metadata-only until native qualification passes.
+    #[doc(hidden)]
+    pub fn event_with_usage(
+        &mut self,
+        repository: &Repository,
+        signal: Signal<'_>,
+        usage_source: Option<&UsageSource<'_>>,
+    ) -> Result<(), AppError> {
         let Signal {
             source,
             resumed,
@@ -769,6 +796,8 @@ impl Store {
         if session.binding.id != binding.id {
             return Err(AppError::Config("Native session mapping changed; review held evidence and begin a new native session".into()));
         }
+        // A native session cannot switch parser versions mid-stream.
+        let usage_version_matches = session.harness_version == version;
         let id = session.id.clone();
         if self_failure_present
             && matches!(
@@ -838,7 +867,47 @@ impl Store {
                 }
             }
         }
+        if matches!(event, CaptureEvent::Stop | CaptureEvent::SessionEnd) {
+            if let Some(input) = usage_source {
+                // Consent and canonical session checks above precede all transcript I/O.
+                let harness = match source {
+                    "claude-code" => Some(Harness::ClaudeCode),
+                    "codex" => Some(Harness::Codex),
+                    _ => None,
+                };
+                let evidence = harness
+                    .filter(|_| {
+                        usage_version_matches
+                            && input.qualified_source == source
+                            && input.qualified_native_session == source_id
+                    })
+                    .and_then(|h| {
+                        ApprovedActiveSession::new(
+                            h,
+                            version,
+                            input.resolved_home,
+                            input.exact_hook_path,
+                            source_id,
+                        )
+                        .ok()
+                    })
+                    .and_then(|approved| read_active_session(&approved).ok());
+                if let Some(evidence) = evidence {
+                    session
+                        .usage_ledger
+                        .observe(evidence, source, version, source_id);
+                } else {
+                    session.usage_ledger.incomplete = true;
+                }
+                if session.usage_ledger.held {
+                    session.needs_attention = true;
+                }
+            }
+        }
         Self::queue(&tx, &mut session)?;
+        if session.usage_ledger.held {
+            tx.execute("UPDATE outbox SET state='held',reason='USAGE_RECORD_CONFLICT',claimed_until=0 WHERE session_id=?1 AND state!='acknowledged'",[&session.id]).map_err(storage_error)?;
+        }
         tx.execute("INSERT INTO sessions(id,binding_id,source_id,data) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
             params![id,binding.id,source_id,serde_json::to_string(&session).map_err(storage_error)?]).map_err(storage_error)?;
         tx.commit().map_err(storage_error)
@@ -851,20 +920,32 @@ impl Store {
             session.revision > 0 && session.queued_lifecycle != session.lifecycle;
         let mut final_checkpoint_sent = false;
         while session.queued_segments < session.segments.len()
+            || (!session.usage_ledger.held
+                && session.usage_ledger.queued < session.usage_ledger.records.len())
             || (final_checkpoint && !final_checkpoint_sent)
         {
             let start = session.queued_segments;
             let mut end = (start + 100).min(session.segments.len());
+            let usage_start = session.usage_ledger.queued;
+            let mut usage_end = if session.usage_ledger.held {
+                usage_start
+            } else {
+                (usage_start + 25).min(session.usage_ledger.records.len())
+            };
             let mut body;
             loop {
-                let payload =
+                let mut payload =
                     session.payload(session.segments[start..end].to_vec(), session.revision + 1)?;
+                payload.usage = session.usage_ledger.payload(usage_start, usage_end);
                 body = serde_json::to_string(&payload).map_err(storage_error)?;
                 if body.len() <= MAX_BODY_BYTES {
                     break;
                 }
-                end -= 1;
-                if end == start {
+                if usage_end > usage_start {
+                    usage_end -= 1;
+                } else if end > start {
+                    end -= 1;
+                } else {
                     return Err(AppError::Config(
                         "Capture request exceeds limit; evidence held".into(),
                     ));
@@ -882,6 +963,10 @@ impl Store {
             )
             .map_err(storage_error)?;
             session.queued_segments = end;
+            for index in usage_start..usage_end {
+                session.usage_ledger.record_revisions[index] = session.revision;
+            }
+            session.usage_ledger.queued = usage_end;
             session.queued_lifecycle = session.lifecycle.clone();
             final_checkpoint_sent = true;
         }
@@ -1268,8 +1353,12 @@ fn validate_frozen(
             "ACTIVE" | "COMPLETED" | "INCOMPLETE"
         )
         || payload.segments.len() > 100
-        || payload.usage
-            != serde_json::json!({"status":"UNAVAILABLE","reason":"NO_QUALIFIED_USAGE_EVIDENCE","models":[]})
+        || !session.usage_ledger.validate_payload(
+            &payload.usage,
+            &session.source_namespace,
+            &session.harness_version,
+            row.revision,
+        )
     {
         return false;
     }
