@@ -65,7 +65,8 @@ This opt-in creates only an integration-owned launch agent for this repository. 
 operational settings necessarily contain the local executable, working directory and queue
 paths; these remain on your device and are separate from billing evidence. No key is stored
 in the launch agent. Existing unrelated launch agents are preserved. Binary changes make
-the service stale; explicitly repeat installation with the reviewed updated runtime.
+the service stale; its expected-runtime digest also refuses delivery after replacement.
+Explicitly repeat installation with the reviewed updated runtime.
 
 Launchd starts and restarts the worker. Settings installed, process running and delivery
 verified are separate states. Real restart/kill/recovery checks remain part of artifact
@@ -126,8 +127,9 @@ not a claim to detect every possible secret.
 
 ## Recover without changing accounting evidence
 
-The worker rechecks current repository consent, authenticated owner, workspace and API
-origin before delivery. A credential switch cannot transfer queued work to another person.
+The worker checks local consent and whether any delivery is due before making even an
+authentication request. It then rechecks authenticated owner, workspace and API origin
+before delivery. A credential switch cannot transfer queued work to another person.
 The server rechecks access on every revision and replay. Disabled/unavailable API, expired
 authentication, network failure, rate limits and temporary server errors retain the original
 payload. Retry-After and bounded backoff apply. A revision conflict or rejected payload is

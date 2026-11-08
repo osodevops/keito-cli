@@ -197,10 +197,16 @@ pub async fn run(
             let result = sync(global).await?;
             print(result, global.quiet)
         }
-        CaptureSubcommand::Worker { interval_seconds } => {
+        CaptureSubcommand::Worker {
+            interval_seconds,
+            expected_runtime_hash,
+        } => {
             // Foreground supervisor: launchd/systemd/the operator owns lifetime. A
             // detached hook child is never the sole delivery/durability mechanism.
             loop {
+                if let Some(expected) = &expected_runtime_hash {
+                    verify_runtime_hash(expected)?;
+                }
                 let _ = sync(global).await;
                 tokio::select! { _ = tokio::signal::ctrl_c() => break, _ = tokio::time::sleep(Duration::from_secs(interval_seconds)) => {} }
             }
@@ -279,31 +285,33 @@ pub async fn run(
 }
 
 async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
-    let auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
-    let config = AppConfig::load().map_err(sanitize_error)?;
-    let origin = config.api_base_url();
-    let client = KeitorClient::new(&auth, &origin)?;
-    let me = client.get_me().await.map_err(sanitize_error)?;
     let mut store = Store::open(&directory()?)?;
-    let mut accepted = 0;
-    let mut held = 0;
-    let mut retryable = 0;
-    // Worker is deliberately repository-scoped: never scan arbitrary folders or
-    // trust a copied configuration file when rechecking a pending upload.
     let repo = current_repo()?;
     let Some(binding) = store.binding(&repo.key)? else {
         return Ok(json!({"accepted":0,"held":0,"reason":"LOCAL_APPROVAL_REQUIRED"}));
     };
-    if repo.disabled
-        || binding.paused
-        || binding.revoked
-        || binding.hint_hash != repo.hint_hash
-        || binding.workspace_id != auth.workspace_id
-        || binding.owner_id != me.id
+    if repo.disabled || binding.paused || binding.revoked || binding.hint_hash != repo.hint_hash {
+        return Ok(json!({"accepted":0,"held":1,"reason":"BINDING_REAPPROVAL_REQUIRED"}));
+    }
+    if !store.has_ready(&binding, UtcClock::seconds())? {
+        return Ok(json!({"accepted":0,"held":0,"pending":store.status()?.pending}));
+    }
+    let auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
+    let config = AppConfig::load().map_err(sanitize_error)?;
+    let origin = config.api_base_url();
+    if binding.workspace_id != auth.workspace_id
         || binding.origin_hash != capture::hash(origin.trim_end_matches('/'))
     {
         return Ok(json!({"accepted":0,"held":1,"reason":"BINDING_REAPPROVAL_REQUIRED"}));
     }
+    let client = KeitorClient::new(&auth, &origin)?;
+    let me = client.get_me().await.map_err(sanitize_error)?;
+    if binding.owner_id != me.id {
+        return Ok(json!({"accepted":0,"held":1,"reason":"BINDING_REAPPROVAL_REQUIRED"}));
+    }
+    let mut accepted = 0;
+    let mut held = 0;
+    let mut retryable = 0;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -474,4 +482,20 @@ fn sanitize_error(error: AppError) -> AppError {
             "Capture preflight unavailable; no response content retained".into(),
         ),
     }
+}
+
+fn verify_runtime_hash(expected: &str) -> Result<(), AppError> {
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AppError::InvalidInput(
+            "Invalid expected runtime digest".into(),
+        ));
+    }
+    let path = std::env::current_exe()
+        .map_err(|_| AppError::Config("Cannot verify worker runtime".into()))?;
+    let bytes =
+        std::fs::read(path).map_err(|_| AppError::Config("Cannot verify worker runtime".into()))?;
+    if capture::hash(bytes) != expected {
+        return Err(AppError::Config("Capture worker runtime changed; explicitly reinstall the reviewed worker before delivery".into()));
+    }
+    Ok(())
 }

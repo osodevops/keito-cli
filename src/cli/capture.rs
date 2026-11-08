@@ -37,6 +37,9 @@ pub enum CaptureSubcommand {
     Worker {
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=60))]
         interval_seconds: u64,
+        /// Refuse supervised execution after an unapproved runtime replacement
+        #[arg(long)]
+        expected_runtime_hash: Option<String>,
     },
     /// Inspect the current repository's macOS worker service without network writes
     WorkerStatus,

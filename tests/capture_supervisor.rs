@@ -143,10 +143,13 @@ exit 1
     }
     #[test]
     fn symlinked_parent_of_launch_agents_cannot_escape_the_owned_home() {
-        let(temp,s,exe,root,capture)=fixture();let conf=config(&exe,&root,&capture);
-        std::fs::create_dir_all(&s.home).unwrap();let outside=temp.path().join("outside-library");std::fs::create_dir_all(&outside).unwrap();
-        symlink(&outside,s.home.join("Library")).unwrap();assert!(s.install(&conf).is_err());
-        assert_eq!(std::fs::read_dir(&outside).unwrap().count(),0);
+        let (temp, s, exe, root, capture) = fixture();
+        let conf = config(&exe, &root, &capture);
+        std::fs::create_dir_all(&s.home).unwrap();
+        let outside = temp.path().join("outside-library");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, s.home.join("Library")).unwrap();
+        assert!(s.install(&conf).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
-
 }

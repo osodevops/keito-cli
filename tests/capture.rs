@@ -74,6 +74,16 @@ fn scripted_source_setup_without_targets_stops_before_installation() {
 
 #[test]
 fn replaced_worker_runtime_is_refused_before_loading_credentials_or_network() {
-    Command::cargo_bin("keito").unwrap().args(["capture","worker","--expected-runtime-hash","0000000000000000000000000000000000000000000000000000000000000000","--json"])
-        .assert().failure().stderr(predicate::str::contains("runtime changed"));
+    Command::cargo_bin("keito")
+        .unwrap()
+        .args([
+            "capture",
+            "worker",
+            "--expected-runtime-hash",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("runtime changed"));
 }

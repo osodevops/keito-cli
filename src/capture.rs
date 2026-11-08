@@ -887,6 +887,9 @@ impl Store {
             .collect();
         result
     }
+    pub fn has_ready(&self, binding: &Binding, now: i64) -> Result<bool, AppError> {
+        self.connection.query_row("SELECT EXISTS(SELECT 1 FROM outbox o JOIN sessions s ON s.id=o.session_id WHERE s.binding_id=?1 AND o.state='pending' AND o.retry_at<=?2 AND o.claimed_until<=?2 AND NOT EXISTS(SELECT 1 FROM outbox prior WHERE prior.session_id=o.session_id AND prior.revision<o.revision AND prior.state!='acknowledged'))",params![binding.id,now],|r|r.get(0)).map_err(storage_error)
+    }
     /// Claims only the next revision of each session. Lease expiry permits lost-response replay.
     pub fn claim(&mut self, binding: &Binding, now: i64) -> Result<Option<Queued>, AppError> {
         let tx = self.transaction()?;

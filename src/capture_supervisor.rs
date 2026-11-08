@@ -92,7 +92,7 @@ impl Supervisor {
 <key>Label</key><string>{label}</string>
 <key>KeitoCapturePolicy</key><string>{policy}</string>
 <key>KeitoBinarySha256</key><string>{binary_hash}</string>
-<key>ProgramArguments</key><array><string>{executable}</string><string>--workspace</string><string>{workspace}</string><string>capture</string><string>worker</string><string>--interval-seconds</string><string>5</string></array>
+<key>ProgramArguments</key><array><string>{executable}</string><string>--workspace</string><string>{workspace}</string><string>capture</string><string>worker</string><string>--interval-seconds</string><string>5</string><string>--expected-runtime-hash</string><string>{binary_hash}</string></array>
 <key>WorkingDirectory</key><string>{repository}</string>
 <key>EnvironmentVariables</key><dict><key>KEITO_CAPTURE_HOME</key><string>{capture_home}</string><key>KEITO_API_URL</key><string>{origin}</string></dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
@@ -118,7 +118,22 @@ impl Supervisor {
             "<key>KeitoCapturePolicy</key><string>{MARKER}</string>"
         ))
     }
+    fn ensure_parents(&self) -> Result<(), AppError> {
+        let mut cursor = self.home.clone();
+        for part in ["", "Library", "LaunchAgents"] {
+            if !part.is_empty() {
+                cursor.push(part);
+            }
+            if let Ok(metadata) = fs::symlink_metadata(&cursor) {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(failure());
+                }
+            }
+        }
+        Ok(())
+    }
     fn read(&self, key: &str) -> Result<Option<Vec<u8>>, AppError> {
+        self.ensure_parents()?;
         let file = self.file(key);
         if !file.exists() {
             return Ok(None);
@@ -136,6 +151,7 @@ impl Supervisor {
         Ok(Some(bytes))
     }
     fn atomic_write(&self, key: &str, bytes: &[u8]) -> Result<(), AppError> {
+        self.ensure_parents()?;
         let file = self.file(key);
         let directory = file.parent().ok_or_else(failure)?;
         if directory.exists()
