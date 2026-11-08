@@ -1132,6 +1132,11 @@ impl Store {
         )
         .map_err(storage_error)?;
         tx.execute("UPDATE outbox SET state='acknowledged',reason='ACCEPTED',attempts=attempts+1,claimed_until=0,acknowledged_at=?2 WHERE id=?1 AND payload_hash=?3",params![row.id,now,row.hash]).map_err(storage_error)?;
+        tx.execute(
+            "DELETE FROM outbox WHERE state='acknowledged' AND acknowledged_at<?1",
+            [now - 7 * 24 * 3600],
+        )
+        .map_err(storage_error)?;
         tx.commit().map_err(storage_error)
     }
     pub fn finish(
