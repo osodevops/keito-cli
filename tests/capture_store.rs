@@ -1048,3 +1048,29 @@ fn observing_repository_in_sync_abandons_clocks_before_identity_can_be_restored(
     );
     assert!(store.claim(&binding, clock(100).wall).unwrap().is_none());
 }
+
+#[test]
+fn a_stop_from_an_unapproved_repository_cannot_leave_the_same_native_clock_alive() {
+    let (_dir, mut store, _) = setup();
+    event(&mut store, "native-gap", Some("turn"), Prompt, 0);
+    let mut unapproved = repo();
+    unapproved.key = capture::hash("different-unapproved-repo");
+    store
+        .event(
+            &unapproved,
+            capture::Signal {
+                source: "codex",
+                resumed: false,
+                source_id: "native-gap",
+                turn_id: Some("turn"),
+                version: "fixture-v1",
+                event: Stop,
+                clock: &clock(60),
+            },
+        )
+        .unwrap();
+    event(&mut store, "native-gap", Some("turn"), Stop, 150);
+    let session = &store.preview("native-gap").unwrap()[0];
+    assert_eq!(session.segments[0].duration_seconds, 0);
+    assert!(session.needs_attention);
+}
