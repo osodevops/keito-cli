@@ -126,7 +126,7 @@ qualification](docs/capture.md); new capture availability depends on server elig
 ### Requirements
 
 - Claude Code and/or Codex CLI
-- Git, Bash, and Python 3
+- Git, Bash, and the official paired `keito` / `keito-capture-guard` release
 - Keito credentials via `keito auth login` or `KEITO_API_KEY` +
   `KEITO_ACCOUNT_ID`
 - macOS/Linux: `./setup` can install the CLI through Homebrew or release
@@ -253,7 +253,7 @@ created by `/track-time-keito`.
   `~/.claude/skills/keito-time-track` for Claude Code and
   `~/.codex/skills/keito-time-track` for Codex.
 - The hook installers merge lifecycle hooks into `~/.claude/settings.json` and
-  `~/.codex/hooks.json` using a preserving Python installer. Trust remains a
+  `~/.codex/hooks.json` using the native Rust installer. Trust remains a
   separate harness decision; an installed adapter is not a verified delivery.
 - `/track-time-keito` verifies auth, asks for the Keito client/project/task for
   the current repo, and writes `.keito/config.yml`.
@@ -412,3 +412,15 @@ man ./man/keito.1
 ## License
 
 [MIT](LICENSE)
+
+### Protected macOS tests
+
+Run macOS CLI tests with `KEITO_TEST_REAL_PROFILE_HOME="$HOME" tests/run-macos-isolated.sh`.
+The runner proves one inherited kernel policy using owned native marker and alias
+executables plus an allowed control, then permits loopback fixtures while denying
+execution of the real service utility. Doctor and transport assertions remain active.
+Their test command builders require a source/hash-bound owned proof receipt and
+recheck denial with an inert marker before spawning the CLI; plain unprotected
+macOS test runs fail before a service observation can execute. No production
+supervisor override or test bypass flag is exposed. Profile access is limited to
+before/after hashes of the three configuration anchors.

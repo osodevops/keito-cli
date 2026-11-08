@@ -23,7 +23,7 @@ keito_cmd=${KEITO_CLI_BIN:-keito}
 guard_cmd=${KEITO_CAPTURE_GUARD_BIN:-}
 case "$keito_cmd" in /*) ;; *) exit 0 ;; esac
 case "$guard_cmd" in /*) ;; *) exit 0 ;; esac
-[ -f "$keito_cmd" ] && [ -x "$keito_cmd" ] && [ ! -L "$keito_cmd" ] || exit 0
+# Core refusal belongs to the native guard, after durable publication.
 [ -f "$guard_cmd" ] && [ -x "$guard_cmd" ] && [ ! -L "$guard_cmd" ] || exit 0
 "$guard_cmd" --core "$keito_cmd" --agent "$agent" --event "$event" --harness-version "$version" \
   <&0 >/dev/null 2>&1 &

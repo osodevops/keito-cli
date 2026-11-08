@@ -74,12 +74,8 @@ mod qualification {
             assert_eq!(core_hash.len(), 64);
             let bin = root.join("bin");
             fs::create_dir(&bin).unwrap();
-            fs::write(bin.join("git"), "#!/bin/sh\nexec /usr/bin/git \"$@\"\n").unwrap();
-            fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o700)).unwrap();
             fs::write(bin.join("keito"), "#!/bin/sh\nexit 89\n").unwrap();
             fs::set_permissions(bin.join("keito"), fs::Permissions::from_mode(0o700)).unwrap();
-            fs::write(bin.join("sleep"), "#!/bin/sh\nexec /bin/sleep \"$@\"\n").unwrap();
-            fs::set_permissions(bin.join("sleep"), fs::Permissions::from_mode(0o700)).unwrap();
             fs::write(
                 root.join("dispatch.sh"),
                 include_str!("../../skills/keito-time-track/hooks/dispatch.sh"),
@@ -99,9 +95,51 @@ mod qualification {
                 repo,
                 core_hash,
             };
+            // Preserve the caller's real executable selection; private PATH
+            // aliases remove fixture wrapper overhead without choosing a
+            // different/faster Git implementation than the installed hook.
+            let selected_git = std::env::var_os("PATH")
+                .and_then(|paths| {
+                    std::env::split_paths(&paths)
+                        .map(|p| p.join("git"))
+                        .find(|p| {
+                            fs::metadata(p).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0)
+                        })
+                })
+                .expect(
+                    "Caller Git is unavailable; fixture setup failed before artifact execution",
+                );
+            let platform_git = selected_git.canonicalize().unwrap();
+            let mut tools = serde_json::Map::new();
+            for (name, path) in [
+                ("git", platform_git),
+                ("sleep", PathBuf::from("/bin/sleep")),
+                ("bash", PathBuf::from("/bin/bash")),
+            ] {
+                let path = path.canonicalize().unwrap();
+                let metadata = fs::metadata(&path).unwrap();
+                assert!(
+                    metadata.is_file()
+                        && metadata.mode() & 0o111 != 0
+                        && metadata.mode() & 0o022 == 0
+                        && (metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() })
+                );
+                std::os::unix::fs::symlink(&path, result.bin.join(name)).unwrap();
+                tools.insert(
+                    name.into(),
+                    json!({"path":path,"sha256":capture::hash(fs::read(&path).unwrap()),
+                        "selection":if name=="git" {"caller_PATH"} else {"explicit_OS_utility"}}),
+                );
+            }
+            tools.insert("selected_git_path".into(), json!(selected_git));
+            fs::write(
+                result.root.join("platform-tools.json"),
+                serde_json::to_vec_pretty(&tools).unwrap(),
+            )
+            .unwrap();
             let template = result.root.join("git-template");
             fs::create_dir(&template).unwrap();
-            let mut git = result.command(Path::new("/usr/bin/git"));
+            let mut git = result.command(&result.bin.join("git"));
             assert!(git
                 .arg("-C")
                 .arg(&result.repo)
@@ -379,7 +417,7 @@ mod qualification {
                 && source.starts_with(&owner),
             "source/run root must be isolated and run-owned"
         );
-        let mut random = [0; 16];
+        let mut random = [0u8; 16];
         assert_eq!(
             unsafe { libc::getentropy(random.as_mut_ptr().cast(), random.len()) },
             0

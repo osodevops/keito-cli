@@ -73,7 +73,11 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
+      - name: Run macOS tests inside the proved service/network boundary
+        if: runner.os == 'macOS'
+        run: KEITO_TEST_REAL_PROFILE_HOME="$HOME" tests/run-macos-isolated.sh
       - run: cargo test --all-features --all-targets
+        if: runner.os != 'macOS'
 
   release-smoke:
     name: Release Smoke

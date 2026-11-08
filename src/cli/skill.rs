@@ -21,8 +21,9 @@ pub struct SkillCommand {
 pub enum SkillSubcommand {
     /// Install the Keito Skill and configure supported agent hooks
     #[command(long_about = "\
-Install the Keito Skill with the pinned open skills installer package, then run
-the installed hook installer for each selected agent.
+Install the bundled Keito Skill and selected lifecycle hooks with the native Rust
+installer and verified official CLI/guard release pair. External --source values
+use the pinned open skills installer to fetch the payload before native registration.
 
 Choose explicit --agent targets in scripts, or select targets interactively. The skill still needs
 per-repository setup after installation: cd into a client repo and run
@@ -36,7 +37,7 @@ per-repository setup after installation: cd into a client repo and run
         #[arg(long, value_enum)]
         agent: Vec<SkillAgent>,
 
-        /// Skip the skills installer and only run hook installers if present
+        /// Reuse an existing skill payload for native hook installation
         #[arg(long)]
         skip_skills_add: bool,
 

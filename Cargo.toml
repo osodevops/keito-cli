@@ -33,6 +33,11 @@ name = "qualify-capture"
 path = "src/bin/qualify-capture.rs"
 required-features = ["dev-tools"]
 
+[[bin]]
+name = "check-service-boundary"
+path = "src/bin/check-service-boundary.rs"
+required-features = ["dev-tools"]
+
 [features]
 dev-tools = []
 

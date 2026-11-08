@@ -1,4 +1,6 @@
 #![allow(deprecated)]
+#[path = "support/service_boundary.rs"]
+mod service_boundary;
 use assert_cmd::Command;
 use keito_cli::capture::{self, Binding, Clock, Repository, Signal, Store};
 use keito_cli::cli::capture::CaptureEvent::{Prompt, Stop};
@@ -18,8 +20,21 @@ fn init(root: &Path) {
         .success());
 }
 fn command(home: &Path, root: &Path, origin: &str) -> Command {
-    let mut cmd = Command::cargo_bin("keito").unwrap();
-    cmd.current_dir(root)
+    let mut cmd = service_boundary::command(assert_cmd::cargo::cargo_bin!("keito"));
+    cmd.env_clear()
+        .current_dir(root)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env(
+            "PATH",
+            if cfg!(windows) {
+                std::env::var_os("PATH").unwrap_or_default()
+            } else {
+                "/usr/bin:/bin".into()
+            },
+        )
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("APPDATA", home.join("AppData/Roaming"))

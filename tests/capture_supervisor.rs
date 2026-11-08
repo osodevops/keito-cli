@@ -1,12 +1,27 @@
-use assert_cmd::Command;
+#[path = "support/service_boundary.rs"]
+mod service_boundary;
 use predicates::prelude::*;
 
 #[test]
 fn capture_worker_status_never_claims_an_uninstalled_service_running() {
     let home = tempfile::tempdir().unwrap();
-    Command::cargo_bin("keito")
-        .unwrap()
+    service_boundary::command(assert_cmd::cargo::cargo_bin!("keito"))
+        .env_clear()
         .env("HOME", home.path())
+        .env("CODEX_HOME", home.path().join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("APPDATA", home.path().join("AppData/Roaming"))
+        .env(
+            "PATH",
+            if cfg!(windows) {
+                std::env::var_os("PATH").unwrap_or_default()
+            } else {
+                "/usr/bin:/bin".into()
+            },
+        )
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("KEITO_CAPTURE_HOME", home.path().join("capture"))
         .args(["capture", "worker-status", "--json"])
         .assert()
@@ -16,8 +31,7 @@ fn capture_worker_status_never_claims_an_uninstalled_service_running() {
 
 #[test]
 fn setup_explains_explicit_supervisor_install() {
-    Command::cargo_bin("keito")
-        .unwrap()
+    service_boundary::command(assert_cmd::cargo::cargo_bin!("keito"))
         .args(["capture", "setup", "--help"])
         .assert()
         .success()

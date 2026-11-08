@@ -50,3 +50,17 @@ Guard flushes use POSIX `fsync`, with bounded EINTR retry, in the original file/
 The hook entry point performs one synchronous poll of its deterministic persistence operation and fails closed if that operation unexpectedly needs asynchronous work. It does not construct Tokio's general command worker pool. Authentication, sync and worker commands retain the normal asynchronous runtime. No updater or network operation runs before hook persistence.
 
 The tampered-guard fixture invokes the actual qualified core against the changed guard file to prove its entry refusal. It does not claim that an unexecutable, corrupted guardian can start and publish uncertainty. The checked profile also opens an image descriptor, replaces the core pathname with an identical-byte file of a different inode, then invokes the actual core: startup must refuse before accepting the boundary. On macOS, the already-built qualification driver and its descendants run under an OS sandbox denying network; other hosts record when that facility is unavailable.
+
+The first b43a5ca extracted-artifact probe failed at 866.572 ms with a retained
+pending flag and no accepted session. That immutable baseline is retained. Later
+pair/bootstrap and exact-ACK diagnostics were unqualified observations. The
+qualification fixture now uses private symlinks to the caller's same selected Git
+and explicit OS bash/sleep, recording paths and hashes instead of adding fresh
+shell wrappers or choosing a faster Git implementation. A fresh reviewed source
+and artifact still require a new quiet-host first probe.
+
+The missing/non-executable/symlinked-core regression exercises both the bundled
+dispatcher and actual plugin command, with direct-guard controls. Dispatch delegates
+core refusals to the available guard so publication precedes refusal. A guard that
+cannot start remains a separate pre-instruction limitation; no corrupted-guardian
+startup durability claim follows from the core-refusal tests.

@@ -21,7 +21,8 @@ keito skill doctor --live --json
 
 Scripted installation requires explicit targets. Interactive installation offers a target
 picker. Authentication never silently installs both adapters. The CLI uses its bundled
-skill by default. Safe configuration merging requires Bash, Git and Python 3. It preserves
+skill by default. Configuration merging uses the native Rust installer and the verified
+Keito/core guard release pair; Bash and Git support the adapter scripts. It preserves
 unrelated hooks, settings and plugins. If integration-owned legacy registrations require
 migration, review them and rerun the selected installation with `--confirm-migration`.
 
