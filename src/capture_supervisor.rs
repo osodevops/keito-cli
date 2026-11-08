@@ -35,6 +35,7 @@ pub struct OwnedWorker {
 pub struct WorkerStatus {
     pub supported: bool,
     pub installed: bool,
+    pub observation: String,
     pub loaded: bool,
     pub running: bool,
     pub stale: bool,
@@ -246,6 +247,28 @@ impl Supervisor {
         workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
         Ok(workers)
     }
+    fn observe(&self, key: &str) -> (&'static str, bool) {
+        let Ok(output) = Command::new(&self.launchctl)
+            .args(["print", &self.service(key)])
+            .output()
+        else {
+            return ("UNKNOWN", false);
+        };
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            return (
+                "LOADED",
+                text.contains("state = running")
+                    && text.lines().any(|line| line.trim().starts_with("pid = ")),
+            );
+        }
+        let error = String::from_utf8_lossy(&output.stderr);
+        if error.contains("Could not find service") && error.contains(&Self::label(key)) {
+            ("ABSENT", false)
+        } else {
+            ("UNKNOWN", false)
+        }
+    }
     pub fn status(
         &self,
         key: &str,
@@ -253,18 +276,8 @@ impl Supervisor {
     ) -> Result<WorkerStatus, AppError> {
         let contents = self.read(key)?;
         let installed = contents.is_some();
-        let observation = Command::new(&self.launchctl)
-            .args(["print", &self.service(key)])
-            .output()
-            .ok();
-        let loaded = observation.as_ref().is_some_and(|o| o.status.success());
-        let running = loaded
-            && observation.as_ref().is_some_and(|o| {
-                String::from_utf8_lossy(&o.stdout).contains("state = running")
-                    && String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .any(|line| line.trim().starts_with("pid = "))
-            });
+        let (observation, running) = self.observe(key);
+        let loaded = observation == "LOADED";
         let stale = if let (Some(existing), Some(config)) = (&contents, config) {
             *existing != self.render(config)?.as_bytes()
         } else if let Some(existing) = &contents {
@@ -279,6 +292,7 @@ impl Supervisor {
         Ok(WorkerStatus {
             supported: true,
             installed,
+            observation: observation.into(),
             loaded,
             running,
             stale,
@@ -319,20 +333,20 @@ impl Supervisor {
     pub fn uninstall(&self, key: &str) -> Result<WorkerStatus, AppError> {
         if self.read(key)?.is_none() {
             let status = self.status(key, None)?;
-            if status.loaded {
-                return Err(AppError::Config("Worker remains loaded without its settings; review launchd state before cleanup".into()));
+            if status.observation != "ABSENT" {
+                return Err(AppError::Config(
+                    "Worker absence could not be verified; inspect launchd state before cleanup"
+                        .into(),
+                ));
             }
             return Ok(status);
         }
         let _ = Command::new(&self.launchctl)
             .args(["bootout", &self.service(key)])
             .output();
-        // A waiting/throttled KeepAlive service is still loaded. Only absence
-        // after bootout authorizes removing its recoverable owned settings.
-        if self.status(key, None)?.loaded {
-            return Err(AppError::Config(
-                "Worker could not be unloaded; owned service settings retained for recovery".into(),
-            ));
+        let status = self.status(key, None)?;
+        if status.observation != "ABSENT" {
+            return Err(AppError::Config("Worker unload or observation failed; owned settings retained until absence is verified".into()));
         }
         fs::remove_file(self.file(key)).map_err(|_| failure())?;
         self.status(key, None)

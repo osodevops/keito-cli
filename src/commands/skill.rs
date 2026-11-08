@@ -23,6 +23,7 @@ struct SkillStatus {
     cli_path: Option<String>,
     npx_installed: bool,
     jq_installed: bool,
+    python3_installed: bool,
     credentials_configured: bool,
     authenticated: bool,
     authentication_state: String,
@@ -318,6 +319,22 @@ async fn status(
             Ok(me) if !me.is_personal_read_only_sync() => {
                 current.authenticated = true;
                 current.authentication_state = "VERIFIED".into();
+                let repository = &mut current.capture["current_repository"];
+                let matches = repository["approved"] == true
+                    && repository["mapping_current"] == true
+                    && repository["paused"] != true
+                    && repository["workspace_id"].as_str() == Some(auth.workspace_id.as_str())
+                    && repository["owner_id"].as_str() == Some(me.id.as_str())
+                    && repository["origin_hash"].as_str()
+                        == Some(
+                            crate::capture::hash(config.api_base_url().trim_end_matches('/'))
+                                .as_str(),
+                        );
+                repository["authentication_binding"] =
+                    serde_json::json!(if matches { "MATCHED" } else { "MISMATCH" });
+                current.delivery_verified =
+                    matches && repository["delivery_history_verified"] == true;
+                current.capture["delivery_verified"] = serde_json::json!(current.delivery_verified);
             }
             Ok(_) => {
                 current.authentication_state = "INCOMPATIBLE_CREDENTIAL".into();
@@ -561,7 +578,7 @@ fn hook_installer_path(agent: SkillAgent) -> Option<PathBuf> {
 
 fn collect_status(global: &GlobalFlags) -> SkillStatus {
     let auth = ResolvedAuth::resolve(global).ok();
-    let (capture, worker) = capture_diagnostics();
+    let (capture, worker) = capture_diagnostics(global);
     let delivery_verified = capture
         .get("delivery_verified")
         .and_then(serde_json::Value::as_bool)
@@ -573,6 +590,7 @@ fn collect_status(global: &GlobalFlags) -> SkillStatus {
             .map(|path| path.display().to_string()),
         npx_installed: find_in_path("npx").is_some(),
         jq_installed: find_in_path("jq").is_some(),
+        python3_installed: find_in_path("python3").is_some(),
         credentials_configured: auth.is_some(),
         authenticated: false,
         authentication_state: "UNVERIFIED".into(),
@@ -719,7 +737,10 @@ fn print_status(status: &SkillStatus, doctor: bool) {
         println!("CLI path: {path}");
     }
     println!("npx available: {}", yes_no(status.npx_installed));
-    println!("jq available: {}", yes_no(status.jq_installed));
+    println!(
+        "Python 3 installer support: {}",
+        yes_no(status.python3_installed)
+    );
     println!(
         "Credentials configured: {}",
         yes_no(status.credentials_configured)
@@ -759,8 +780,8 @@ fn print_status(status: &SkillStatus, doctor: bool) {
         if !status.npx_installed {
             println!("- Install Node.js/npm so npx is available.");
         }
-        if !status.jq_installed {
-            println!("- Install jq.");
+        if !status.python3_installed {
+            println!("- Install Python 3 for safe adapter configuration.");
         }
         if !status.authenticated {
             println!("- Run keito auth login.");
@@ -1038,7 +1059,7 @@ fn relative_display(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn capture_diagnostics() -> (serde_json::Value, serde_json::Value) {
+fn capture_diagnostics(global: &GlobalFlags) -> (serde_json::Value, serde_json::Value) {
     let default_worker = serde_json::json!({"installed":false,"loaded":false,"running":false,"stale":false,"state":"UNKNOWN"});
     let directory = std::env::var_os("KEITO_CAPTURE_HOME")
         .map(PathBuf::from)
@@ -1067,13 +1088,26 @@ fn capture_diagnostics() -> (serde_json::Value, serde_json::Value) {
     };
     let mut capture =
         serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({"storage_paused":true}));
+    capture["historical_delivery_verified"] = capture["delivery_verified"].clone();
+    capture["delivery_verified"] = serde_json::json!(false);
+    let auth = ResolvedAuth::resolve(global).ok();
+    let origin = crate::config::AppConfig::load()
+        .ok()
+        .map(|config| crate::capture::hash(config.api_base_url().trim_end_matches('/')));
     let repository = std::env::current_dir()
         .ok()
         .and_then(|path| crate::capture::Repository::resolve(&path).ok());
     let worker = if let Some(repository) = repository {
         capture["current_repository"] = match store.binding(&repository.key) {
             Ok(Some(binding)) => {
-                serde_json::json!({"approved":!binding.revoked,"paused":binding.paused,"mapping_current":repository.matches_binding(&binding)})
+                let local_auth_match = auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.workspace_id == binding.workspace_id)
+                    && origin.as_deref() == Some(binding.origin_hash.as_str());
+                serde_json::json!({"approved":!binding.revoked,"paused":binding.paused,"mapping_current":repository.matches_binding(&binding),
+                    "workspace_id":binding.workspace_id,"owner_id":binding.owner_id,"origin_hash":binding.origin_hash,
+                    "delivery_history_verified":store.binding_delivery_history(&binding.id).unwrap_or(false),
+                    "authentication_binding":if local_auth_match {"UNVERIFIED_OWNER"} else {"MISMATCH"}})
             }
             _ => serde_json::json!({"approved":false,"reason":"LOCAL_APPROVAL_REQUIRED"}),
         };

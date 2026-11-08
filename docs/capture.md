@@ -28,7 +28,8 @@ migration, review them and rerun the selected installation with `--confirm-migra
 Review new or changed Codex hooks through the harness's normal `/hooks` trust flow and
 check that lifecycle hooks are enabled. Keito never writes trust decisions or bypasses
 managed settings. Doctor distinguishes configured credentials from verified live
-authentication. Unknown trust or delivery never counts as ready.
+authentication and a matching current owner/workspace/API-origin binding. Historical
+delivery from another binding is not current delivery proof. Unknown trust or delivery never counts as ready.
 
 ## Approve a repository
 
@@ -75,7 +76,8 @@ the service stale; its expected-runtime digest also refuses delivery after repla
 Explicitly repeat installation with the reviewed updated runtime.
 
 Launchd starts and restarts the worker. Settings installed, service loaded, process running and delivery
-verified are separate states. Real restart/kill/recovery checks remain part of artifact
+verified are separate states. Failed or unavailable launchd observations are unknown,
+not proof of service absence; uninstall keeps settings until absence is positively verified. Real restart/kill/recovery checks remain part of artifact
 qualification. To stop/remove only this repository's worker service:
 
 ```sh
@@ -113,7 +115,10 @@ keito capture disable-all
 
 Pause excludes its interval and holds queued uploads. Resume preserves earned time and
 requires an unchanged approved binding. Disable revokes local consent; re-enabling requires
-explicit setup again. None of these commands rewrites submitted accounting records.
+explicit setup again. None of these commands rewrites submitted accounting records. Revoking global or
+harness consent abandons any unmeasured active interval as incomplete; reapproval
+cannot resurrect the clock or count time while capture was disabled. A refused Stop
+also prevents a delayed duplicate from supplying a later completion time.
 
 Prompt opens a supported turn and Stop checkpoints it. Session starts/resumes do not erase
 previous completed intervals. Native Claude `prompt_id` and Codex `turn_id` identify turns;

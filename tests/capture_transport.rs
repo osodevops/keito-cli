@@ -436,7 +436,35 @@ async fn http_date_retry_after_is_not_replaced_by_short_backoff() {
 
 #[tokio::test]
 async fn doctor_never_reuses_another_workspace_delivery_as_current_binding_proof() {
-    let server=MockServer::start().await;let home=tempfile::tempdir().unwrap();let root=home.path().join("repo");init(&root);me(&server,"usr_1").await;let(mut store,b)=seed(home.path(),&root,&server.uri());let queued=store.claim(&b,chrono::Utc::now().timestamp()).unwrap().unwrap();store.acknowledge(&queued,"canonical-doctor",chrono::Utc::now().timestamp()).unwrap();
-    let output=command(home.path(),&root,&server.uri()).env("KEITO_ACCOUNT_ID","other_workspace").args(["skill","doctor","--live","--json"]).assert().success().get_output().stdout.clone();let status:Value=serde_json::from_slice(&output).unwrap();
-    assert_eq!(status["authentication_state"],"VERIFIED");assert_eq!(status["capture"]["current_repository"]["authentication_binding"],"MISMATCH");assert_eq!(status["delivery_verified"],false);assert_eq!(status["capture"]["delivery_verified"],false);assert_eq!(status["ready"],false);assert!(status["python3_installed"].is_boolean());
+    let server = MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("repo");
+    init(&root);
+    me(&server, "usr_1").await;
+    let (mut store, b) = seed(home.path(), &root, &server.uri());
+    let queued = store
+        .claim(&b, chrono::Utc::now().timestamp())
+        .unwrap()
+        .unwrap();
+    store
+        .acknowledge(&queued, "canonical-doctor", chrono::Utc::now().timestamp())
+        .unwrap();
+    let output = command(home.path(), &root, &server.uri())
+        .env("KEITO_ACCOUNT_ID", "other_workspace")
+        .args(["skill", "doctor", "--live", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(status["authentication_state"], "VERIFIED");
+    assert_eq!(
+        status["capture"]["current_repository"]["authentication_binding"],
+        "MISMATCH"
+    );
+    assert_eq!(status["delivery_verified"], false);
+    assert_eq!(status["capture"]["delivery_verified"], false);
+    assert_eq!(status["ready"], false);
+    assert!(status["python3_installed"].is_boolean());
 }

@@ -384,6 +384,18 @@ impl Session {
         self.observed_through = self.observed_through.max(clock.wall);
         Ok(())
     }
+    fn abandon_active(&mut self) -> Result<(), AppError> {
+        let clock = self
+            .active
+            .as_ref()
+            .and_then(|turn| turn.clock.clone())
+            .unwrap_or(Clock {
+                wall: self.observed_through,
+                monotonic: 0,
+                boot: "UNOBSERVED_BOUNDARY".into(),
+            });
+        self.close(&clock, false)
+    }
     fn payload(&self, segments: Vec<Segment>, revision: i64) -> Result<CapturePayload, AppError> {
         Ok(CapturePayload {
             schema_version: 1,
@@ -569,6 +581,11 @@ impl Store {
                 && old.project_id == binding.project_id
                 && old.task_id == binding.task_id
             {
+                Self::abandon_revoked_turns(
+                    &tx,
+                    &old.id,
+                    if old.revoked { &[] } else { &binding.agents },
+                )?;
                 binding.id = old.id.clone();
                 binding.version = old.version;
                 binding.paused = old.paused && !old.revoked;
@@ -606,6 +623,7 @@ impl Store {
                 tx.commit().map_err(storage_error)?;
                 return Ok(binding);
             }
+            Self::abandon_revoked_turns(&tx, &old.id, &[])?;
             tx.execute("UPDATE outbox SET state='held',reason='MAPPING_CHANGED_REVIEW_REQUIRED' WHERE session_id IN(SELECT id FROM sessions WHERE binding_id=?1) AND state!='acknowledged'",[&old.id]).map_err(storage_error)?;
             tx.execute("UPDATE sessions SET data=json_set(data,'$.needs_attention',json('true')) WHERE binding_id=?1",[&old.id]).map_err(storage_error)?;
         }
@@ -626,6 +644,36 @@ impl Store {
             params![binding.repository_key, serde_json::to_string(&binding).map_err(storage_error)?]).map_err(storage_error)?;
         tx.commit().map_err(storage_error)?;
         Ok(binding)
+    }
+    fn abandon_revoked_turns(
+        tx: &Transaction<'_>,
+        binding_id: &str,
+        remaining_agents: &[String],
+    ) -> Result<(), AppError> {
+        let mut statement=tx.prepare("SELECT data FROM sessions WHERE binding_id=?1 AND json_type(data,'$.active')='object'").map_err(storage_error)?;
+        let rows: Vec<String> = statement
+            .query_map([binding_id], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for raw in rows {
+            let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            if remaining_agents.contains(&session.source_namespace) {
+                continue;
+            }
+            session.abandon_active()?;
+            Self::queue(tx, &mut session)?;
+            tx.execute(
+                "UPDATE sessions SET data=?2 WHERE id=?1",
+                params![
+                    session.id,
+                    serde_json::to_string(&session).map_err(storage_error)?
+                ],
+            )
+            .map_err(storage_error)?;
+        }
+        Ok(())
     }
     fn binding_in(connection: &Connection, key: &str) -> Result<Option<Binding>, AppError> {
         let value: Option<String> = connection
@@ -669,6 +717,7 @@ impl Store {
         if let Some(id) = turn_id {
             identifier(id)?;
         }
+        let self_failure_present = self.failure()?.is_some();
         let tx = self.transaction()?;
         Self::check_size(&tx)?;
         let Some(binding) = Self::binding_in(&tx, &repository.key)? else {
@@ -721,6 +770,14 @@ impl Store {
             return Err(AppError::Config("Native session mapping changed; review held evidence and begin a new native session".into()));
         }
         let id = session.id.clone();
+        if self_failure_present
+            && matches!(
+                event,
+                CaptureEvent::Stop | CaptureEvent::Interrupt | CaptureEvent::SessionEnd
+            )
+        {
+            session.abandon_active()?;
+        }
         if resumed && event == CaptureEvent::SessionStart {
             session.close(clock, false)?;
         }
@@ -905,6 +962,7 @@ impl Store {
         let bindings = self.status()?.bindings;
         let tx = self.transaction()?;
         for mut binding in bindings {
+            Self::abandon_revoked_turns(&tx, &binding.id, &[])?;
             binding.paused = true;
             binding.revoked = true;
             tx.execute(
@@ -917,6 +975,9 @@ impl Store {
             .map_err(storage_error)?;
         }
         tx.commit().map_err(storage_error)
+    }
+    pub fn binding_delivery_history(&self, binding_id: &str) -> Result<bool, AppError> {
+        self.connection.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE binding_id=?1 AND json_type(data,'$.canonical_server_id')='text')",[binding_id],|r|r.get(0)).map_err(storage_error)
     }
     pub fn status(&self) -> Result<Status, AppError> {
         let mut statement = self

@@ -37,7 +37,7 @@ mod launchd {
 state="$(dirname "$0")/running"
 fail="$(dirname "$0")/fail"
 case "$1" in
-  print) if [ -f "$state" ]; then printf 'state = running\npid = 123\n'; exit 0; else exit 1; fi;;
+  print) if [ -f "$state" ]; then printf 'state = running\npid = 123\n'; exit 0; else printf 'Could not find service "%s"\n' "${2##*/}" >&2; exit 113; fi;;
   bootout) rm -f "$state"; exit 0;;
   bootstrap) if [ -f "$fail" ]; then exit 1; fi; touch "$state"; exit 0;;
 esac
