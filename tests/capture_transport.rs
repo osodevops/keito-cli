@@ -263,3 +263,66 @@ async fn paused_or_revoked_local_consent_performs_no_network_even_preflight() {
         );
     }
 }
+
+#[tokio::test]
+async fn mapping_change_between_queued_revisions_stops_before_next_upload() {
+    let server = MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("repo");
+    init(&root);
+    me(&server, "usr_1").await;
+    let (mut store, _) = seed(home.path(), &root, &server.uri());
+    let repo = Repository::resolve(&root).unwrap();
+    for (event, offset) in [(Prompt, 100), (Stop, 190)] {
+        store
+            .event(
+                &repo,
+                Signal {
+                    source: "codex",
+                    resumed: false,
+                    source_id: "synthetic-session",
+                    turn_id: Some("second-turn"),
+                    version: "0.167.0",
+                    event,
+                    clock: &Clock {
+                        wall: 1_794_067_200 + offset,
+                        monotonic: 10 + offset,
+                        boot: "fixture".into(),
+                    },
+                },
+            )
+            .unwrap();
+    }
+    let changed_root = root.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v2/agent-sessions"))
+        .respond_with(move |request: &wiremock::Request| {
+            std::fs::create_dir_all(changed_root.join(".keito")).unwrap();
+            std::fs::write(
+                changed_root.join(".keito/config.yml"),
+                "agent_tracking:\n  enabled: false\n",
+            )
+            .unwrap();
+            let payload: Value = serde_json::from_slice(&request.body).unwrap();
+            ResponseTemplate::new(201).set_body_json(
+                json!({"agent_session":{"id":"canonical-session","revision":payload["revision"]}}),
+            )
+        })
+        .mount(&server)
+        .await;
+    command(home.path(), &root, &server.uri())
+        .args(["capture", "sync", "--json"])
+        .assert()
+        .success();
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == "POST")
+            .count(),
+        1
+    );
+    assert_eq!(store.status().unwrap().pending, 1);
+}
