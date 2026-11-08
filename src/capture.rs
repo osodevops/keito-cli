@@ -1830,6 +1830,24 @@ fn read_failure_markers(directory: &Path) -> Result<Vec<(PathBuf, CaptureFailure
     Ok(markers)
 }
 
+// Emergency markers use the reviewed POSIX fsync contract, not Apple's
+// stronger drive-wide F_FULLFSYNC used by File::sync_all. SQLite is unchanged.
+fn sync_refusal(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        file.sync_all()
+    }
+}
+
 pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Result<(), AppError> {
     if !matches!(
         reason,
@@ -1899,10 +1917,10 @@ pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Resu
         use std::io::Write;
         file.write_all(&serde_json::to_vec(&failure).map_err(storage_error)?)
             .map_err(storage_error)?;
-        file.sync_all().map_err(storage_error)?;
+        sync_refusal(&file).map_err(storage_error)?;
         fs::rename(&temporary, &path).map_err(storage_error)?;
         fs::File::open(directory)
-            .and_then(|f| f.sync_all())
+            .and_then(|f| sync_refusal(&f))
             .map_err(storage_error)?;
         Ok(())
     })();

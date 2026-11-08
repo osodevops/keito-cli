@@ -88,3 +88,50 @@ and empty results; the migration preserves their exact output strings. These
 source changes require a new reviewed build and first-artifact qualification.
 The earlier 1e234ee paired build remains unexecuted evidence, not a qualified
 artifact for the updated dependency set.
+
+## Hosted CI follow-up and platform verification
+
+A live Permit retains its verified read-only, close-on-exec marker descriptor
+through clones, transaction validation and acknowledgement. This pins the inode
+allocation after unlink, preventing a recycled device/inode pair from authorizing
+a different marker. Snapshot/dead-marker probes still close immediately, releasing
+any probe flock; the retained live descriptor does not own the guardian's lock.
+This does not extend the documented same-user tamper or marker unlink/CAS guarantee.
+
+Emergency refusal publication alone now uses POSIX `fsync` for the marker and then
+the renamed marker's parent directory, preserving write/flush/rename/flush order
+and error propagation. Apple's stronger drive-wide `F_FULLFSYNC` from Rust
+`File::sync_all` exceeded the existing contention budget. SQLite's 500 ms busy
+policy and synchronous setting, the 700 ms core test assertion, and all guardian
+and adapter deadlines remain unchanged. This is the existing POSIX durability
+contract, not a power-loss or unconditional filesystem-latency guarantee. The
+contention test records event, emergency publication and total elapsed time even
+when the unchanged assertion fails.
+
+Windows automatic capture explicitly refuses before credentials, network, Store
+or profile work; ordinary manual CLI/API/output and clap discovery remain covered.
+Unix-only imports and resource fields are partitioned rather than warning-suppressed.
+The platform test inventory is deliberate:
+
+- `capture_store`: 36 POSIX-authority cases on Unix; six pure identifier/Git/mapping
+  parser cases remain cross-platform.
+- `capture_usage_integration`: 21 native consent/store/reader cases on Unix.
+- `capture_transport`: 11 native consent/queued-store cases on Unix.
+- Parser tests moved from the removed integration target to the private
+  `capture_usage::parser_tests` library child in `tests/unit/capture_usage_parser.rs`.
+  All 29 names/assertions remain: 27 pure decoder cases are cross-platform and two
+  POSIX path/descriptor safety cases are Unix-only. Unix fixtures still invoke
+  the real bounded readers and additionally compare pure decoder results. Pure
+  decoder identity carries no path, file authority, consent or normal enablement.
+- Mixed entry/supervisor suites partition native operations individually, retaining
+  help, selection, and applicable doctor checks. `capture_unsupported` adds a
+  Windows public-command matrix for unsupported diagnostics, no API requests,
+  no stdout/ACK/readiness and unchanged private state/profile bytes.
+
+Use `--lib capture_usage::parser_tests` for focused parser selection inside the
+protected test environment. The old `--test capture_usage_parser` target no longer
+exists; the full all-features/all-targets suite discovers the library cases.
+Actual Windows hosted execution remains necessary; local source partitioning is
+not a passing Windows runtime result. These changes also require fresh independent
+review and a new paired-artifact qualification. The retained 689 source's FIRST
+and p95 observations qualify only that earlier source/artifact slice.

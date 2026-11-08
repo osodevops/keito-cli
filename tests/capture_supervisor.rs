@@ -2,6 +2,7 @@
 mod service_boundary;
 use predicates::prelude::*;
 
+#[cfg(unix)]
 #[test]
 fn capture_worker_status_never_claims_an_uninstalled_service_running() {
     let home = tempfile::tempdir().unwrap();

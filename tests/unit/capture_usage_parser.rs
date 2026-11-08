@@ -2,9 +2,7 @@
 //! observations. Envelopes reconstruct allowlisted fields from the initial and
 //! envelope-session probes; raw content was discarded. Malformed/stream variants
 //! and edge cases are synthetic validation, not harness qualification evidence.
-#[path = "../src/capture_usage.rs"]
-mod capture_usage;
-use capture_usage::*;
+use super::*;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::{fs, path::PathBuf};
@@ -47,6 +45,7 @@ impl Fixture {
         )
         .unwrap();
     }
+    #[cfg(unix)]
     fn approved(&self) -> ApprovedActiveSession {
         ApprovedActiveSession::new(
             self.harness,
@@ -62,7 +61,57 @@ impl Fixture {
         .unwrap()
     }
     fn read(&self) -> Result<UsageEvidence, UsageReadError> {
-        read_active_session(&self.approved())
+        let decoded = parse_snapshot(
+            &self.decoder_identity(),
+            &fs::read(&self.path).unwrap(),
+            &BTreeSet::new(),
+        );
+        #[cfg(unix)]
+        {
+            let native = read_active_session(&self.approved());
+            assert_eq!(native, decoded, "native/pure decoder parity");
+            native
+        }
+        #[cfg(not(unix))]
+        {
+            decoded
+        }
+    }
+    fn read_request_ids(&self) -> Result<ObservedRequestIds, UsageReadError> {
+        let decoded = parse_request_ids(&self.decoder_identity(), &fs::read(&self.path).unwrap());
+        #[cfg(unix)]
+        {
+            let native = read_active_session_request_ids(&self.approved());
+            assert_eq!(native, decoded, "native/pure identity decoder parity");
+            native
+        }
+        #[cfg(not(unix))]
+        {
+            decoded
+        }
+    }
+    fn read_excluding(&self, excluded: &BTreeSet<String>) -> Result<UsageEvidence, UsageReadError> {
+        let decoded = parse_snapshot(
+            &self.decoder_identity(),
+            &fs::read(&self.path).unwrap(),
+            excluded,
+        );
+        #[cfg(unix)]
+        {
+            let native = read_active_session_excluding_request_ids(&self.approved(), excluded);
+            assert_eq!(native, decoded, "native/pure excluded decoder parity");
+            native
+        }
+        #[cfg(not(unix))]
+        {
+            decoded
+        }
+    }
+    fn decoder_identity(&self) -> DecoderIdentity<'_> {
+        DecoderIdentity {
+            harness: self.harness,
+            session_id: SESSION,
+        }
     }
 }
 fn claude(id: &str, output: u64) -> Value {
@@ -94,7 +143,7 @@ fn baseline_keeps_only_ids_including_provisional_or_nonnumeric_history() {
     old["message"]["usage"] = json!({"input_tokens":"PRIVATE_HISTORY_COUNTER","output_tokens":-1});
     let missing = json!({"type":"assistant","sessionId":SESSION,"message":{"id":"msg_missing"}});
     let f = Fixture::new(Harness::ClaudeCode, vec![old, missing]);
-    let baseline = read_active_session_request_ids(&f.approved()).unwrap();
+    let baseline = f.read_request_ids().unwrap();
     assert_eq!(
         baseline.record_ids,
         ["msg_old".to_owned(), "msg_missing".to_owned()]
@@ -112,19 +161,16 @@ fn baseline_keeps_only_ids_including_provisional_or_nonnumeric_history() {
 #[test]
 fn empty_stable_claude_baseline_is_valid_but_tail_or_missing_identity_is_not_complete() {
     let f = Fixture::new(Harness::ClaudeCode, vec![]);
-    let empty = read_active_session_request_ids(&f.approved()).unwrap();
+    let empty = f.read_request_ids().unwrap();
     assert!(empty.record_ids.is_empty());
     assert!(empty.limitations.is_empty());
     fs::write(&f.path, b"{\"type\":\"assistant\"").unwrap();
-    let partial = read_active_session_request_ids(&f.approved()).unwrap();
+    let partial = f.read_request_ids().unwrap();
     assert!(partial.limitations.contains(&"INCOMPLETE_TAIL"));
     f.write(vec![
         json!({"type":"assistant","sessionId":SESSION,"message":{}}),
     ]);
-    assert_eq!(
-        read_active_session_request_ids(&f.approved()),
-        Err(UsageReadError::InvalidRecord)
-    );
+    assert_eq!(f.read_request_ids(), Err(UsageReadError::InvalidRecord));
 }
 
 #[test]
@@ -132,20 +178,17 @@ fn codex_baseline_requires_native_metadata_and_excludes_no_usage_response_ids() 
     let mut old = codex("resp_old", "turn_old", false);
     old["payload"]["usage"] = Value::Null;
     let f = Fixture::new(Harness::Codex, vec![meta(), old.clone()]);
-    let ids = read_active_session_request_ids(&f.approved()).unwrap();
+    let ids = f.read_request_ids().unwrap();
     assert_eq!(
         ids.record_ids,
         ["resp_old".to_owned()].into_iter().collect()
     );
     f.write(vec![meta()]);
-    let ids = read_active_session_request_ids(&f.approved()).unwrap();
+    let ids = f.read_request_ids().unwrap();
     assert!(ids.record_ids.is_empty());
     assert!(ids.limitations.is_empty());
     f.write(vec![old]);
-    assert_eq!(
-        read_active_session_request_ids(&f.approved()),
-        Err(UsageReadError::InvalidSession)
-    );
+    assert_eq!(f.read_request_ids(), Err(UsageReadError::InvalidSession));
 }
 
 #[test]
@@ -156,7 +199,7 @@ fn excluded_history_is_skipped_before_counter_model_or_finality_decoding() {
     invalid["message"]["stop_reason"] = json!({"PRIVATE_FINALITY":"invalid"});
     let f = Fixture::new(Harness::ClaudeCode, vec![invalid, claude("msg_new", 7)]);
     let excluded: BTreeSet<_> = ["msg_old".to_owned()].into_iter().collect();
-    let evidence = read_active_session_excluding_request_ids(&f.approved(), &excluded).unwrap();
+    let evidence = f.read_excluding(&excluded).unwrap();
     assert_eq!(evidence.requests.len(), 1);
     assert_eq!(evidence.requests[0].source_record_id, "msg_new");
     assert!(!serde_json::to_string(&evidence)
@@ -174,7 +217,7 @@ fn excluded_history_is_skipped_before_counter_model_or_finality_decoding() {
         ],
     );
     let excluded: BTreeSet<_> = ["resp_old".to_owned()].into_iter().collect();
-    let evidence = read_active_session_excluding_request_ids(&f.approved(), &excluded).unwrap();
+    let evidence = f.read_excluding(&excluded).unwrap();
     assert_eq!(evidence.requests.len(), 1);
     assert_eq!(evidence.requests[0].source_record_id, "resp_new");
 }
@@ -186,11 +229,11 @@ fn exclusion_never_bypasses_session_identity_or_changed_accepted_request_conflic
     let f = Fixture::new(Harness::ClaudeCode, vec![old]);
     let excluded: BTreeSet<_> = ["msg_old".to_owned()].into_iter().collect();
     assert_eq!(
-        read_active_session_excluding_request_ids(&f.approved(), &excluded),
+        f.read_excluding(&excluded),
         Err(UsageReadError::InvalidSession)
     );
     f.write(vec![claude("msg_accepted", 5), claude("msg_accepted", 9)]);
-    let evidence = read_active_session_excluding_request_ids(&f.approved(), &excluded).unwrap();
+    let evidence = f.read_excluding(&excluded).unwrap();
     assert!(evidence.requests.is_empty());
     assert!(evidence
         .limitations

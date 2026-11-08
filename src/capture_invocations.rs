@@ -1,29 +1,43 @@
 //! Invocation safety flags, not accounting. No native identity or raw hook data.
 use crate::error::AppError;
 use std::{
-    fs::{self, File},
-    io::{Read, Write},
+    fs,
     path::{Path, PathBuf},
 };
+#[cfg(unix)]
+use std::{
+    fs::File,
+    io::{Read, Write},
+    sync::Arc,
+};
+#[cfg(unix)]
 pub const ACK: &[u8] = b"KEITO_CAPTURE_DURABLE_V1\n";
+#[cfg(unix)]
 const PENDING: &[u8] = b"KEITO_CAPTURE_PENDING_V1\n";
 fn refused() -> AppError {
     AppError::Config("Capture invocation authority unavailable; collection remains paused".into())
 }
+#[cfg(unix)]
 fn nonce_valid(nonce: &str) -> bool {
     nonce.len() == 64 && nonce.bytes().all(|b| b.is_ascii_hexdigit())
 }
 #[derive(Clone)]
 pub struct Permit {
+    #[cfg(unix)]
     nonce: String,
-    device: u64,
-    inode: u64,
+    // Pin the verified live inode through validation/commit/ACK and every clone.
+    // A read-only descriptor owns no guardian flock and closes across exec.
+    #[cfg(unix)]
+    marker: Arc<File>,
 }
 pub struct Marker {
     pub nonce: String,
     pub live: bool,
+    #[cfg(unix)]
     device: u64,
+    #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
     preparing: bool,
 }
 /// Capture state follows effective-user passwd HOME, never a hook's HOME/CWD.
@@ -208,6 +222,11 @@ fn names(root: &File) -> Result<Vec<String>, AppError> {
 }
 #[cfg(unix)]
 fn inspect(root: &File, nonce: &str, preparing: bool) -> Result<Marker, AppError> {
+    // Snapshot/dead probes must release any successful probe flock immediately.
+    Ok(inspect_file(root, nonce, preparing)?.0)
+}
+#[cfg(unix)]
+fn inspect_file(root: &File, nonce: &str, preparing: bool) -> Result<(Marker, File), AppError> {
     use std::ffi::CString;
     use std::os::{
         fd::{AsRawFd, FromRawFd},
@@ -258,13 +277,16 @@ fn inspect(root: &File, nonce: &str, preparing: bool) -> Result<Marker, AppError
     } else {
         return Err(refused());
     };
-    Ok(Marker {
-        nonce: nonce.to_owned(),
-        live,
-        device: m.dev(),
-        inode: m.ino(),
-        preparing,
-    })
+    Ok((
+        Marker {
+            nonce: nonce.to_owned(),
+            live,
+            device: m.dev(),
+            inode: m.ino(),
+            preparing,
+        },
+        file,
+    ))
 }
 pub fn snapshot(directory: &Path) -> Result<Vec<Marker>, AppError> {
     let path = directory.join("capture-invocations");
@@ -333,14 +355,13 @@ impl Permit {
         #[cfg(unix)]
         {
             let _publication = publication(directory)?;
-            let m = inspect(&root(directory)?, nonce, false)?;
+            let (m, file) = inspect_file(&root(directory)?, nonce, false)?;
             if !m.live {
                 return Err(refused());
             }
             Ok(Self {
                 nonce: m.nonce,
-                device: m.device,
-                inode: m.inode,
+                marker: Arc::new(file),
             })
         }
         #[cfg(not(unix))]
@@ -350,11 +371,25 @@ impl Permit {
         }
     }
     pub fn validate(&self, directory: &Path) -> Result<(), AppError> {
-        let current = Self::new(directory, &self.nonce)?;
-        if current.device != self.device || current.inode != self.inode {
-            return Err(refused());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let expected = self.marker.metadata().map_err(|_| refused())?;
+            if expected.nlink() != 1 {
+                return Err(refused());
+            }
+            let current = Self::new(directory, &self.nonce)?;
+            let observed = current.marker.metadata().map_err(|_| refused())?;
+            if observed.dev() != expected.dev() || observed.ino() != expected.ino() {
+                return Err(refused());
+            }
+            Ok(())
         }
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            let _ = directory;
+            Err(refused())
+        }
     }
     pub fn acknowledge(&self, directory: &Path, fd: i32) -> Result<(), AppError> {
         self.validate(directory)?;
@@ -420,5 +455,112 @@ pub fn remove_dead(directory: &Path, markers: &[Marker]) -> Result<(), AppError>
     {
         let _ = (directory, markers);
         Err(refused())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permit_tests {
+    use super::*;
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    fn marker(root: &Path, nonce: &str, live: bool) -> File {
+        let directory = root.join("capture-invocations");
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(format!("{nonce}.pending")))
+            .unwrap();
+        file.write_all(PENDING).unwrap();
+        file.sync_all().unwrap();
+        if live {
+            assert_eq!(
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+        }
+        file
+    }
+
+    #[test]
+    fn live_permit_pins_readonly_cloexec_inode_until_last_clone_without_keeping_guardian_alive() {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let nonce = crate::capture::hash("pinned-permit");
+        let guard = marker(&root, &nonce, true);
+        let identity = guard.metadata().unwrap();
+        let permit = Permit::new(&root, &nonce).unwrap();
+        let cloned = permit.clone();
+        assert!(permit.validate(&root).is_ok());
+        drop(guard);
+        // Retaining a read descriptor must not retain the guardian's exclusive lock.
+        assert!(permit.validate(&root).is_err());
+        let dead = snapshot(&root).unwrap();
+        assert_eq!(dead.len(), 1);
+        assert!(!dead[0].live);
+        remove_dead(&root, &dead).unwrap();
+        assert_eq!(
+            fs::read_dir(root.join("capture-invocations"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let matching = || {
+            fs::read_dir("/dev/fd")
+                .unwrap()
+                .filter_map(|entry| {
+                    let fd = entry.ok()?.file_name().to_str()?.parse::<i32>().ok()?;
+                    let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    if unsafe { libc::fstat(fd, info.as_mut_ptr()) } != 0 {
+                        return None;
+                    }
+                    let info = unsafe { info.assume_init() };
+                    #[cfg(target_os = "macos")]
+                    let device = info.st_dev as u64;
+                    #[cfg(not(target_os = "macos"))]
+                    let device = info.st_dev;
+                    if device != identity.dev() || info.st_ino != identity.ino() {
+                        return None;
+                    }
+                    Some((unsafe { libc::fcntl(fd, libc::F_GETFD) }, unsafe {
+                        libc::fcntl(fd, libc::F_GETFL)
+                    }))
+                })
+                .collect::<Vec<_>>()
+        };
+        let held = matching();
+        assert!(
+            !held.is_empty(),
+            "accepted Permit dropped its verified descriptor, permitting inode ABA"
+        );
+        assert!(held
+            .iter()
+            .all(|(descriptor, access)| descriptor & libc::FD_CLOEXEC != 0
+                && access & libc::O_ACCMODE == libc::O_RDONLY));
+        let replacement = marker(&root, &nonce, true);
+        assert_ne!(
+            (
+                replacement.metadata().unwrap().dev(),
+                replacement.metadata().unwrap().ino()
+            ),
+            (identity.dev(), identity.ino())
+        );
+        assert!(permit.validate(&root).is_err());
+        drop(permit);
+        assert!(!matching().is_empty(), "Permit clone lost the pin");
+        drop(cloned);
+        assert!(
+            matching().is_empty(),
+            "last Permit clone leaked its descriptor"
+        );
+        // Keep the replacement's guardian live until every pin assertion completes.
+        assert!(replacement.as_raw_fd() >= 0);
     }
 }

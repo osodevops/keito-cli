@@ -439,7 +439,9 @@ fn materialize_bundled_skill() -> Result<MaterializedBundledSkill, AppError> {
     let temp_root =
         std::env::temp_dir().join(format!("keito-skill-{}-{unique}", std::process::id()));
     let skill_root = temp_root.join(SKILL_NAME);
-    let mut builder = fs::DirBuilder::new();
+    let builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    let mut builder = builder;
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;

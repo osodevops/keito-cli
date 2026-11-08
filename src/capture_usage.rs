@@ -41,6 +41,7 @@ pub enum UsageReadError {
     Unavailable,
     TooLarge,
     InvalidRecord,
+    #[cfg(unix)]
     SourceChanged,
 }
 impl std::fmt::Display for UsageReadError {
@@ -57,7 +58,19 @@ pub struct ApprovedActiveSession {
     session_id: String,
     path: PathBuf,
 }
+// Untrusted, path-free decoder identity; it grants no file access or Store consent.
+struct DecoderIdentity<'a> {
+    harness: Harness,
+    session_id: &'a str,
+}
 impl ApprovedActiveSession {
+    fn decoder_identity(&self) -> DecoderIdentity<'_> {
+        DecoderIdentity {
+            harness: self.harness,
+            session_id: &self.session_id,
+        }
+    }
+
     /// `resolved_home` must come from the consent-owning core, never hook input.
     /// A hook path alone is not authorization. Only harness-managed roots qualify.
     /// No environment/config is read and no path is searched or canonicalized.
@@ -177,7 +190,13 @@ pub fn read_active_session_request_ids(
     approved: &ApprovedActiveSession,
 ) -> Result<ObservedRequestIds, UsageReadError> {
     let bytes = bounded_snapshot(&approved.path)?;
-    let (lines, incomplete_tail) = complete_lines(&bytes)?;
+    parse_request_ids(&approved.decoder_identity(), &bytes)
+}
+fn parse_request_ids(
+    approved: &DecoderIdentity<'_>,
+    bytes: &[u8],
+) -> Result<ObservedRequestIds, UsageReadError> {
+    let (lines, incomplete_tail) = complete_lines(bytes)?;
     let mut record_ids = BTreeSet::new();
     let mut saw_meta = false;
     for line in lines {
@@ -200,7 +219,7 @@ pub fn read_active_session_request_ids(
         return Err(UsageReadError::InvalidSession);
     }
     Ok(ObservedRequestIds {
-        source_session_id: approved.session_id.clone(),
+        source_session_id: approved.session_id.to_owned(),
         harness_version: approved.harness.version(),
         source_adapter: approved.harness.adapter(),
         record_ids,
@@ -217,7 +236,7 @@ pub fn read_active_session_excluding_request_ids(
     excluded: &BTreeSet<String>,
 ) -> Result<UsageEvidence, UsageReadError> {
     let bytes = bounded_snapshot(&approved.path)?;
-    parse_snapshot(approved, &bytes, excluded)
+    parse_snapshot(&approved.decoder_identity(), &bytes, excluded)
 }
 
 pub fn read_active_session(
@@ -491,7 +510,7 @@ fn complete_lines(bytes: &[u8]) -> Result<(Vec<&[u8]>, bool), UsageReadError> {
     Ok((lines, tail))
 }
 fn claude_request_id(
-    approved: &ApprovedActiveSession,
+    approved: &DecoderIdentity<'_>,
     line: &[u8],
 ) -> Result<String, UsageReadError> {
     let identity: ClaudeIdentity = decode(line).map_err(|_| UsageReadError::InvalidSession)?;
@@ -505,10 +524,7 @@ fn claude_request_id(
     }
     Ok(record.message.id)
 }
-fn verify_session_meta(
-    approved: &ApprovedActiveSession,
-    line: &[u8],
-) -> Result<(), UsageReadError> {
+fn verify_session_meta(approved: &DecoderIdentity<'_>, line: &[u8]) -> Result<(), UsageReadError> {
     let meta: Envelope<SessionMeta> = decode(line).map_err(|_| UsageReadError::InvalidSession)?;
     if meta.payload.id != approved.session_id || meta.payload.session_id != approved.session_id {
         return Err(UsageReadError::InvalidSession);
@@ -519,7 +535,7 @@ fn verify_session_meta(
     Ok(())
 }
 fn codex_request_id(
-    approved: &ApprovedActiveSession,
+    approved: &DecoderIdentity<'_>,
     line: &[u8],
     saw_meta: bool,
 ) -> Result<String, UsageReadError> {
@@ -568,10 +584,13 @@ fn validate_counters(request: &RequestUsage) -> Result<(), UsageReadError> {
     Ok(())
 }
 fn parse_snapshot(
-    approved: &ApprovedActiveSession,
+    approved: &DecoderIdentity<'_>,
     bytes: &[u8],
     excluded: &BTreeSet<String>,
 ) -> Result<UsageEvidence, UsageReadError> {
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(UsageReadError::TooLarge);
+    }
     let mut limitations = BTreeSet::new();
     let mut contexts: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut candidates = Vec::new();
@@ -845,7 +864,7 @@ fn parse_snapshot(
         limitations.insert("NO_OBSERVED_REQUEST_RECORDS");
     }
     Ok(UsageEvidence {
-        source_session_id: approved.session_id.clone(),
+        source_session_id: approved.session_id.to_owned(),
         harness_version: approved.harness.version(),
         coverage: "PARTIAL",
         coverage_reason: "OBSERVED_REQUEST_RECORDS",
@@ -853,3 +872,7 @@ fn parse_snapshot(
         limitations: limitations.into_iter().collect(),
     })
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/capture_usage_parser.rs"]
+mod parser_tests;

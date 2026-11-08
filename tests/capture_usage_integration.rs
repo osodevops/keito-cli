@@ -1,3 +1,5 @@
+#![cfg(unix)]
+// Native consent/store/reader assertions require the supported POSIX authority.
 //! Synthetic core qualification only. Native command integration remains disabled.
 use keito_cli::capture::{self, Binding, Clock, Repository, Signal, Store, UsageSource};
 use keito_cli::cli::capture::CaptureEvent::{self, *};

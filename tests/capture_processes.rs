@@ -149,15 +149,25 @@ fn sqlite_contention_exposes_lost_boundary_as_storage_pause_in_status() {
             }
         )
         .is_err());
+    let event_elapsed = core_start.elapsed();
+    let refusal_start = std::time::Instant::now();
     capture::record_failure(
         &capture,
         &capture::hash("core-contention"),
         "STORAGE_UNAVAILABLE",
     )
     .unwrap();
+    let refusal_elapsed = refusal_start.elapsed();
+    let core_elapsed = core_start.elapsed();
+    println!(
+        "contention timings: event={:.3}ms refusal={:.3}ms total={:.3}ms",
+        event_elapsed.as_secs_f64() * 1000.0,
+        refusal_elapsed.as_secs_f64() * 1000.0,
+        core_elapsed.as_secs_f64() * 1000.0
+    );
     assert!(
-        core_start.elapsed() < std::time::Duration::from_millis(700),
-        "core admission and marker exceeded watchdog budget"
+        core_elapsed < std::time::Duration::from_millis(700),
+        "core admission and marker exceeded watchdog budget: event={event_elapsed:?} refusal={refusal_elapsed:?} total={core_elapsed:?}"
     );
     drop(probe);
     let start = std::time::Instant::now();

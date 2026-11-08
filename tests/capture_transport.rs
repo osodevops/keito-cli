@@ -1,3 +1,5 @@
+#![cfg(unix)]
+// Native consent/store/reader assertions require the supported POSIX authority.
 #![allow(deprecated)]
 #[path = "support/service_boundary.rs"]
 mod service_boundary;

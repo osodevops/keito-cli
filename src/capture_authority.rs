@@ -1,8 +1,11 @@
 //! Cross-process refusal authority. Acquire SQLite first, then this bounded lock.
 //! Marker publication never waits for the lock and uses immutable unique files.
 use crate::error::AppError;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::path::Path;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 fn refused() -> AppError {
     AppError::Config("Capture authority unavailable; collection remains paused".into())

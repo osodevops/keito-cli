@@ -1,7 +1,11 @@
-use keito_cli::capture::{self, Binding, Clock, Repository, Store};
+use keito_cli::capture::{self, Repository};
+#[cfg(unix)]
+use keito_cli::capture::{Binding, Clock, Store};
+#[cfg(unix)]
 use keito_cli::cli::capture::CaptureEvent::*;
 use std::path::Path;
 
+#[cfg(unix)]
 fn clock(s: i64) -> Clock {
     Clock {
         wall: 1_794_067_200 + s,
@@ -9,6 +13,7 @@ fn clock(s: i64) -> Clock {
         boot: "fixture-boot".into(),
     }
 }
+#[cfg(unix)]
 fn repo() -> Repository {
     Repository {
         key: capture::hash("fixture-repo"),
@@ -18,6 +23,7 @@ fn repo() -> Repository {
         disabled: false,
     }
 }
+#[cfg(unix)]
 fn binding() -> Binding {
     Binding {
         repository_key: repo().key,
@@ -35,12 +41,14 @@ fn binding() -> Binding {
         revoked: false,
     }
 }
+#[cfg(unix)]
 fn setup() -> (tempfile::TempDir, Store, Binding) {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(&dir.path().join("capture")).unwrap();
     let b = store.approve(binding()).unwrap();
     (dir, store, b)
 }
+#[cfg(unix)]
 fn event(
     store: &mut Store,
     session: &str,
@@ -63,12 +71,14 @@ fn event(
         )
         .unwrap()
 }
+#[cfg(unix)]
 fn body(store: &mut Store, b: &Binding, s: i64) -> (capture::Queued, serde_json::Value) {
     let queued = store.claim(b, clock(s).wall).unwrap().unwrap();
     let body = serde_json::from_str(&queued.body).unwrap();
     (queued, body)
 }
 
+#[cfg(unix)]
 #[test]
 fn three_turns_short_first_idle_and_resume_preserve_exact_seconds() {
     let (_dir, mut store, b) = setup();
@@ -98,6 +108,7 @@ fn three_turns_short_first_idle_and_resume_preserve_exact_seconds() {
     assert!(payload.get("billable").is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn frozen_failure_retries_do_not_count_upload_wait_and_preserve_identity() {
     let (_dir, mut store, b) = setup();
@@ -114,6 +125,7 @@ fn frozen_failure_retries_do_not_count_upload_wait_and_preserve_identity() {
     assert_eq!(second["segments"][0]["duration_seconds"], 90);
 }
 
+#[cfg(unix)]
 #[test]
 fn missing_or_wrong_session_never_uses_latest_directory_state() {
     let (_dir, mut store, _) = setup();
@@ -127,6 +139,7 @@ fn missing_or_wrong_session_never_uses_latest_directory_state() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn duplicate_boundaries_are_idempotent_and_out_of_order_stop_cannot_close_new_turn() {
     let (_dir, mut store, _) = setup();
@@ -150,6 +163,7 @@ fn duplicate_boundaries_are_idempotent_and_out_of_order_stop_cannot_close_new_tu
     assert_eq!(s.revision, 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn pause_excludes_interval_and_does_not_reset_earned_time() {
     let (_dir, mut store, _) = setup();
@@ -165,6 +179,7 @@ fn pause_excludes_interval_and_does_not_reset_earned_time() {
     assert_eq!(s.segments.len(), 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn interrupt_missing_stop_and_reboot_never_invent_complete_time() {
     let (_dir, mut store, _) = setup();
@@ -198,6 +213,7 @@ fn interrupt_missing_stop_and_reboot_never_invent_complete_time() {
     assert!(s.segments.iter().all(|s| s.completeness == "INCOMPLETE"));
 }
 
+#[cfg(unix)]
 #[test]
 fn backward_clock_and_implausible_intervals_are_incomplete() {
     for end in [-1, 100_000] {
@@ -210,6 +226,7 @@ fn backward_clock_and_implausible_intervals_are_incomplete() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn no_native_turn_identity_is_a_refusal_not_fabricated_elapsed_time() {
     let (_dir, mut store, _) = setup();
@@ -230,6 +247,7 @@ fn no_native_turn_identity_is_a_refusal_not_fabricated_elapsed_time() {
     assert!(store.preview("session").unwrap().is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn changed_mapping_or_revoked_consent_holds_new_collection_and_pending_delivery() {
     let (_dir, mut store, b) = setup();
@@ -259,6 +277,7 @@ fn changed_mapping_or_revoked_consent_holds_new_collection_and_pending_delivery(
     assert_eq!(store.status().unwrap().held, 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn next_revision_is_not_claimed_until_previous_acknowledgement() {
     let (_dir, mut store, b) = setup();
@@ -278,6 +297,7 @@ fn next_revision_is_not_claimed_until_previous_acknowledgement() {
     assert_eq!(p["expected_revision"], 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn sqlite_connections_serialize_duplicate_hooks_into_one_revision() {
     let (dir, mut store, b) = setup();
@@ -302,6 +322,7 @@ fn sqlite_connections_serialize_duplicate_hooks_into_one_revision() {
     assert_eq!(p["segments"][0]["duration_seconds"], 90);
 }
 
+#[cfg(unix)]
 #[cfg(unix)]
 #[test]
 fn queue_has_private_modes_and_rejects_symlinks() {
@@ -396,6 +417,7 @@ fn linked_worktrees_share_identity_but_nested_repositories_and_changed_remotes_d
     assert!(!changed.key.contains("SECRET"));
 }
 
+#[cfg(unix)]
 #[test]
 fn repeated_resume_does_not_reset_an_active_interval() {
     let (_dir, mut store, _) = setup();
@@ -408,6 +430,7 @@ fn repeated_resume_does_not_reset_an_active_interval() {
         90
     );
 }
+#[cfg(unix)]
 #[test]
 fn repeated_setup_preserves_approval_identity_and_pause() {
     let (_dir, mut store, b) = setup();
@@ -417,6 +440,7 @@ fn repeated_setup_preserves_approval_identity_and_pause() {
     assert_eq!(same.version, b.version);
     assert!(same.paused);
 }
+#[cfg(unix)]
 #[test]
 fn old_completed_prompt_replay_cannot_close_or_duplicate_a_newer_turn() {
     let (_dir, mut store, _) = setup();
@@ -438,6 +462,7 @@ fn old_completed_prompt_replay_cannot_close_or_duplicate_a_newer_turn() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn resumed_harness_keeps_completed_turns_and_marks_the_abandoned_interval_incomplete() {
     let (_dir, mut store, _) = setup();
@@ -466,6 +491,7 @@ fn resumed_harness_keeps_completed_turns_and_marks_the_abandoned_interval_incomp
     assert!(s.needs_attention);
 }
 
+#[cfg(unix)]
 #[test]
 fn stopped_while_paused_never_reopens_or_counts_idle_after_resume() {
     let (_dir, mut store, _) = setup();
@@ -485,6 +511,7 @@ fn stopped_while_paused_never_reopens_or_counts_idle_after_resume() {
     assert_eq!(store.status().unwrap().unfinished, 0);
     assert_eq!(store.status().unwrap().pending, 1);
 }
+#[cfg(unix)]
 #[test]
 fn adding_harness_preserves_native_session_revision_and_identical_reenable_keeps_identity() {
     let temp = tempfile::tempdir().unwrap();
@@ -507,6 +534,7 @@ fn adding_harness_preserves_native_session_revision_and_identical_reenable_keeps
     let renewed = store.approve(binding()).unwrap();
     assert_eq!(renewed.id, second.id);
 }
+#[cfg(unix)]
 #[test]
 fn absent_linked_hint_inherits_approval_but_explicit_conflict_is_held() {
     let temp = tempfile::tempdir().unwrap();
@@ -597,6 +625,7 @@ fn remote_changes_do_not_change_operational_repository_family_identity() {
     assert_eq!(before.key, after.key);
 }
 
+#[cfg(unix)]
 #[test]
 fn remapping_a_native_session_is_held_instead_of_starting_revision_one_again() {
     let (_dir, mut store, first) = setup();
@@ -630,6 +659,7 @@ fn remapping_a_native_session_is_held_instead_of_starting_revision_one_again() {
         Some("MAPPING_CHANGED_REVIEW_REQUIRED")
     );
 }
+#[cfg(unix)]
 #[test]
 fn all_terminal_events_during_pause_reconcile_without_reopening_the_turn() {
     for terminal in [Interrupt, SessionEnd] {
@@ -649,6 +679,7 @@ fn all_terminal_events_during_pause_reconcile_without_reopening_the_turn() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn storage_failure_requires_explicit_recovery_and_never_reconstructs_missing_seconds() {
     let (dir, mut store, _) = setup();
@@ -686,6 +717,7 @@ fn storage_failure_requires_explicit_recovery_and_never_reconstructs_missing_sec
     assert_eq!(s.segments[0].completeness, "INCOMPLETE");
     assert!(s.needs_attention);
 }
+#[cfg(unix)]
 #[test]
 fn queue_ceiling_reports_paused_reason_without_evicting_existing_evidence() {
     let (dir, mut store, b) = setup();
@@ -729,6 +761,7 @@ fn queue_ceiling_reports_paused_reason_without_evicting_existing_evidence() {
     assert_eq!(body, q.body);
 }
 
+#[cfg(unix)]
 #[test]
 fn typed_acknowledgement_retires_only_expired_acknowledged_payloads() {
     let (_dir, mut store, b) = setup();
@@ -805,6 +838,7 @@ fn malformed_and_duplicate_mapping_keys_are_refused_without_source_excerpt() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn global_revoke_and_reenable_cannot_resurrect_an_active_turn() {
     let (_dir, mut store, _) = setup();
@@ -821,6 +855,7 @@ fn global_revoke_and_reenable_cannot_resurrect_an_active_turn() {
     assert!(s.needs_attention);
     assert_eq!(store.status().unwrap().unfinished, 0);
 }
+#[cfg(unix)]
 #[test]
 fn removed_harness_and_reapproval_cannot_count_the_unapproved_interval() {
     let (_dir, mut store, _) = setup();
@@ -838,6 +873,7 @@ fn removed_harness_and_reapproval_cannot_count_the_unapproved_interval() {
     );
     assert!(s.needs_attention);
 }
+#[cfg(unix)]
 #[test]
 fn refused_stop_cannot_be_replaced_by_the_time_of_a_later_duplicate_stop() {
     let (dir, mut store, _) = setup();
@@ -859,6 +895,7 @@ fn refused_stop_cannot_be_replaced_by_the_time_of_a_later_duplicate_stop() {
     assert!(store.status().unwrap().storage_paused);
 }
 
+#[cfg(unix)]
 #[test]
 fn refusal_is_reconciled_before_pause_and_resume_clock_transitions() {
     let (dir, mut store, _) = setup();
@@ -895,6 +932,7 @@ fn refusal_is_reconciled_before_pause_and_resume_clock_transitions() {
         .unwrap();
     assert_eq!(clocks, 0);
 }
+#[cfg(unix)]
 #[test]
 fn refusal_published_while_terminal_waits_for_sqlite_is_not_a_stale_authorization() {
     let (dir, mut store, _) = setup();
@@ -925,6 +963,7 @@ fn refusal_published_while_terminal_waits_for_sqlite_is_not_a_stale_authorizatio
     );
     assert!(session.needs_attention);
 }
+#[cfg(unix)]
 #[test]
 fn observed_mapping_invalidation_is_durable_until_explicit_reapproval() {
     for remote in [false, true] {
@@ -967,6 +1006,7 @@ fn observed_mapping_invalidation_is_durable_until_explicit_reapproval() {
         assert!(store.claim(&binding, clock(170).wall).unwrap().is_some());
     }
 }
+#[cfg(unix)]
 #[test]
 fn repo_disable_checkpoints_previously_earned_fragments_without_another_native_hook() {
     let (_dir, mut store, binding) = setup();
@@ -978,6 +1018,7 @@ fn repo_disable_checkpoints_previously_earned_fragments_without_another_native_h
     let (_, body) = body(&mut store, &binding, 100);
     assert_eq!(body["segments"][0]["duration_seconds"], 30);
 }
+#[cfg(unix)]
 #[test]
 fn idle_maintenance_expires_only_acknowledged_bodies_with_an_injected_clock() {
     let (dir, mut store, binding) = setup();
@@ -1001,6 +1042,7 @@ fn idle_maintenance_expires_only_acknowledged_bodies_with_an_injected_clock() {
     assert_eq!(store.preview("expired").unwrap().len(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn refusal_quarantine_survives_recover_reapproval_and_an_inflight_retry_finish() {
     let (dir, mut store, binding) = setup();
@@ -1033,6 +1075,7 @@ fn refusal_quarantine_survives_recover_reapproval_and_an_inflight_retry_finish()
         .unwrap();
     assert_eq!(frozen, original);
 }
+#[cfg(unix)]
 #[test]
 fn observing_repository_in_sync_abandons_clocks_before_identity_can_be_restored() {
     let (_dir, mut store, binding) = setup();
@@ -1049,6 +1092,7 @@ fn observing_repository_in_sync_abandons_clocks_before_identity_can_be_restored(
     assert!(store.claim(&binding, clock(100).wall).unwrap().is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_stop_from_an_unapproved_repository_cannot_leave_the_same_native_clock_alive() {
     let (_dir, mut store, _) = setup();
@@ -1075,6 +1119,7 @@ fn a_stop_from_an_unapproved_repository_cannot_leave_the_same_native_clock_alive
     assert!(session.needs_attention);
 }
 
+#[cfg(unix)]
 #[test]
 fn native_resume_during_capture_pause_abandons_old_turn_for_both_harnesses() {
     for source in ["codex", "claude-code"] {

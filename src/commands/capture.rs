@@ -175,6 +175,11 @@ pub async fn run(
     global: &GlobalFlags,
     _mode: OutputMode,
 ) -> Result<(), AppError> {
+    if cfg!(not(unix)) {
+        return Err(AppError::Config(
+            "Automatic capture is unsupported on this platform; manual time commands remain available".into(),
+        ));
+    }
     match cmd.command {
         CaptureSubcommand::Hook {
             agent,

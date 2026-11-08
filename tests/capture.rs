@@ -30,6 +30,7 @@ fn private_process(
 
 // Acceptance evidence for CAP/MAP/SEC: a missing command is the intentional red
 // baseline, not an authentication or fixture failure.
+#[cfg(unix)]
 #[test]
 fn capture_status_is_a_local_metadata_only_command() {
     let home = tempfile::tempdir().unwrap();
@@ -42,6 +43,7 @@ fn capture_status_is_a_local_metadata_only_command() {
         .stdout(predicate::str::contains("\"delivery_verified\": false"));
 }
 
+#[cfg(unix)]
 #[test]
 fn capture_setup_requires_explicit_local_consent_and_targets() {
     let home = tempfile::tempdir().unwrap();
@@ -52,6 +54,7 @@ fn capture_setup_requires_explicit_local_consent_and_targets() {
         .stderr(predicate::str::contains("--agent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn capture_hook_discards_sensitive_input_without_a_mapping() {
     let home = tempfile::tempdir().unwrap();
@@ -99,6 +102,7 @@ fn scripted_source_setup_without_targets_stops_before_installation() {
     assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn replaced_worker_runtime_is_refused_before_loading_credentials_or_network() {
     let home = tempfile::tempdir().unwrap();

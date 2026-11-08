@@ -7,6 +7,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 pub const GUARD_CONTRACT: u32 = 1;
+#[cfg(unix)]
 static IMAGE_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct CaptureRuntimeIdentity {
