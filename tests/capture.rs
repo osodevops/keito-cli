@@ -71,3 +71,9 @@ fn scripted_source_setup_without_targets_stops_before_installation() {
         .stderr(predicate::str::contains("--host"));
     assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn replaced_worker_runtime_is_refused_before_loading_credentials_or_network() {
+    Command::cargo_bin("keito").unwrap().args(["capture","worker","--expected-runtime-hash","0000000000000000000000000000000000000000000000000000000000000000","--json"])
+        .assert().failure().stderr(predicate::str::contains("runtime changed"));
+}

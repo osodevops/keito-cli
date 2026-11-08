@@ -232,3 +232,14 @@ async fn setup_validates_auth_project_and_task_before_persisting_approval() {
     let store = Store::open(&home.path().join("capture")).unwrap();
     assert_eq!(store.status().unwrap().bindings.len(), 1);
 }
+
+#[tokio::test]
+async fn paused_or_revoked_local_consent_performs_no_network_even_preflight() {
+    for action in ["pause","disable"] {
+        let server=MockServer::start().await;let home=tempfile::tempdir().unwrap();let root=home.path().join("repo");init(&root);
+        let(mut store,_)=seed(home.path(),&root,&server.uri());let repo=Repository::resolve(&root).unwrap();
+        store.control(&repo,action,&Clock{wall:1_794_067_300,monotonic:110,boot:"fixture".into()}).unwrap();
+        command(home.path(),&root,&server.uri()).args(["capture","sync","--json"]).assert().success();
+        assert!(server.received_requests().await.unwrap().is_empty(),"Local disable must not cause authentication or capture requests");
+    }
+}
