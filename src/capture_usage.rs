@@ -432,6 +432,8 @@ fn parse_snapshot(
     let mut contexts: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut candidates = Vec::new();
     let mut held_requests = BTreeSet::new();
+    let mut provisional_requests = BTreeSet::new();
+    let mut final_requests = BTreeSet::new();
     let mut started_turns = BTreeSet::new();
     let mut completed_turns = BTreeSet::new();
     let mut interrupted_turns = BTreeSet::new();
@@ -472,16 +474,23 @@ fn parse_snapshot(
                 if !raw.message.id.starts_with("msg_") {
                     return Err(UsageReadError::InvalidRecord);
                 }
-                // Only these request boundaries were actually observed in the
-                // pinned probe. Unknown/partial snapshots are not final usage.
-                // A later snapshot cannot silently repair an unqualified stream.
-                if !matches!(
-                    raw.message.stop_reason,
-                    Some(ClaudeStopReason::ToolUse | ClaudeStopReason::EndTurn)
-                ) {
-                    held_requests.insert(raw.message.id);
-                    limitations.insert("UNKNOWN_REQUEST_FINALITY");
-                    continue;
+                // Provisional stream counters are cumulative snapshots, not
+                // deltas. Ignore them, then consume a qualified final once.
+                // Actual same-ID stream delivery remains a qualification gate;
+                // the policy follows the primary final-usage contract.
+                match raw.message.stop_reason {
+                    None => {
+                        provisional_requests.insert(raw.message.id);
+                        continue;
+                    }
+                    Some(ClaudeStopReason::Unqualified) => {
+                        held_requests.insert(raw.message.id);
+                        limitations.insert("UNKNOWN_REQUEST_FINALITY");
+                        continue;
+                    }
+                    Some(ClaudeStopReason::ToolUse | ClaudeStopReason::EndTurn) => {
+                        final_requests.insert(raw.message.id.clone());
+                    }
                 }
                 let usage = raw.message.usage;
                 if usage.is_none() {
@@ -623,6 +632,14 @@ fn parse_snapshot(
     }
     if approved.harness == Harness::Codex && !saw_meta {
         return Err(UsageReadError::InvalidSession);
+    }
+    if provisional_requests
+        .difference(&final_requests)
+        .next()
+        .is_some()
+    {
+        // This is resolvable incomplete coverage, not a permanent conflict.
+        limitations.insert("PENDING_REQUEST_FINALITY");
     }
     let mut requests: BTreeMap<String, Option<RequestUsage>> = BTreeMap::new();
     for mut request in candidates {

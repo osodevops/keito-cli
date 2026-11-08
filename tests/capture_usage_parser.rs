@@ -177,8 +177,8 @@ fn stale_or_missing_codex_source_version_and_missing_native_id_are_refused() {
 }
 
 #[test]
-fn unqualified_claude_request_finality_is_held_even_if_other_snapshot_looks_final() {
-    for stop in [Value::Null, json!("unknown"), json!("max_tokens")] {
+fn unsupported_nonnull_claude_finality_remains_explicitly_held() {
+    for stop in [json!("unknown"), json!("max_tokens")] {
         let mut partial = claude("msg_1", 5);
         partial["message"]["stop_reason"] = stop;
         let f = Fixture::new(
@@ -190,6 +190,76 @@ fn unqualified_claude_request_finality_is_held_even_if_other_snapshot_looks_fina
         assert_eq!(e.requests[0].source_record_id, "msg_2");
         assert!(e.limitations.contains(&"UNKNOWN_REQUEST_FINALITY"));
     }
+}
+
+#[test]
+fn provisional_claude_frames_yield_to_one_qualified_final_record() {
+    // Synthetic stream ordering exercises the proposed contract; the real
+    // pinned probe did not observe same-ID provisional-to-final delivery.
+    for absent in [false, true] {
+        for final_first in [false, true] {
+            let mut provisional = claude("msg_1", 1);
+            provisional["message"]["stop_reason"] = Value::Null;
+            if absent {
+                provisional["message"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("stop_reason");
+            }
+            let final_record = claude("msg_1", 81);
+            let rows = if final_first {
+                vec![
+                    final_record.clone(),
+                    provisional.clone(),
+                    provisional,
+                    final_record,
+                ]
+            } else {
+                vec![
+                    provisional.clone(),
+                    provisional,
+                    final_record.clone(),
+                    final_record,
+                ]
+            };
+            let f = Fixture::new(Harness::ClaudeCode, rows);
+            let e = f.read().unwrap();
+            assert_eq!(e.requests.len(), 1);
+            assert_eq!(e.requests[0].output_tokens, Some(81));
+            assert!(!e.limitations.contains(&"UNKNOWN_REQUEST_FINALITY"));
+            assert!(!e.limitations.contains(&"PENDING_REQUEST_FINALITY"));
+            assert!(!e.limitations.contains(&"CONFLICTING_REQUEST_RECORDS"));
+            assert_eq!(e.coverage, "PARTIAL");
+        }
+    }
+}
+
+#[test]
+fn provisional_only_claude_request_is_pending_and_can_resolve_in_a_later_snapshot() {
+    let mut provisional = claude("msg_1", 1);
+    provisional["message"]["stop_reason"] = Value::Null;
+    let f = Fixture::new(
+        Harness::ClaudeCode,
+        vec![provisional.clone(), claude("msg_2", 3)],
+    );
+    let pending = f.read().unwrap();
+    assert_eq!(pending.requests.len(), 1);
+    assert_eq!(pending.requests[0].source_record_id, "msg_2");
+    assert!(pending.limitations.contains(&"PENDING_REQUEST_FINALITY"));
+    assert!(!pending.limitations.contains(&"UNKNOWN_REQUEST_FINALITY"));
+    f.write(vec![provisional, claude("msg_1", 81), claude("msg_2", 3)]);
+    let resolved = f.read().unwrap();
+    assert_eq!(resolved.requests.len(), 2);
+    assert_eq!(
+        resolved
+            .requests
+            .iter()
+            .map(|r| r.output_tokens.unwrap())
+            .sum::<u64>(),
+        84
+    );
+    assert!(!resolved.limitations.contains(&"PENDING_REQUEST_FINALITY"));
+    assert_eq!(resolved.coverage, "PARTIAL");
 }
 
 #[test]
@@ -280,7 +350,7 @@ fn codex_resume_uses_response_deltas_not_cumulative_totals() {
     assert!(!serde_json::to_string(&e).unwrap().contains("999999"));
 }
 #[test]
-fn duplicate_delivery_is_deduped_but_partial_stream_snapshot_is_held() {
+fn identical_terminal_delivery_is_deduped_but_conflicting_terminal_records_are_held() {
     let f = Fixture::new(
         Harness::ClaudeCode,
         vec![claude("msg_1", 5), claude("msg_1", 5)],
