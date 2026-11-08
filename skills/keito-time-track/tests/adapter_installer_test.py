@@ -390,7 +390,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         config = self.config_path("codex")
         receipt = self.home / ".codex/skills/keito-time-track/capture-install.json"
         before = config.read_bytes()
-        for content in (b'[]', b'null', b'"text"', b'\xff', b'{"files":[]}'):
+        for content in (b'[]', b'null', b'"text"', b'\xff', b'{"files":[]}', b'[' * 1200 + b'0' + b']' * 1200):
             with self.subTest(content=repr(content)):
                 receipt.write_bytes(content)
                 result = self.uninstall()
@@ -525,6 +525,91 @@ m.apply('codex','install',SimpleNamespace(confirm_migration=False,harness_versio
         setup = [c for c in self.recorded() if "setup" in c["args"]]
         self.assertEqual(len(setup), 1)
         self.assertIn("--install-worker", setup[0]["args"])
+
+    def test_executing_shell_substitution_is_preserved_as_ambiguous_hook(self):
+        self.assertEqual(self.install().returncode, 0)
+        config = self.config_path("codex")
+        current = self.read_config()
+        command = current["hooks"]["Stop"][0]["hooks"][0]["command"]
+        literal_argv = shlex.split(command)[1:]
+        marker = self.root / "audit-helper-ran"
+        helper = self.root / "audit-helper"
+        helper.write_text("#!/bin/sh\nprintf ran > " + shlex.quote(str(marker)) + "\nprintf '%s\\n' " + shlex.quote(str(self.bin)) + "\n")
+        helper.chmod(0o700)
+        extra = {"type": "command", "command": "KEITO_CLI_BIN=$(audit-helper) " + shlex.join(literal_argv)}
+        current["hooks"]["Stop"].append({"hooks": [extra]})
+        config.write_text(json.dumps(current))
+        env = {**self.env, "PATH": str(self.root) + os.pathsep + self.env["PATH"]}
+        executed = subprocess.run(["bash", "-c", extra["command"]], input="{}", capture_output=True, text=True, env=env, timeout=2)
+        self.assertEqual((executed.returncode, executed.stdout, executed.stderr), (0, "", ""))
+        self.assertEqual(marker.read_text(), "ran")
+        self.assertEqual(self.install().returncode, 0)
+        self.assertIn(extra, [h for g in self.read_config()["hooks"]["Stop"] for h in g["hooks"]])
+        self.assertEqual(self.uninstall().returncode, 0)
+        self.assertIn(extra, [h for g in self.read_config()["hooks"]["Stop"] for h in g["hooks"]])
+
+    def test_external_settings_edit_after_journal_fsync_is_preserved_and_reported(self):
+        self.assertEqual(self.install().returncode, 0)
+        config = self.config_path("codex")
+        journal = config.parent / ".keito-capture-publication.json"
+        external = b'{"external":"latest-setting-after-journal"}'
+        spec = importlib.util.spec_from_file_location("installer_late_writer", SKILL / "installers/manage-hooks.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fsync = module.os.fsync
+        changed = False
+        def edit_after_fsync(fd):
+            nonlocal changed
+            fsync(fd)
+            if journal.exists() and not changed:
+                changed = True
+                config.write_bytes(external)
+        args = SimpleNamespace(confirm_migration=False, harness_version="0.167.1")
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(module.os, "fsync", side_effect=edit_after_fsync):
+            with self.assertRaises(module.SafeError):
+                module.apply("codex", "install", args, str(self.bin))
+        self.assertTrue(changed)
+        self.assertEqual(config.read_bytes(), external)
+        self.assertTrue((self.home / ".codex/skills/keito-time-track/SKILL.md").is_file())
+
+    def test_generation_without_execute_permission_cannot_be_reused_as_installed(self):
+        self.assertEqual(self.install().returncode, 0)
+        config = self.config_path("codex")
+        before = config.read_bytes()
+        command = self.read_config()["hooks"]["Stop"][0]["hooks"][0]["command"]
+        executable = Path(next(p for p in shlex.split(command) if p.endswith('/hooks/dispatch.sh')))
+        executable.chmod(0o600)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("review", result.stderr.lower())
+        self.assertEqual(config.read_bytes(), before)
+        self.assertEqual(executable.stat().st_mode & 0o777, 0o600)
+
+    def test_deep_install_and_mapping_recovery_metadata_fail_without_traceback(self):
+        self.assertEqual(self.install().returncode, 0)
+        config = self.config_path("codex")
+        before = config.read_bytes()
+        nested = b'[' * 1200 + b'0' + b']' * 1200
+        journal = config.parent / ".keito-capture-publication.json"
+        journal.write_bytes(nested)
+        result = self.uninstall()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn(str(self.home), result.stderr)
+        self.assertEqual((config.read_bytes(), journal.read_bytes()), (before, nested))
+        subprocess.run(["git", "-c", "init.templateDir=", "init", "--quiet", str(self.root)], check=True, env=self.env)
+        directory = self.root / ".keito"
+        directory.mkdir()
+        hint = directory / "config.yml"
+        old = b'{"project_id":"preserve"}'
+        hint.write_bytes(old)
+        mapping_journal = directory / ".capture-mapping-recovery.json"
+        mapping_journal.write_bytes(nested)
+        result = self.run_script("scripts/setup-wizard.sh", "--agent", "codex", payload="1\n1\n1\ny\n", env={**self.env, "FAKE_PICKER": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual((hint.read_bytes(), mapping_journal.read_bytes()), (old, nested))
 
     def test_management_scripts_delegate_without_legacy_state(self):
         for path, args, expected in [

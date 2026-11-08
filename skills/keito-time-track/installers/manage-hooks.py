@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ import uuid
 
 SOURCE = Path(__file__).resolve().parents[1]
 CONTRACT = 1
+_UNSET = object()
 OWNED_PLUGIN = 'keito-time-track@keito'
 SCRIPTS = {'dispatch.sh', 'session-start.sh', 'session-end.sh', 'session-finalize.sh', 'prompt.sh', 'stop.sh', 'interrupt.sh'}
 EVENTS = {'SessionStart': 'session-start', 'UserPromptSubmit': 'prompt', 'Stop': 'stop', 'SessionEnd': 'session-end'}
@@ -69,9 +71,38 @@ def read_config(file):
     return data, original
 
 
+def literal_shell_command(command):
+    """Conservative literal-word subset; shlex alone does not model expansion.
+
+    Preserve ambiguous shell programs instead of deleting unrelated execution.
+    Quoted literal metacharacters in actual file paths remain supported.
+    """
+    quote = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char in '\r\n':
+            return False
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == "\\":
+            index += 1
+            if index >= len(command):
+                return False
+        elif char == "'" and quote is None:
+            quote = "'"
+        elif char == '"':
+            quote = None if quote == '"' else '"'
+        elif char in '$`' or (quote is None and char in ';&|<>(){}*?[]~#'):
+            return False
+        index += 1
+    return quote is None
+
+
 def owned_hook(hook, dest):
     """Recognize invoked executables/known integration arguments, never path data."""
-    if hook.get('type') != 'command' or not isinstance(hook.get('command'), str):
+    if hook.get('type') != 'command' or not isinstance(hook.get('command'), str) or not literal_shell_command(hook['command']):
         return False
     try:
         argv = shlex.split(hook['command'])
@@ -154,8 +185,21 @@ def receipt_valid(dest):
         if any(not isinstance(name, str) or PurePosixPath(name).is_absolute() or '..' in PurePosixPath(name).parts
                or not isinstance(digest, str) or not re.fullmatch('[a-f0-9]{64}', digest) for name, digest in files.items()):
             return False
+        # Content hashes do not establish that the referenced payload can run.
+        # Verify regular files, readable/traversable directories and executable
+        # shell entrypoints before reusing or reporting a generation installed.
+        for directory in [dest, *[p for p in dest.rglob('*') if p.is_dir()]]:
+            if directory.is_symlink() or (directory.stat().st_mode & 0o500) != 0o500:
+                return False
+        for name in files:
+            file = dest / name
+            mode = file.stat().st_mode
+            if file.is_symlink() or not stat.S_ISREG(mode) or not mode & 0o400:
+                return False
+            if name.endswith('.sh') and (not mode & 0o100 or not os.access(file, os.X_OK)):
+                return False
         return files == tree_hashes(dest)
-    except (ValueError, OSError):
+    except (ValueError, OSError, RecursionError):
         return False
 
 
@@ -201,7 +245,7 @@ def sync_directory(directory):
         os.close(fd)
 
 
-def atomic_bytes(file, content):
+def atomic_bytes(file, content, expected=_UNSET):
     handle, name = tempfile.mkstemp(prefix='.' + file.name + '.keito-', dir=file.parent)
     temporary = Path(name)
     try:
@@ -209,6 +253,11 @@ def atomic_bytes(file, content):
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+        if expected is not _UNSET and (file.is_symlink() or (file.read_bytes() if file.exists() else None) != expected):
+            raise SafeError('Hook settings changed before publication. The external edit was preserved; review it before retrying.')
+        # This last comparison detects journal/temp-fsync window edits. It is
+        # not universal CAS against applications that ignore the install lock:
+        # a writer can still race between this comparison and os.replace.
         os.replace(temporary, file)
         sync_directory(file.parent)
     finally:
@@ -230,7 +279,7 @@ def recover(host, dest):
             raise ValueError()
         if data.get('stage') is not None and not re.fullmatch(r'\.keito-time-track-stage-[A-Za-z0-9_-]+', data['stage']):
             raise ValueError()
-    except (ValueError, OSError, TypeError):
+    except (ValueError, OSError, TypeError, RecursionError):
         raise SafeError('Installation recovery metadata needs review; no recovery paths were followed.')
     backup = dest.parent / data['backup']
     stage = dest.parent / data['stage'] if data['stage'] else None
@@ -312,7 +361,7 @@ def apply(agent, action, args, binary):
                 if generation.exists():
                     if generation.is_symlink() or not receipt_valid(generation) or tree_hashes(generation) != tree_hashes(generation_stage):
                         shutil.rmtree(generation_stage)
-                        raise SafeError('An immutable adapter generation changed; review it before installing.')
+                        raise SafeError('An immutable adapter generation changed or cannot execute. Review trusted file permissions and release integrity before reinstalling; no hook configuration was changed.')
                     shutil.rmtree(generation_stage)
                 else:
                     os.replace(generation_stage, generation)
@@ -333,7 +382,7 @@ def apply(agent, action, args, binary):
             atomic_bytes(journal, (json.dumps(recovery) + '\n').encode())
             # New registered executables are already durable and immutable.
             # Switch JSON before touching the discoverable skill directory.
-            atomic_bytes(config, (json.dumps(next_data, indent=2, ensure_ascii=False) + '\n').encode())
+            atomic_bytes(config, (json.dumps(next_data, indent=2, ensure_ascii=False) + '\n').encode(), expected=original)
             if dest.exists():
                 os.replace(dest, backup)
             if stage:
@@ -391,6 +440,6 @@ if __name__ == '__main__':
     except SafeError as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         print('Keito installer could not complete. Review local permissions and retained recovery files before retrying.', file=sys.stderr)
         sys.exit(1)

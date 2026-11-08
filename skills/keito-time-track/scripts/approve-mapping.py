@@ -70,7 +70,7 @@ def restore(hint, journal):
             raise ValueError()
         if type(data['mode']) is not int or data['mode'] < 0 or data['mode'] > 0o777 or not re.fullmatch('[a-f0-9]{64}', data['candidate_sha256']):
             raise ValueError()
-    except (ValueError, TypeError, OSError):
+    except (ValueError, TypeError, OSError, RecursionError):
         raise SafeError('Mapping recovery metadata needs review. Inspect capture status before retrying.')
     current = hint.read_bytes() if hint.exists() else None
     if current == original:
@@ -178,6 +178,6 @@ if __name__ == '__main__':
     except SafeError as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         print('Setup could not complete safely. Review mapping/recovery files and keito capture status before retrying.', file=sys.stderr)
         sys.exit(1)
