@@ -26,10 +26,11 @@ command -v "$keito_cmd" >/dev/null 2>&1 || exit 0
 worker=$!
 # The core commits SQLite locally before it acknowledges. Killing a stalled
 # process is safe; the next event/status exposes missing or incomplete evidence.
+# Budget TERM/KILL inside one second, including launch and cleanup margin.
 (
-  sleep 1
+  sleep 0.65
   kill -TERM "$worker" >/dev/null 2>&1 || exit 0
-  sleep 0.05
+  sleep 0.025
   kill -KILL "$worker" >/dev/null 2>&1 || true
 ) >/dev/null 2>&1 &
 watchdog=$!

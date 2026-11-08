@@ -3,9 +3,15 @@
 set -euo pipefail
 keito_cmd=${KEITO_CLI_BIN:-keito}
 agents=()
+worker=()
 while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--install-worker' ]; then
+    worker=(--install-worker)
+    shift
+    continue
+  fi
   if [ "$1" != '--agent' ] || [ "$#" -lt 2 ]; then
-    echo 'Usage: setup-wizard.sh --agent claude-code|codex [--agent claude-code|codex]' >&2
+    echo 'Usage: setup-wizard.sh --agent claude-code|codex [--agent claude-code|codex] [--install-worker]' >&2
     exit 1
   fi
   case "$2" in claude-code|codex) agents+=(--agent "$2") ;; *) echo 'Select a supported adapter explicitly.' >&2; exit 1 ;; esac
@@ -51,28 +57,24 @@ project_id=$(select_id "$projects" project)
 tasks=$("$keito_cmd" --json --workspace "$workspace_id" projects tasks "$project_id")
 task_id=$(select_id "$tasks" task)
 echo "Review mapping: workspace $workspace_id; client $client_id; project $project_id; task $task_id."
-echo 'Capture sends only allowlisted identity, completed intervals and supported numeric usage evidence.'
+echo 'Capture sends allowlisted identities and observed interval metadata. Numeric usage is unavailable in this candidate.'
 echo 'Prompts, responses, transcripts, code, full paths and branch names are not uploaded.'
 echo 'Activity remains pending review and nonbillable. Existing repository config is only a mapping hint.'
+if [ "${#worker[@]}" -gt 0 ]; then
+  echo 'This setup also requests a local background uploader service for this user.'
+else
+  echo 'This setup approves local queuing only; automatic delivery requires explicit --install-worker setup.'
+fi
+if [ -e "$repo_root/.keito/config.yml" ] || [ -L "$repo_root/.keito/config.yml" ]; then
+  echo 'An existing mapping hint will be replaced for setup; failure restores it. Inspect status after interruption.'
+fi
 printf 'Approve this repository mapping and metadata-only capture on this device? [y/N] '
 read -r confirm
 case "$confirm" in y|Y|yes|YES) ;; *) echo 'Setup cancelled; no mapping approved.'; exit 0 ;; esac
-config_dir="$repo_root/.keito"
-config_path="$config_dir/config.yml"
-if [ -L "$config_dir" ] || [ -L "$config_path" ]; then
-  echo 'Refusing a symlinked repository mapping. Review it before approving capture.' >&2
-  exit 1
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+if [ "${#worker[@]}" -gt 0 ]; then
+  agents+=(--install-worker)
 fi
-umask 077
-mkdir -p "$config_dir"
-config_tmp=$(mktemp "$config_dir/.config.yml.capture-XXXXXX")
-trap 'rm -f "$config_tmp"' EXIT
-# JSON is a strict YAML subset. Only explicit mapping/policy fields are written.
-jq -n --arg workspace "$workspace_id" --arg client "$client_id" --arg project "$project_id" --arg task "$task_id" \
-  '{version:1,workspace_id:$workspace,client_id:$client,project_id:$project,task_id:$task,
-    agent_tracking:{enabled:true,source:"agent",redact_notes:true}}' > "$config_tmp"
-mv "$config_tmp" "$config_path"
-trap - EXIT
-cd "$repo_root"
-exec "$keito_cmd" --workspace "$workspace_id" capture setup "${agents[@]}" \
-  --project "$project_id" --task "$task_id" --confirm
+exec python3 "$script_dir/approve-mapping.py" --root "$repo_root" \
+  --workspace "$workspace_id" --client "$client_id" --project "$project_id" --task "$task_id" \
+  "${agents[@]}" --confirm

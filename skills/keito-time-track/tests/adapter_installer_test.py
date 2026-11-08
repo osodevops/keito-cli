@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import tempfile
 import time
@@ -49,9 +50,18 @@ if os.environ.get('FAKE_PICKER') == '1':
         print(json.dumps([{'id': 'p1', 'name': 'Synthetic project'}]))
     else:
         print('{}')
+    if 'setup' in sys.argv:
+        if os.environ.get('FAKE_SETUP_MARKER'):
+            Path(os.environ['FAKE_SETUP_MARKER']).write_text('consent may be committed')
+        time.sleep(float(os.environ.get('FAKE_SETUP_SLEEP', '0')))
+        sys.exit(int(os.environ.get('FAKE_SETUP_EXIT', '0')))
     sys.exit(0)
 print('PRIVATE_CLI_OUTPUT_CANARY')
 print('PRIVATE_CLI_ERROR_CANARY', file=sys.stderr)
+if os.environ.get('FAKE_IGNORE_TERM'):
+    __import__('signal').signal(__import__('signal').SIGTERM, __import__('signal').SIG_IGN)
+    if os.environ.get('FAKE_TERM_MARKER'):
+        Path(os.environ['FAKE_TERM_MARKER']).write_text('TERM ignored')
 time.sleep(float(os.environ.get('FAKE_SLEEP', '0')))
 sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
 """)
@@ -105,7 +115,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
     def test_stalled_core_has_one_second_fail_open_ceiling(self):
         started = time.monotonic()
         result = self.run_script("hooks/stop.sh", payload="{}", env={**self.env, "FAKE_SLEEP": "3"})
-        self.assertLess(time.monotonic() - started, 1.6)
+        self.assertLess(time.monotonic() - started, 1.0)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
 
     def test_unknown_agent_does_not_invent_identity(self):
@@ -262,7 +272,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         spec.loader.exec_module(module)
         replace = module.os.replace
         def fail_config(source, destination):
-            if Path(destination) == config:
+            if Path(destination).resolve() == config.resolve():
                 raise OSError("synthetic interrupted replacement")
             return replace(source, destination)
         args = SimpleNamespace(confirm_migration=False, harness_version="0.167.1")
@@ -334,6 +344,187 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         result = self.run_script("hooks/stop.sh", payload="{}", env={**self.env, "KEITO_HARNESS_VERSION": "0.167.0+build"})
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertEqual(self.recorded(), [])
+
+    def test_unrelated_commands_mentioning_adapter_as_data_survive_install_and_uninstall(self):
+        config = self.config_path("codex")
+        config.parent.mkdir()
+        script = str(self.home / ".codex/skills/keito-time-track/hooks/dispatch.sh")
+        commands = ["printf '%s' " + shlex.quote(script), "audit " + shlex.quote(script),
+                    "bash -c " + shlex.quote("echo " + script),
+                    shlex.quote(script) + " --agent codex --event stop --harness-version 0.167.0 && echo other"]
+        hooks = [{"type": "command", "command": command} for command in commands]
+        config.write_text(json.dumps({"hooks": {"Stop": [{"hooks": hooks}]}}))
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for original in hooks:
+            self.assertIn(original, [h for g in self.read_config()["hooks"]["Stop"] for h in g["hooks"]])
+        self.assertEqual(self.uninstall().returncode, 0)
+        self.assertEqual(self.read_config()["hooks"]["Stop"][0]["hooks"], hooks)
+
+    def test_symlinked_harness_or_skills_parents_refuse_install_and_uninstall(self):
+        for parent_name in (".codex", ".codex/skills", ".claude", ".claude/skills"):
+            with self.subTest(parent=parent_name):
+                case_home = self.root / ("case-" + parent_name.replace('/', '-'))
+                case_home.mkdir()
+                target = self.root / ("outside-" + parent_name.replace('/', '-'))
+                target.mkdir()
+                marker = target / "preserve.txt"
+                marker.write_text("outside must remain intact")
+                link = case_home / parent_name
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(target, target_is_directory=True)
+                agent = "codex" if parent_name.startswith(".codex") else "claude-code"
+                env = {**self.env, "HOME": str(case_home)}
+                before = sorted(str(p.relative_to(target)) for p in target.rglob('*'))
+                for action in ("install", "uninstall"):
+                    script = f"installers/install-{agent}.sh" if action == "install" else "installers/uninstall.sh"
+                    args = ["--harness-version", "0.167.0"] if action == "install" else ["--agent", agent]
+                    result = self.run_script(script, *args, env=env)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(sorted(str(p.relative_to(target)) for p in target.rglob('*')), before)
+                    self.assertEqual(marker.read_text(), "outside must remain intact")
+
+    def test_malformed_receipt_shapes_fail_with_sanitized_recovery_and_no_mutations(self):
+        self.assertEqual(self.install().returncode, 0)
+        config = self.config_path("codex")
+        receipt = self.home / ".codex/skills/keito-time-track/capture-install.json"
+        before = config.read_bytes()
+        for content in (b'[]', b'null', b'"text"', b'\xff', b'{"files":[]}'):
+            with self.subTest(content=repr(content)):
+                receipt.write_bytes(content)
+                result = self.uninstall()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertNotIn(str(self.home), result.stderr)
+                self.assertIn("review", result.stderr.lower())
+                self.assertEqual((config.read_bytes(), receipt.read_bytes()), (before, content))
+
+    def test_stalled_term_ignoring_core_returns_before_installed_host_deadline(self):
+        self.assertEqual(self.install().returncode, 0)
+        command = self.read_config()["hooks"]["Stop"][0]["hooks"][0]["command"]
+        marker = self.root / "term-handler-armed"
+        started = time.monotonic()
+        result = subprocess.run(["bash", "-c", command], input="{}", text=True, capture_output=True,
+                                env={**self.env, "FAKE_SLEEP": "3", "FAKE_IGNORE_TERM": "1", "FAKE_TERM_MARKER": str(marker)}, timeout=1.0)
+        self.assertTrue(marker.exists(), "Fixture must install its TERM-ignore handler")
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
+    def test_failed_setup_restores_previous_hint_even_after_possible_consent_commit(self):
+        subprocess.run(["git", "-c", "init.templateDir=", "init", "--quiet", str(self.root)], check=True, env=self.env)
+        hint = self.root / ".keito/config.yml"
+        hint.parent.mkdir()
+        old = b'{"workspace_id":"old","project_id":"oldproject","task_id":"oldtask","agent_tracking":{"enabled":false}}'
+        hint.write_bytes(old)
+        marker = self.root / "consent-marker"
+        result = self.run_script("scripts/setup-wizard.sh", "--agent", "codex", payload="1\n1\n1\ny\n",
+            env={**self.env, "FAKE_PICKER": "1", "FAKE_SETUP_EXIT": "9", "FAKE_SETUP_MARKER": str(marker)})
+        self.assertEqual(result.returncode, 9)
+        self.assertTrue(marker.exists())
+        self.assertEqual(hint.read_bytes(), old)
+        self.assertIn("existing", result.stdout.lower())
+        self.assertIn("status", result.stderr.lower())
+
+    def test_install_survives_real_signals_at_each_publication_boundary_and_recovers(self):
+        self.assertEqual(self.install().returncode, 0)
+        child = r"""import importlib.util,os,pathlib,signal,sys
+from types import SimpleNamespace
+sys.dont_write_bytecode=True
+spec=importlib.util.spec_from_file_location('installer',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+real=m.os.replace
+boundary=sys.argv[3];sig=int(sys.argv[4])
+def replace(src,dst):
+    src,dst=pathlib.Path(src),pathlib.Path(dst)
+    hit=(boundary=='payload-backup' and src.name=='keito-time-track') or (boundary=='config-before' and dst.name=='hooks.json') or (boundary=='config-after' and dst.name=='hooks.json') or (boundary=='generation' and dst.parent.name=='.keito-capture-generations')
+    if hit and boundary=='config-before':os.kill(os.getpid(),sig)
+    real(src,dst)
+    if hit and boundary!='config-before':os.kill(os.getpid(),sig)
+m.os.replace=replace
+m.apply('codex','install',SimpleNamespace(confirm_migration=False,harness_version='0.167.1-'+boundary+'-'+str(sig)),sys.argv[2])
+"""
+        for boundary in ("payload-backup", "config-before", "config-after", "generation"):
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                with self.subTest(boundary=boundary, signal=sig):
+                    self.assertEqual(self.install().returncode, 0)
+                    result = subprocess.run([sys.executable, "-c", child, str(SKILL / "installers/manage-hooks.py"),
+                                             str(self.bin), boundary, str(int(sig))], env=self.env, capture_output=True, text=True, timeout=15)
+                    self.assertIn(result.returncode, (-sig, 128 + sig), result.stderr)
+                    for groups in self.read_config()["hooks"].values():
+                        for group in groups:
+                            for hook in group["hooks"]:
+                                argv = shlex.split(hook["command"])
+                                executable = next(token for token in argv if token.endswith('/hooks/dispatch.sh'))
+                                self.assertTrue(Path(executable).is_file(), "Registered payload must remain available after process death")
+                    recovery = self.install()
+                    self.assertEqual(recovery.returncode, 0, recovery.stderr)
+                    self.assertTrue((self.home / ".codex/skills/keito-time-track/SKILL.md").is_file())
+
+    def test_mapping_signal_failure_restores_or_recovers_hint_without_replaying_consent(self):
+        subprocess.run(["git", "-c", "init.templateDir=", "init", "--quiet", str(self.root)], check=True, env=self.env)
+        hint = self.root / ".keito/config.yml"
+        hint.parent.mkdir()
+        old = b'{"project_id":"old","agent_tracking":{"enabled":false}}'
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            with self.subTest(signal=int(sig)):
+                hint.write_bytes(old)
+                marker = self.root / ("setup-started-" + str(int(sig)))
+                env = {**self.env, "FAKE_PICKER": "1", "FAKE_SETUP_MARKER": str(marker), "FAKE_SETUP_SLEEP": "3"}
+                child = subprocess.Popen(["bash", str(SKILL / "scripts/setup-wizard.sh"), "--agent", "codex"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=self.root,
+                    start_new_session=True)
+                child.stdin.write("1\n1\n1\ny\n")
+                child.stdin.flush()
+                deadline = time.monotonic() + 4
+                while not marker.exists() and time.monotonic() < deadline and child.poll() is None:
+                    time.sleep(0.01)
+                self.assertTrue(marker.exists(), "Fixture must reach actual core setup before signal")
+                os.killpg(child.pid, sig)
+                child.communicate(timeout=4)
+                if sig == signal.SIGKILL:
+                    count_before = len([c for c in self.recorded() if "setup" in c["args"]])
+                    recovery = self.run_script("scripts/setup-wizard.sh", "--agent", "codex", payload="1\n1\n1\ny\n",
+                        env={**self.env, "FAKE_PICKER": "1"})
+                    self.assertNotEqual(recovery.returncode, 0)
+                    self.assertIn("status", recovery.stderr.lower())
+                    self.assertEqual(len([c for c in self.recorded() if "setup" in c["args"]]), count_before)
+                self.assertEqual(hint.read_bytes(), old)
+                self.assertFalse((hint.parent / ".capture-mapping-recovery.json").exists())
+
+    def test_home_alias_is_allowed_but_dangling_child_symlink_is_refused(self):
+        alias = self.root / "approved-home-alias"
+        alias.symlink_to(self.home, target_is_directory=True)
+        env = {**self.env, "HOME": str(alias)}
+        result = self.run_script("installers/install-codex.sh", "--harness-version", "0.167.0", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        other = self.home / ".claude"
+        other.symlink_to(self.root / "missing-outside", target_is_directory=True)
+        result = self.install("claude-code")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "missing-outside").exists())
+
+    def test_symlinked_parent_of_existing_install_refuses_update_and_removal(self):
+        self.assertEqual(self.install().returncode, 0)
+        host = self.home / ".codex"
+        external = self.root / "existing-install-outside"
+        host.rename(external)
+        host.symlink_to(external, target_is_directory=True)
+        before = (external / "hooks.json").read_bytes()
+        for result in (self.install(), self.uninstall()):
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual((external / "hooks.json").read_bytes(), before)
+        self.assertTrue((external / "skills/keito-time-track/SKILL.md").is_file())
+
+    def test_background_uploader_is_only_forwarded_when_explicitly_selected_and_previewed(self):
+        subprocess.run(["git", "-c", "init.templateDir=", "init", "--quiet", str(self.root)], check=True, env=self.env)
+        result = self.run_script("scripts/setup-wizard.sh", "--agent", "codex", "--install-worker", payload="1\n1\n1\ny\n",
+                                 env={**self.env, "FAKE_PICKER": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("background uploader", result.stdout)
+        setup = [c for c in self.recorded() if "setup" in c["args"]]
+        self.assertEqual(len(setup), 1)
+        self.assertIn("--install-worker", setup[0]["args"])
 
     def test_management_scripts_delegate_without_legacy_state(self):
         for path, args, expected in [

@@ -21,7 +21,7 @@ continue without asking again. For example, for both:
 
 ```bash
 keito skill install --agent claude-code --agent codex
-scripts/setup-wizard.sh --agent claude-code --agent codex
+scripts/setup-wizard.sh --agent claude-code --agent codex --install-worker
 ```
 
 The CLI must expose `keito capture --help`. If it does not, install a qualified
@@ -29,10 +29,18 @@ CLI release before proceeding. `scripts/install-cli.sh` installs the public CLI;
 it does not establish capture support or harness qualification. Authentication
 belongs to `keito auth login`; never request or print API keys.
 
+The explicit `--install-worker` option requests a local macOS background
+uploader; the picker previews it before confirmation. Without that option setup
+only approves local queuing, so do not claim automatic delivery. The CLI owns
+service setup and must report its actual running/verified state.
+
 The setup picker uses existing accessible clients, projects and project tasks.
 It previews metadata-only collection and requires explicit mapping consent on
 this device. A repository-carried `.keito/config.yml` is only a hint; it cannot
-approve capture, choose a billing rate or authorize historical import.
+approve capture, choose a billing rate or authorize historical import. Failed setup restores the previous hint. After an
+interruption, run setup recovery and inspect `keito capture status` before
+explicit reapproval; core consent may have committed even when the wrapper
+failed. Recovery must not replay that operation automatically.
 
 ## Inspect and control
 
@@ -57,8 +65,9 @@ For adapter removal, explicitly select only the unwanted target:
 installers/uninstall.sh --agent codex
 ```
 
-Removal preserves unrelated settings and refuses to delete modified skill
-payloads. It does not delete capture evidence or restore previously disabled
+Removal preserves unrelated/ambiguous commands and refuses to delete modified
+skill payloads. Immutable hidden adapter generations remain for safe rollback;
+installation never replaces an executable referenced by an existing hook. It does not delete capture evidence or restore previously disabled
 legacy plugins automatically.
 
 ## Plugin qualification
