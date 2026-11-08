@@ -48,7 +48,7 @@ jobs:
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-clippy-
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-features --all-targets -- -D warnings
       - run: cargo check --all-targets
 
   test:
@@ -73,7 +73,7 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
-      - run: cargo test --all-targets
+      - run: cargo test --all-features --all-targets
 
   release-smoke:
     name: Release Smoke
@@ -101,7 +101,7 @@ jobs:
           ./target/release/keito --help > /dev/null
       - name: Verify generated man pages
         run: |
-          cargo run --bin gen-man -- /tmp/keito-man
+          cargo run --features dev-tools --bin gen-man -- /tmp/keito-man
           test -s /tmp/keito-man/keito.1
           test -s /tmp/keito-man/keito-auth-login.1
           test -s /tmp/keito-man/keito-time-stop.1

@@ -51,6 +51,9 @@ per-repository setup after installation: cd into a client repo and run
         agent: Vec<SkillAgent>,
     },
 
+    /// Verify the release-bound native runtime pair without changing local state
+    Runtime,
+
     /// Show install/auth/hook status for the Keito Skill
     Status,
 

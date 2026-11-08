@@ -23,7 +23,7 @@ struct SkillStatus {
     cli_path: Option<String>,
     npx_installed: bool,
     jq_installed: bool,
-    python3_installed: bool,
+    capture_runtime: String,
     credentials_configured: bool,
     authenticated: bool,
     authentication_state: String,
@@ -43,6 +43,7 @@ struct AgentStatus {
     skill_path: Option<String>,
     hooks_configured: bool,
     hook_config_path: Option<String>,
+    guard_runtime: String,
 }
 
 #[derive(Debug)]
@@ -81,11 +82,6 @@ const BUNDLED_SKILL_FILES: &[BundledSkillFile] = &[
     BundledSkillFile {
         path: "hooks/dispatch.sh",
         contents: include_str!("../../skills/keito-time-track/hooks/dispatch.sh"),
-        executable: true,
-    },
-    BundledSkillFile {
-        path: "hooks/guard.py",
-        contents: include_str!("../../skills/keito-time-track/hooks/guard.py"),
         executable: true,
     },
     BundledSkillFile {
@@ -134,18 +130,8 @@ const BUNDLED_SKILL_FILES: &[BundledSkillFile] = &[
         executable: true,
     },
     BundledSkillFile {
-        path: "installers/manage-hooks.py",
-        contents: include_str!("../../skills/keito-time-track/installers/manage-hooks.py"),
-        executable: true,
-    },
-    BundledSkillFile {
         path: "installers/uninstall.sh",
         contents: include_str!("../../skills/keito-time-track/installers/uninstall.sh"),
-        executable: true,
-    },
-    BundledSkillFile {
-        path: "scripts/approve-mapping.py",
-        contents: include_str!("../../skills/keito-time-track/scripts/approve-mapping.py"),
         executable: true,
     },
     BundledSkillFile {
@@ -171,11 +157,6 @@ const BUNDLED_SKILL_FILES: &[BundledSkillFile] = &[
     BundledSkillFile {
         path: "scripts/status.sh",
         contents: include_str!("../../skills/keito-time-track/scripts/status.sh"),
-        executable: true,
-    },
-    BundledSkillFile {
-        path: "tests/adapter_installer_test.py",
-        contents: include_str!("../../skills/keito-time-track/tests/adapter_installer_test.py"),
         executable: true,
     },
 ];
@@ -223,6 +204,17 @@ pub async fn run(
         SkillSubcommand::Uninstall { agent } => {
             uninstall(selected_agents(agent)?, global, mode).await
         }
+        SkillSubcommand::Runtime => {
+            let runtime = crate::capture_runtime_pair::current()?;
+            if !global.quiet {
+                println!(
+                    "{}",
+                    serde_json::to_string(&runtime)
+                        .map_err(|_| AppError::Config("Cannot render runtime identity".into()))?
+                );
+            }
+            Ok(())
+        }
         SkillSubcommand::Status => status(global, mode, false, false).await,
         SkillSubcommand::Doctor { live } => status(global, mode, true, live).await,
         SkillSubcommand::TeamInit { mode: team_mode } => team_init(team_mode, global, mode).await,
@@ -259,33 +251,35 @@ async fn install(
             "npx is required for an external skill source. Install Node.js, use --source bundled, or run the manual skill installer.".into(),
         ));
     }
-    if find_in_path("python3").is_none() {
-        return Err(AppError::Config(
-            "Python 3 is required by the safe Keito adapter configuration installer.".into(),
-        ));
-    }
-
+    // Qualification precedes every profile mutation, including external
+    // skills downloads. An arbitrary adjacent binary cannot qualify capture.
+    let runtime = crate::capture_runtime_pair::current()?;
+    let home =
+        dirs::home_dir().ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
     let bundled_skill = if !skip_skills_add && use_bundled {
         Some(materialize_bundled_skill()?)
     } else {
         None
     };
-
     for agent in &agents {
-        let show_child_output = !global.quiet && mode == OutputMode::Table;
-        if skip_skills_add {
-            run_hook_installer(*agent, show_child_output, confirm_migration)?;
-        } else if let Some(skill) = bundled_skill.as_ref() {
-            run_bundled_hook_installer(
-                *agent,
-                show_child_output,
-                &skill.skill_root,
-                confirm_migration,
-            )?;
-        } else {
-            run_skills_add(source, *agent, show_child_output)?;
-            run_hook_installer(*agent, show_child_output, confirm_migration)?;
+        if !skip_skills_add && !use_bundled {
+            run_skills_add(source, *agent, !global.quiet && mode == OutputMode::Table)?;
         }
+        let root = if let Some(skill) = bundled_skill.as_ref() {
+            skill.skill_root.clone()
+        } else {
+            hook_installer_path(*agent)
+                .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
+                .ok_or_else(|| AppError::Config("Keito skill source is unavailable".into()))?
+        };
+        crate::skill_adapter::install(crate::skill_adapter::InstallOptions {
+            source_root: &root,
+            profile_home: &home,
+            agent: *agent,
+            runtime: &runtime,
+            confirm_migration,
+            harness_version: None,
+        })?;
     }
 
     if global.quiet {
@@ -437,67 +431,6 @@ fn run_skills_add(source: &str, agent: SkillAgent, show_output: bool) -> Result<
     Ok(())
 }
 
-fn run_bundled_hook_installer(
-    agent: SkillAgent,
-    show_output: bool,
-    skill_root: &Path,
-    confirm_migration: bool,
-) -> Result<(), AppError> {
-    let installer_name = match agent {
-        SkillAgent::Codex => "install-codex.sh",
-        SkillAgent::ClaudeCode => "install-claude-code.sh",
-    };
-    let script = skill_root.join("installers").join(installer_name);
-    run_installer_script(agent, show_output, &script, confirm_migration)
-}
-
-fn run_hook_installer(
-    agent: SkillAgent,
-    show_output: bool,
-    confirm_migration: bool,
-) -> Result<(), AppError> {
-    let script = hook_installer_path(agent).ok_or_else(|| {
-        AppError::Config(format!(
-            "Keito Skill files were not found for {} after install",
-            agent.display_name()
-        ))
-    })?;
-
-    run_installer_script(agent, show_output, &script, confirm_migration)
-}
-
-fn run_installer_script(
-    agent: SkillAgent,
-    show_output: bool,
-    script: &Path,
-    confirm_migration: bool,
-) -> Result<(), AppError> {
-    let current_exe = std::env::current_exe()
-        .map_err(|e| AppError::Config(format!("Could not resolve current keito binary: {e}")))?;
-
-    let mut command = ProcessCommand::new("bash");
-    command.arg(script);
-    if confirm_migration {
-        command.arg("--confirm-migration");
-    }
-    let status = command
-        .env("KEITO_CLI_BIN", current_exe)
-        .stdin(Stdio::null())
-        .stdout(child_stdio(show_output))
-        .stderr(child_stdio(show_output))
-        .status()
-        .map_err(|e| AppError::Config(format!("Failed to run hook installer: {e}")))?;
-
-    if !status.success() {
-        return Err(AppError::Config(format!(
-            "Hook installer failed for {}",
-            agent.display_name()
-        )));
-    }
-
-    Ok(())
-}
-
 fn materialize_bundled_skill() -> Result<MaterializedBundledSkill, AppError> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -506,6 +439,15 @@ fn materialize_bundled_skill() -> Result<MaterializedBundledSkill, AppError> {
     let temp_root =
         std::env::temp_dir().join(format!("keito-skill-{}-{unique}", std::process::id()));
     let skill_root = temp_root.join(SKILL_NAME);
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&temp_root)
+        .map_err(|_| AppError::Config("Cannot create private bundled skill source".into()))?;
 
     for file in BUNDLED_SKILL_FILES {
         let path = skill_root.join(file.path);
@@ -595,7 +537,12 @@ fn collect_status(global: &GlobalFlags) -> SkillStatus {
             .map(|path| path.display().to_string()),
         npx_installed: find_in_path("npx").is_some(),
         jq_installed: find_in_path("jq").is_some(),
-        python3_installed: find_in_path("python3").is_some(),
+        capture_runtime: if crate::capture_runtime_pair::current().is_ok() {
+            "VERIFIED_RELEASE_PAIR"
+        } else {
+            "UNQUALIFIED_OR_STALE"
+        }
+        .into(),
         credentials_configured: auth.is_some(),
         authenticated: false,
         authentication_state: "UNVERIFIED".into(),
@@ -623,14 +570,21 @@ fn agent_status(agent: SkillAgent) -> AgentStatus {
         SkillAgent::Codex => home.join(".codex/hooks.json"),
         SkillAgent::ClaudeCode => home.join(".claude/settings.json"),
     });
-    let hooks_configured = hook_config_path
-        .as_ref()
-        .is_some_and(|path| hook_configured(path));
+    let runtime = crate::capture_runtime_pair::current().ok();
+    let hooks_configured = home.as_ref().is_some_and(|home| {
+        crate::skill_adapter::inspect(home, agent, runtime.as_ref()).unwrap_or(false)
+    });
 
     AgentStatus {
         skill_installed: skill_path.is_some(),
         skill_path: skill_path.map(|path| path.display().to_string()),
         hooks_configured,
+        guard_runtime: if runtime.is_some() {
+            "VERIFIED_RELEASE_PAIR"
+        } else {
+            "UNQUALIFIED_OR_STALE"
+        }
+        .into(),
         hook_config_path: hook_config_path.map(|path| path.display().to_string()),
     }
 }
@@ -639,64 +593,15 @@ fn first_existing(paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find(|path| path.exists()).cloned()
 }
 
-fn hook_configured(path: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return false;
-    };
-    [
-        ("SessionStart", "session-start"),
-        ("UserPromptSubmit", "prompt"),
-        ("Stop", "stop"),
-        ("SessionEnd", "session-end"),
-    ]
-    .into_iter()
-    .all(|(event, lifecycle)| {
-        value["hooks"][event].as_array().is_some_and(|groups| {
-            groups.iter().any(|group| {
-                group["hooks"].as_array().is_some_and(|hooks| {
-                    hooks.iter().any(|hook| {
-                        hook["type"] == "command"
-                            && hook["command"].as_str().is_some_and(|command| {
-                                (command.contains(SKILL_NAME)
-                                    || command.contains("/.keito-capture-generations/"))
-                                    && command.contains("dispatch.sh")
-                                    && command.contains(&format!("--event {lifecycle}"))
-                            })
-                    })
-                })
-            })
-        })
-    })
-}
-
 async fn uninstall(
     agents: Vec<SkillAgent>,
     global: &GlobalFlags,
     mode: OutputMode,
 ) -> Result<(), AppError> {
+    let home =
+        dirs::home_dir().ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
     for agent in agents {
-        if let Some(installer) = hook_installer_path(agent) {
-            let script = installer
-                .parent()
-                .ok_or_else(|| AppError::Config("Missing adapter uninstall helper".into()))?
-                .join("uninstall.sh");
-            let status = ProcessCommand::new("bash")
-                .arg(script)
-                .args(["--agent", agent.skills_cli_name()])
-                .stdin(Stdio::null())
-                .stdout(child_stdio(mode == OutputMode::Table && !global.quiet))
-                .stderr(child_stdio(mode == OutputMode::Table && !global.quiet))
-                .status()
-                .map_err(|_| AppError::Config("Cannot run adapter uninstaller".into()))?;
-            if !status.success() {
-                return Err(AppError::Config(
-                    "Adapter uninstall refused; inspect retained local configuration".into(),
-                ));
-            }
-        }
+        crate::skill_adapter::uninstall(&home, agent)?;
     }
     status(global, mode, false, false).await
 }
@@ -742,10 +647,7 @@ fn print_status(status: &SkillStatus, doctor: bool) {
         println!("CLI path: {path}");
     }
     println!("npx available: {}", yes_no(status.npx_installed));
-    println!(
-        "Python 3 installer support: {}",
-        yes_no(status.python3_installed)
-    );
+    println!("Native capture runtime: {}", status.capture_runtime);
     println!(
         "Credentials configured: {}",
         yes_no(status.credentials_configured)
@@ -785,8 +687,8 @@ fn print_status(status: &SkillStatus, doctor: bool) {
         if !status.npx_installed {
             println!("- Install Node.js/npm so npx is available.");
         }
-        if !status.python3_installed {
-            println!("- Install Python 3 for safe adapter configuration.");
+        if status.capture_runtime != "VERIFIED_RELEASE_PAIR" {
+            println!("- Install the official paired Keito release for native capture.");
         }
         if !status.authenticated {
             println!("- Run keito auth login.");
@@ -956,7 +858,7 @@ Do not create duplicate manual entries for the same captured coding session.
     }
 }
 
-fn git_repo_root() -> Result<PathBuf, AppError> {
+pub(crate) fn git_repo_root() -> Result<PathBuf, AppError> {
     let output = ProcessCommand::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .stdin(Stdio::null())

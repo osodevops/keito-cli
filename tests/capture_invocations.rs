@@ -1,4 +1,6 @@
 #![cfg(unix)]
+#[path = "support/mutation_environment.rs"]
+mod isolation;
 use keito_cli::capture::{self, Binding, Clock, Repository, Signal, Store};
 use keito_cli::cli::capture::CaptureEvent::*;
 use std::{fs, io::Write, os::fd::AsRawFd, os::unix::fs::OpenOptionsExt, path::Path};
@@ -204,40 +206,39 @@ fn malformed_marker_and_symlink_are_never_healthy_or_read_as_an_invocation() {
 }
 
 #[test]
-fn actual_hook_emits_exact_private_ack_only_after_durable_result_and_never_for_malformed_input() {
-    use std::process::{Command, Stdio};
+fn unqualified_actual_hook_never_acknowledges_or_accepts_a_guarded_boundary() {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::{Command, Stdio},
+    };
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
-    let root = base.join("repo");
-    fs::create_dir(&root).unwrap();
-    assert!(Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .arg("init")
-        .output()
-        .unwrap()
-        .status
-        .success());
-    let repository = Repository::resolve(&root).unwrap();
-    let directory = base.join("capture");
+    let home = base.join("home");
+    fs::create_dir(&home).unwrap();
+    let directory = home.join("capture");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let core = base.join("keito");
+    fs::copy(assert_cmd::cargo::cargo_bin!("keito"), &core).unwrap();
+    let checked =
+        isolation::checked(&base, &base, Some(&home), Some(&directory), Some(&core)).unwrap();
     let mut store = Store::open(&directory).unwrap();
-    store
-        .approve(Binding {
-            repository_key: repository.key,
-            remote_hash: repository.remote_hash,
-            hint_hash: repository.hint_hash,
-            id: String::new(),
-            version: 0,
-            workspace_id: "co_test".into(),
-            owner_id: "owner".into(),
-            origin_hash: capture::hash("origin"),
-            project_id: "p".into(),
-            task_id: "t".into(),
-            agents: vec!["codex".into()],
-            paused: false,
-            revoked: false,
-        })
-        .unwrap();
+    let binding = Binding {
+        repository_key: repo().key,
+        remote_hash: repo().remote_hash,
+        hint_hash: repo().hint_hash,
+        id: String::new(),
+        version: 0,
+        workspace_id: "co_test".into(),
+        owner_id: "owner".into(),
+        origin_hash: capture::hash("origin"),
+        project_id: "p".into(),
+        task_id: "t".into(),
+        agents: vec!["codex".into()],
+        paused: false,
+        revoked: false,
+    };
+    store.approve(binding).unwrap();
     for malformed in [false, true] {
         let nonce = capture::hash(if malformed {
             "bad-input"
@@ -247,9 +248,16 @@ fn actual_hook_emits_exact_private_ack_only_after_durable_result_and_never_for_m
         let guard = marker(&directory, &nonce, true);
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        let mut child = Command::new(assert_cmd::cargo::cargo_bin!("keito"))
-            .current_dir(&root)
-            .env("KEITO_CAPTURE_HOME", &directory)
+        let mut child = Command::new(&checked.core)
+            .env_clear()
+            .current_dir(&home)
+            .env("HOME", &checked.home)
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("KEITO_CAPTURE_HOME", &checked.capture)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("APPDATA", home.join("AppData"))
+            .env("PATH", base.join("empty-bin"))
             .env("KEITO_CAPTURE_INVOCATION_NONCE", &nonce)
             .env("KEITO_CAPTURE_ACK_FD", pipe[1].to_string())
             .args([
@@ -268,18 +276,14 @@ fn actual_hook_emits_exact_private_ack_only_after_durable_result_and_never_for_m
             .spawn()
             .unwrap();
         let input = if malformed {
-            "{PRIVATE_RAW_CANARY".to_owned()
+            b"{PRIVATE_RAW_CANARY".as_slice()
         } else {
-            serde_json::json!({"cwd":root,"session_id":"native","turn_id":"turn","prompt":"PRIVATE_RAW_CANARY"}).to_string()
+            b"{\"session_id\":\"native\",\"turn_id\":\"turn\",\"prompt\":\"PRIVATE_RAW_CANARY\"}"
+                .as_slice()
         };
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(input);
         let output = child.wait_with_output().unwrap();
-        assert!(output.status.success());
+        assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE_RAW_CANARY"));
         unsafe {
@@ -287,26 +291,17 @@ fn actual_hook_emits_exact_private_ack_only_after_durable_result_and_never_for_m
             let flags = libc::fcntl(pipe[0], libc::F_GETFL);
             libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
-        let mut bytes = [0u8; 128];
-        let n = unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+        let mut bytes = [0; 128];
+        assert!(unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) } <= 0);
         unsafe {
             libc::close(pipe[0]);
         }
-        if malformed {
-            assert!(n <= 0);
-            drop(guard);
-            store.maintain(clock(100).wall).unwrap();
-            assert!(store.status().unwrap().storage_paused);
-            assert_eq!(
-                store.preview("native").unwrap()[0].segments[0].duration_seconds,
-                0
-            );
-        } else {
-            assert_eq!(&bytes[..n as usize], b"KEITO_CAPTURE_DURABLE_V1\n");
-            assert_eq!(store.status().unwrap().unfinished, 1);
-            fs::remove_file(directory.join(format!("capture-invocations/{nonce}.pending")))
-                .unwrap();
-            drop(guard);
-        }
+        assert_eq!(store.status().unwrap().unfinished, 0);
+        assert!(directory
+            .join(format!("capture-invocations/{nonce}.pending"))
+            .exists());
+        drop(guard);
     }
+    store.maintain(clock(100).wall).unwrap();
+    assert!(store.status().unwrap().storage_paused);
 }

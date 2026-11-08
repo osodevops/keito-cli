@@ -2,6 +2,7 @@
 name = "keito-cli"
 version = "0.2.0"
 edition = "2021"
+default-run = "keito"
 description = "AI agent time tracking CLI for Keito: capture billable human and agent work for client billing, agency projects, and AI-native services"
 license = "MIT"
 repository = "https://github.com/osodevops/keito-cli"
@@ -19,10 +20,24 @@ name = "keito"
 path = "src/main.rs"
 
 [[bin]]
+name = "keito-capture-guard"
+path = "src/bin/keito-capture-guard.rs"
+
+[[bin]]
 name = "gen-man"
 path = "src/bin/gen-man.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "qualify-capture"
+path = "src/bin/qualify-capture.rs"
+required-features = ["dev-tools"]
+
+[features]
+dev-tools = []
 
 [dependencies]
+base64 = "0.22.1"
 clap = { version = "4", features = ["derive", "env", "string"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio = { version = "1", features = ["full"] }

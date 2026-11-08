@@ -1,3 +1,4 @@
+#![cfg(feature = "dev-tools")]
 #![allow(deprecated)]
 
 use assert_cmd::Command;
@@ -42,6 +43,7 @@ const EXPECTED_PAGES: &[&str] = &[
     "keito-skill-uninstall.1",
     "keito-skill-install.1",
     "keito-skill-status.1",
+    "keito-skill-runtime.1",
     "keito-skill-team-init.1",
     "keito-time.1",
     "keito-time-help.1",

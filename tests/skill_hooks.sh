@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Development-only entry point; native focused tests are run directly, never
+# recursively from a cargo test process.
 set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-exec python3 "$repo_root/skills/keito-time-track/tests/adapter_installer_test.py"
+exec "$repo_root/tests/native-adapter-tests.sh"

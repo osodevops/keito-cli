@@ -29,6 +29,147 @@ fn print(value: Value, quiet: bool) -> Result<(), AppError> {
     Ok(())
 }
 
+struct SetupOptions {
+    agent: Vec<crate::cli::capture::CaptureAgent>,
+    project: String,
+    task: String,
+    selected_client: Option<String>,
+    write_hint: bool,
+    confirm: bool,
+    install_worker: bool,
+}
+async fn setup(
+    options: SetupOptions,
+    global: &GlobalFlags,
+    mapping: &mut Option<crate::capture_mapping::MappingPublication>,
+) -> Result<(), AppError> {
+    let SetupOptions {
+        agent,
+        project,
+        task,
+        selected_client,
+        write_hint,
+        confirm,
+        install_worker,
+    } = options;
+    if !confirm {
+        return Err(AppError::InvalidInput(
+            "Explicit --confirm is required for metadata-only capture consent".into(),
+        ));
+    }
+    capture::identifier(&project)?;
+    capture::identifier(&task)?;
+    let auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
+    let config = AppConfig::load().map_err(sanitize_error)?;
+    let client = KeitorClient::new(&auth, &config.api_base_url())?;
+    let me = client.get_me().await.map_err(sanitize_error)?;
+    if me.is_personal_read_only_sync() {
+        return Err(AppError::Auth(
+            "Capture requires a full-access credential".into(),
+        ));
+    }
+    capture::identifier(&me.id)?;
+    let projects = client.list_projects().await.map_err(sanitize_error)?;
+    if !projects.iter().any(|p| {
+        p.id == project
+            && p.is_active
+            && selected_client
+                .as_ref()
+                .is_none_or(|id| p.client.as_ref().is_some_and(|c| &c.id == id))
+    }) {
+        return Err(AppError::NotFound(
+            "Project unavailable; choose an active accessible project".into(),
+        ));
+    }
+    let tasks = client
+        .list_tasks_for_project(Some(&project))
+        .await
+        .map_err(sanitize_error)?;
+    if !tasks.iter().any(|t| t.id == task && t.is_active) {
+        return Err(AppError::NotFound(
+            "Task unavailable on the selected project".into(),
+        ));
+    }
+    *mapping = if write_hint {
+        let root = crate::commands::skill::git_repo_root()?
+            .canonicalize()
+            .map_err(|_| AppError::Config("Cannot identify canonical Git root".into()))?;
+        Some(crate::capture_mapping::MappingPublication::begin(
+            &root,
+            &crate::capture_mapping::MappingIds {
+                workspace: &auth.workspace_id,
+                client: selected_client.as_deref().ok_or_else(|| {
+                    AppError::InvalidInput("Explicit client is required for --write-hint".into())
+                })?,
+                project: &project,
+                task: &task,
+            },
+        )?)
+    } else {
+        None
+    };
+    tokio::task::yield_now().await;
+    let repo = current_repo()?;
+    if repo.disabled {
+        return Err(AppError::Config(
+            "Repository hint disables capture; enable it before approving".into(),
+        ));
+    }
+    let mut store = Store::open(&directory()?)?;
+    if install_worker && config.api_key.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::Config("The supervised worker requires credentials saved by keito auth login; environment-only credentials are never copied to service settings".into()));
+    }
+    let approved = store.approve(Binding {
+        repository_key: repo.key,
+        remote_hash: repo.remote_hash,
+        hint_hash: repo.hint_hash,
+        id: String::new(),
+        version: 0,
+        workspace_id: auth.workspace_id,
+        owner_id: me.id,
+        origin_hash: capture::hash(config.api_base_url().trim_end_matches('/')),
+        project_id: project,
+        task_id: task,
+        agents: agent
+            .into_iter()
+            .map(|a| a.namespace().to_owned())
+            .collect(),
+        paused: false,
+        revoked: false,
+    })?;
+    let worker = if install_worker {
+        Some(install_worker_service(
+            &approved,
+            &origin_for_worker(&config),
+            &directory()?,
+        )?)
+    } else {
+        None
+    };
+    tokio::task::yield_now().await;
+    if let Some(mapping) = mapping.as_mut() {
+        mapping.commit()?;
+    }
+    print(
+        json!({"status":"approved","worker":worker,"policy":"METADATA_ONLY_OBSERVED_TURNS_V1","binding":approved,
+                "notice":"Only minimized timing metadata leaves this device. Captures require review before charging. Start capture worker for automatic delivery.","usage":"UNAVAILABLE"}),
+        global.quiet,
+    )
+}
+
+async fn setup_cancelled() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut termination) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! { _ = termination.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 pub async fn run(
     cmd: CaptureCommand,
     global: &GlobalFlags,
@@ -43,6 +184,17 @@ pub async fn run(
             // A malformed/unknown hook must never block coding or echo raw input.
             let mut boundary_id = None;
             let invocation_nonce = std::env::var("KEITO_CAPTURE_INVOCATION_NONCE").ok();
+            if invocation_nonce.is_some() {
+                let runtime = crate::capture_runtime_pair::current()?;
+                if std::env::var("KEITO_CAPTURE_CORE_SHA256").ok().as_deref()
+                    != Some(runtime.core_sha256.as_str())
+                {
+                    return Err(AppError::Config(
+                        "Installed capture runtime changed; reinstall the official release pair"
+                            .into(),
+                    ));
+                }
+            }
             let ack_fd = std::env::var("KEITO_CAPTURE_ACK_FD")
                 .ok()
                 .and_then(|fd| fd.parse::<i32>().ok())
@@ -148,83 +300,23 @@ pub async fn run(
             agent,
             project,
             task,
+            client: selected_client,
+            write_hint,
             confirm,
             install_worker,
         } => {
-            if !confirm {
-                return Err(AppError::InvalidInput(
-                    "Explicit --confirm is required for metadata-only capture consent".into(),
-                ));
-            }
-            capture::identifier(&project)?;
-            capture::identifier(&task)?;
-            let repo = current_repo()?;
-            if repo.disabled {
-                return Err(AppError::Config(
-                    "Repository hint disables capture; enable it before approving".into(),
-                ));
-            }
-            let auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
-            let config = AppConfig::load().map_err(sanitize_error)?;
-            let client = KeitorClient::new(&auth, &config.api_base_url())?;
-            let me = client.get_me().await.map_err(sanitize_error)?;
-            if me.is_personal_read_only_sync() {
-                return Err(AppError::Auth(
-                    "Capture requires a full-access credential".into(),
-                ));
-            }
-            capture::identifier(&me.id)?;
-            let projects = client.list_projects().await.map_err(sanitize_error)?;
-            if !projects.iter().any(|p| p.id == project && p.is_active) {
-                return Err(AppError::NotFound(
-                    "Project unavailable; choose an active accessible project".into(),
-                ));
-            }
-            let tasks = client
-                .list_tasks_for_project(Some(&project))
-                .await
-                .map_err(sanitize_error)?;
-            if !tasks.iter().any(|t| t.id == task && t.is_active) {
-                return Err(AppError::NotFound(
-                    "Task unavailable on the selected project".into(),
-                ));
-            }
-            let mut store = Store::open(&directory()?)?;
-            if install_worker && config.api_key.as_deref().is_none_or(str::is_empty) {
-                return Err(AppError::Config("The supervised worker requires credentials saved by keito auth login; environment-only credentials are never copied to service settings".into()));
-            }
-            let approved = store.approve(Binding {
-                repository_key: repo.key,
-                remote_hash: repo.remote_hash,
-                hint_hash: repo.hint_hash,
-                id: String::new(),
-                version: 0,
-                workspace_id: auth.workspace_id,
-                owner_id: me.id,
-                origin_hash: capture::hash(config.api_base_url().trim_end_matches('/')),
-                project_id: project,
-                task_id: task,
-                agents: agent
-                    .into_iter()
-                    .map(|a| a.namespace().to_owned())
-                    .collect(),
-                paused: false,
-                revoked: false,
-            })?;
-            let worker = if install_worker {
-                Some(install_worker_service(
-                    &approved,
-                    &origin_for_worker(&config),
-                    &directory()?,
-                )?)
-            } else {
-                None
+            let mut mapping: Option<crate::capture_mapping::MappingPublication> = None;
+            let result = tokio::select! {
+                biased;
+                _ = setup_cancelled() => Err(AppError::Config("Capture setup interrupted; inspect local approval before retrying".into())),
+                result = setup(SetupOptions {agent, project, task, selected_client, write_hint, confirm, install_worker}, global, &mut mapping) => result,
             };
-            print(
-                json!({"status":"approved","worker":worker,"policy":"METADATA_ONLY_OBSERVED_TURNS_V1","binding":approved,
-                "notice":"Only minimized timing metadata leaves this device. Captures require review before charging. Start capture worker for automatic delivery.","usage":"UNAVAILABLE"}),
-                global.quiet,
-            )
+            if result.is_err() {
+                if let Some(mapping) = mapping.as_mut() {
+                    mapping.rollback()?;
+                }
+            }
+            result
         }
         CaptureSubcommand::Status => {
             let mut store = Store::open(&directory()?)?;

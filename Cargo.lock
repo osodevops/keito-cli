@@ -1014,6 +1014,7 @@ name = "keito-cli"
 version = "0.2.0"
 dependencies = [
  "assert_cmd",
+ "base64",
  "chrono",
  "clap",
  "clap_mangen",

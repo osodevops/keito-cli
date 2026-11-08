@@ -17,6 +17,12 @@ pub enum CaptureSubcommand {
         project: String,
         #[arg(long)]
         task: String,
+        /// Client identifier for an explicitly requested repository hint
+        #[arg(long, required_if_eq("write_hint", "true"))]
+        client: Option<String>,
+        /// Transactionally publish this mapping hint alongside device approval
+        #[arg(long, requires = "client")]
+        write_hint: bool,
         /// Confirm the displayed metadata-only mapping policy; never bill automatically
         #[arg(long, required = true)]
         confirm: bool,

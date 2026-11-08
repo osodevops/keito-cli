@@ -3,7 +3,8 @@
 /tapes/*
 !/tapes/
 !/tapes/*.tape
-/scripts
+/scripts/*
+!/scripts/qualify-capture-artifact.sh
 *.swp
 *.swo
 .DS_Store

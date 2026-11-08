@@ -1,6 +1,9 @@
 [workspace]
 members = ["cargo:."]
 
+# Production capture uses .github/workflows/release.yml: finalize the guard,
+# embed its hash into keito, then package both plus the manifest. cargo-dist
+# output without that pairing is intentionally manual-CLI-only.
 [dist]
 cargo-dist-version = "0.30.2"
 allow-dirty = ["ci"]

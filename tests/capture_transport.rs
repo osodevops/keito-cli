@@ -468,5 +468,5 @@ async fn doctor_never_reuses_another_workspace_delivery_as_current_binding_proof
     assert_eq!(status["delivery_verified"], false);
     assert_eq!(status["capture"]["delivery_verified"], false);
     assert_eq!(status["ready"], false);
-    assert!(status["python3_installed"].is_boolean());
+    assert_eq!(status["capture_runtime"], "UNQUALIFIED_OR_STALE");
 }

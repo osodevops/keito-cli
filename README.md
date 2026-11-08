@@ -41,7 +41,7 @@ brew install osodevops/tap/keito
 
 ### GitHub Releases
 
-Download the latest binary from [Releases](https://github.com/osodevops/keito-cli/releases) for your platform (macOS, Linux, Windows).
+Download the latest archive from [Releases](https://github.com/osodevops/keito-cli/releases) for your platform (macOS, Linux, Windows). On macOS/Linux, keep `keito`, `keito-capture-guard`, and `capture-runtime-manifest.json` together. Verify the archive against `SHA256SUMS`, then run `keito skill runtime --json` to check the release-bound pair before installing capture. Windows supports manual CLI commands; native capture is unqualified.
 
 ### Build from Source
 
@@ -52,7 +52,7 @@ cargo build --release
 # binary at target/release/keito
 ```
 
-Requires a current stable Rust toolchain.
+Requires a current stable Rust toolchain. Source and `cargo install keito-cli --bin keito --bin keito-capture-guard` builds support manual commands; native capture requires the official release pair whose finalized guard hash is embedded by the release workflow. No local manifest can substitute for that release anchor.
 
 ## Setup
 
@@ -405,7 +405,7 @@ cargo test --all-targets
 ### Generate Man Pages
 
 ```sh
-cargo run --bin gen-man
+cargo run --features dev-tools --bin gen-man
 man ./man/keito.1
 ```
 
