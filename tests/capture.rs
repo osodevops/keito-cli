@@ -87,3 +87,13 @@ fn replaced_worker_runtime_is_refused_before_loading_credentials_or_network() {
         .failure()
         .stderr(predicate::str::contains("runtime changed"));
 }
+
+#[test]
+fn live_doctor_malformed_config_never_echoes_credential_source_lines() {
+    let home=tempfile::tempdir().unwrap();
+    for directory in [home.path().join("Library/Application Support/keito"),home.path().join("config/keito"),home.path().join("AppData/Roaming/keito")] {
+        std::fs::create_dir_all(&directory).unwrap();std::fs::write(directory.join("config.toml"),"api_key = \"kto_PRIVATE_CONFIG_CANARY\" invalid\n").unwrap();
+    }
+    Command::cargo_bin("keito").unwrap().env("HOME",home.path()).env("XDG_CONFIG_HOME",home.path().join("config")).env("APPDATA",home.path().join("AppData/Roaming"))
+        .args(["skill","doctor","--live","--json"]).assert().failure().stderr(predicate::str::contains("PRIVATE_CONFIG_CANARY").not());
+}
