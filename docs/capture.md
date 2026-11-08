@@ -48,7 +48,10 @@ The runtime verifies current authentication and the selected project/task before
 approval outside the repository. A cloned `.keito/config.yml` cannot authorize collection.
 Changed mapping/policy or Git remote identity holds evidence until renewed approval. Linked
 worktrees use the Git common repository identity; nested repositories remain separate.
-A repeated identical setup preserves the binding and its pause state.
+A repeated identical setup preserves the binding and its pause state. Adding another
+selected harness preserves the existing canonical session revision stream. A real mapping
+or remote change holds prior queued evidence for review; an already-started native session
+will not silently move to the new binding or restart at revision one.
 
 ## Automatic delivery on macOS
 
@@ -116,7 +119,12 @@ Local storage is a private SQLite transaction ledger with full synchronization, 
 ceiling and no silent eviction of unsent evidence. Frozen request bodies are limited to
 16 KiB and 100 segments. Acknowledged request payloads have seven-day local retention;
 minimized session/consent state remains for replay integrity until the bounded store is
-explicitly managed. A full or damaged queue pauses capture with a recovery error.
+explicitly managed. A full or damaged queue pauses capture with a recovery error. If SQLite refuses a
+boundary (for example lock contention), a separate bounded, private failure marker
+records its hashed identity and safe reason. The missed boundary is explicitly refused,
+not described as saved. Status exposes storage_paused and the failure reason.
+After fixing storage, explicitly run `keito capture recover --confirm`; it marks unfinished
+intervals incomplete, never reconstructs missing seconds, then clears the refusal marker.
 
 Canonical request data contains only harness/session identifiers, versioned mapping,
 absolute lifecycle instants, exact integer seconds, completeness and explicit usage

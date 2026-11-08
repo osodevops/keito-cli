@@ -44,6 +44,7 @@ pub async fn run(
             harness_version,
         } => {
             // A malformed/unknown hook must never block coding or echo raw input.
+            let mut boundary_id = None;
             let result = (|| {
                 let mut bytes = Vec::new();
                 std::io::stdin()
@@ -73,6 +74,13 @@ pub async fn run(
                         "turn_id"
                     })
                     .and_then(Value::as_str);
+                boundary_id = Some(capture::hash(format!(
+                    "{}\0{}\0{}\0{:?}",
+                    agent.namespace(),
+                    source_id,
+                    turn_id.unwrap_or("no-turn"),
+                    event
+                )));
                 let mut store = Store::open(&directory()?)?;
                 store.event(
                     &repo,
@@ -88,8 +96,27 @@ pub async fn run(
                     },
                 )
             })();
-            if result.is_err() {
-                eprintln!("Keito capture held this event; run keito capture status for recovery.");
+            if let Err(error) = result {
+                let reason = match error {
+                    AppError::Config(ref message) if message.contains("queue limit") => {
+                        "QUEUE_LIMIT_REACHED"
+                    }
+                    AppError::Config(_) => "STORAGE_UNAVAILABLE",
+                    _ => "BOUNDARY_REFUSED",
+                };
+                let saved = boundary_id.as_deref().is_some_and(|id| {
+                    directory().ok().is_some_and(|directory| {
+                        capture::record_failure(&directory, id, reason).is_ok()
+                    })
+                });
+                eprintln!(
+                    "Keito capture refused this boundary; no time was invented. {}",
+                    if saved {
+                        "A minimized failure marker was saved; inspect capture status and use capture recover --confirm."
+                    } else {
+                        "The boundary could not be saved; inspect local storage and capture status before resuming."
+                    }
+                );
             }
             Ok(())
         }
@@ -189,6 +216,20 @@ pub async fn run(
                 Err(_) => json!({"approved":false,"reason":"REPOSITORY_UNAVAILABLE"}),
             };
             print(value, global.quiet)
+        }
+        CaptureSubcommand::Recover { confirm } => {
+            if !confirm {
+                return Err(AppError::InvalidInput(
+                    "Explicit confirmation is required before acknowledging refused boundaries"
+                        .into(),
+                ));
+            }
+            let mut store = Store::open(&directory()?)?;
+            store.recover(&Clock::now()?)?;
+            print(
+                json!({"status":"recovered","notice":"Unfinished intervals were marked incomplete. Refused boundaries cannot be reconstructed; inspect needs-attention evidence before charging."}),
+                global.quiet,
+            )
         }
         CaptureSubcommand::Preview { session } => {
             let store = Store::open(&directory()?)?;

@@ -402,6 +402,7 @@ pub struct Signal<'a> {
 
 pub struct Store {
     connection: Connection,
+    directory: PathBuf,
 }
 #[derive(Debug, Serialize)]
 pub struct QueueState {
@@ -411,6 +412,13 @@ pub struct QueueState {
     pub reason: Option<String>,
     pub attempts: i64,
     pub retry_at: i64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureFailure {
+    pub reason: String,
+    pub boundary_id: String,
+    pub observed_at: i64,
 }
 #[derive(Debug, Serialize)]
 pub struct Status {
@@ -424,6 +432,9 @@ pub struct Status {
     pub unfinished: i64,
     pub queue: Vec<QueueState>,
     pub queue_truncated: bool,
+    pub storage_paused: bool,
+    pub storage_reason: Option<String>,
+    pub capture_failure: Option<CaptureFailure>,
 }
 #[derive(Clone, Debug)]
 pub struct Queued {
@@ -495,7 +506,10 @@ impl Store {
                 payload_hash TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                 retry_at INTEGER NOT NULL DEFAULT 0, claimed_until INTEGER NOT NULL DEFAULT 0, reason TEXT,
                 acknowledged_at INTEGER, UNIQUE(session_id,revision));").map_err(storage_error)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            directory: directory.to_owned(),
+        })
     }
     fn transaction(&mut self) -> Result<Transaction<'_>, AppError> {
         self.connection
@@ -622,6 +636,14 @@ impl Store {
         } = signal;
         identifier(source_id)?;
         version_identifier(version)?;
+        if self.failure()?.is_some()
+            && matches!(event, CaptureEvent::Prompt | CaptureEvent::SessionStart)
+        {
+            return Err(AppError::Config(
+                "Capture is paused after a refused boundary; inspect status and explicitly recover"
+                    .into(),
+            ));
+        }
         if matches!(event, CaptureEvent::Prompt | CaptureEvent::Stop) && turn_id.is_none() {
             return Err(AppError::InvalidInput(
                 "Missing native turn identity; capture requires qualified prompt_id/turn_id".into(),
@@ -944,6 +966,22 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(storage_error)?;
+        let capture_failure = self.failure()?;
+        let pages: i64 = self
+            .connection
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .map_err(storage_error)?;
+        let page_size: i64 = self
+            .connection
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .map_err(storage_error)?;
+        let full = pages * page_size >= MAX_QUEUE_BYTES - 64 * 1024;
+        let storage_paused = full || capture_failure.is_some();
+        let storage_reason = if full {
+            Some("QUEUE_LIMIT_REACHED".into())
+        } else {
+            capture_failure.as_ref().map(|f| f.reason.clone())
+        };
         Ok(Status {
             policy: POLICY,
             pending,
@@ -955,7 +993,71 @@ impl Store {
             unfinished,
             queue,
             queue_truncated,
+            storage_paused,
+            storage_reason,
+            capture_failure,
         })
+    }
+    fn failure(&self) -> Result<Option<CaptureFailure>, AppError> {
+        let path = self.directory.join("capture-failure.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(storage_error)?;
+        if metadata.file_type().is_symlink() || metadata.len() > 1024 {
+            return Err(AppError::Config(
+                "Capture failure marker needs local inspection; collection remains paused".into(),
+            ));
+        }
+        let value: CaptureFailure = serde_json::from_slice(&fs::read(path).map_err(storage_error)?)
+            .map_err(|_| {
+                AppError::Config(
+                    "Capture failure marker needs local inspection; collection remains paused"
+                        .into(),
+                )
+            })?;
+        if !matches!(
+            value.reason.as_str(),
+            "STORAGE_UNAVAILABLE" | "QUEUE_LIMIT_REACHED" | "BOUNDARY_REFUSED"
+        ) || value.boundary_id.len() != 64
+            || !value.boundary_id.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(storage_error("invalid failure marker"));
+        }
+        Ok(Some(value))
+    }
+    pub fn recover(&mut self, clock: &Clock) -> Result<(), AppError> {
+        let tx = self.transaction()?;
+        Self::check_size(&tx)?;
+        let mut statement = tx
+            .prepare("SELECT data FROM sessions WHERE json_type(data,'$.active')='object'")
+            .map_err(storage_error)?;
+        let rows: Vec<String> = statement
+            .query_map([], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for raw in rows {
+            let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            session.close(clock, false)?;
+            Self::queue(&tx, &mut session)?;
+            tx.execute(
+                "UPDATE sessions SET data=?2 WHERE id=?1",
+                params![
+                    session.id,
+                    serde_json::to_string(&session).map_err(storage_error)?
+                ],
+            )
+            .map_err(storage_error)?;
+        }
+        tx.commit().map_err(storage_error)?;
+        let path = self.directory.join("capture-failure.json");
+        if path.exists() {
+            self.failure()?;
+            fs::remove_file(path).map_err(storage_error)?;
+        }
+        Ok(())
     }
     pub fn preview(&self, source_id: &str) -> Result<Vec<Session>, AppError> {
         identifier(source_id)?;
@@ -1135,4 +1237,66 @@ fn validate_frozen(
         }
     }
     true
+}
+
+/// Separate reserved, metadata-only failure marker remains writable when SQLite
+/// is busy/full. It records refusal, never claims the missed boundary was saved.
+pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Result<(), AppError> {
+    if !matches!(
+        reason,
+        "STORAGE_UNAVAILABLE" | "QUEUE_LIMIT_REACHED" | "BOUNDARY_REFUSED"
+    ) || boundary_id.len() != 64
+        || !boundary_id.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(storage_error("invalid failure marker"));
+    }
+    if directory.exists()
+        && fs::symlink_metadata(directory)
+            .map_err(storage_error)?
+            .file_type()
+            .is_symlink()
+    {
+        return Err(storage_error("symlink"));
+    }
+    fs::create_dir_all(directory).map_err(storage_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(storage_error)?;
+    }
+    let path = directory.join("capture-failure.json");
+    if path.exists()
+        && fs::symlink_metadata(&path)
+            .map_err(storage_error)?
+            .file_type()
+            .is_symlink()
+    {
+        return Err(storage_error("symlink"));
+    }
+    let temporary = directory.join(format!(".capture-failure-{}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temporary).map_err(storage_error)?;
+        let failure = CaptureFailure {
+            reason: reason.into(),
+            boundary_id: boundary_id.into(),
+            observed_at: chrono::Utc::now().timestamp(),
+        };
+        let body = serde_json::to_vec(&failure).map_err(storage_error)?;
+        use std::io::Write;
+        file.write_all(&body).map_err(storage_error)?;
+        file.sync_all().map_err(storage_error)?;
+        fs::rename(&temporary, &path).map_err(storage_error)?;
+        Ok(())
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }

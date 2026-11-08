@@ -26,6 +26,12 @@ pub enum CaptureSubcommand {
     },
     /// Inspect local consent, queue and delivery state (no network)
     Status,
+    /// Reconcile unfinished intervals after a storage-refused boundary, without inventing time
+    Recover {
+        /// Acknowledge that refused boundaries cannot be reconstructed
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
     /// Inspect minimized evidence for an exact original harness session identifier
     Preview {
         #[arg(long)]

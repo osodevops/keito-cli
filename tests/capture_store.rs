@@ -647,3 +647,83 @@ fn all_terminal_events_during_pause_reconcile_without_reopening_the_turn() {
         assert_eq!(store.status().unwrap().unfinished, 0);
     }
 }
+
+#[test]
+fn storage_failure_requires_explicit_recovery_and_never_reconstructs_missing_seconds() {
+    let (dir, mut store, _) = setup();
+    event(&mut store, "unfinished", Some("turn"), Prompt, 0);
+    capture::record_failure(
+        &dir.path().join("capture"),
+        &capture::hash("refused-boundary"),
+        "STORAGE_UNAVAILABLE",
+    )
+    .unwrap();
+    let status = store.status().unwrap();
+    assert!(status.storage_paused);
+    assert_eq!(
+        status.capture_failure.unwrap().reason,
+        "STORAGE_UNAVAILABLE"
+    );
+    assert!(store
+        .event(
+            &repo(),
+            capture::Signal {
+                source: "codex",
+                resumed: false,
+                source_id: "new",
+                turn_id: Some("new"),
+                version: "fixture-v1",
+                event: Prompt,
+                clock: &clock(10)
+            }
+        )
+        .is_err());
+    store.recover(&clock(1000)).unwrap();
+    assert!(!store.status().unwrap().storage_paused);
+    let s = &store.preview("unfinished").unwrap()[0];
+    assert_eq!(s.segments[0].duration_seconds, 0);
+    assert_eq!(s.segments[0].completeness, "INCOMPLETE");
+    assert!(s.needs_attention);
+}
+#[test]
+fn queue_ceiling_reports_paused_reason_without_evicting_existing_evidence() {
+    let (dir, mut store, b) = setup();
+    event(&mut store, "existing", Some("turn"), Prompt, 0);
+    event(&mut store, "existing", Some("turn"), Stop, 90);
+    let (q, _) = body(&mut store, &b, 91);
+    let database = rusqlite::Connection::open(dir.path().join("capture/capture.sqlite3")).unwrap();
+    database
+        .execute("CREATE TABLE synthetic_full_queue (bytes BLOB)", [])
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO synthetic_full_queue VALUES(zeroblob(104780000))",
+            [],
+        )
+        .unwrap();
+    let status = store.status().unwrap();
+    assert!(status.storage_paused);
+    assert_eq!(
+        status.storage_reason.as_deref(),
+        Some("QUEUE_LIMIT_REACHED")
+    );
+    assert_eq!(status.pending, 1);
+    assert!(store
+        .event(
+            &repo(),
+            capture::Signal {
+                source: "codex",
+                resumed: false,
+                source_id: "blocked",
+                turn_id: Some("turn"),
+                version: "fixture-v1",
+                event: Prompt,
+                clock: &clock(100)
+            }
+        )
+        .is_err());
+    let body: String = database
+        .query_row("SELECT body FROM outbox WHERE id=?1", [q.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(body, q.body);
+}
