@@ -857,3 +857,73 @@ fn refused_stop_cannot_be_replaced_by_the_time_of_a_later_duplicate_stop() {
     assert!(s.segments.iter().all(|s| s.completeness == "INCOMPLETE"));
     assert!(store.status().unwrap().storage_paused);
 }
+
+#[test]
+fn refusal_is_reconciled_before_pause_and_resume_clock_transitions() {
+    let (dir, mut store, _) = setup();
+    event(&mut store,"refused-control",Some("turn"),Prompt,0);
+    capture::record_failure(&dir.path().join("capture"),&capture::hash("boundary"),"STORAGE_UNAVAILABLE").unwrap();
+    store.control(&repo(),"pause",&clock(150)).unwrap();
+    let _ = store.control(&repo(),"resume",&clock(170));
+    event(&mut store,"refused-control",Some("turn"),Stop,180);
+    let session=&store.preview("refused-control").unwrap()[0];
+    assert_eq!(session.segments.iter().map(|s|s.duration_seconds).sum::<i64>(),0);
+    assert!(session.segments.iter().all(|s|s.completeness=="INCOMPLETE"));
+    let database=rusqlite::Connection::open(dir.path().join("capture/capture.sqlite3")).unwrap();
+    let clocks:i64=database.query_row("SELECT COUNT(*) FROM sessions WHERE json_type(data,'$.active.clock')='object'",[],|r|r.get(0)).unwrap();
+    assert_eq!(clocks,0);
+}
+#[test]
+fn refusal_published_while_terminal_waits_for_sqlite_is_not_a_stale_authorization() {
+    let (dir, mut store, _) = setup();
+    event(&mut store,"racing-terminal",Some("turn"),Prompt,0);
+    let database=rusqlite::Connection::open(dir.path().join("capture/capture.sqlite3")).unwrap();
+    database.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let worker=std::thread::spawn(move || {event(&mut store,"racing-terminal",Some("turn"),Stop,150);store});
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    capture::record_failure(&dir.path().join("capture"),&capture::hash("boundary"),"STORAGE_UNAVAILABLE").unwrap();
+    database.execute_batch("ROLLBACK").unwrap();
+    let store=worker.join().unwrap();
+    let session=&store.preview("racing-terminal").unwrap()[0];
+    assert_eq!(session.segments.iter().map(|s|s.duration_seconds).sum::<i64>(),0);
+    assert!(session.needs_attention);
+}
+#[test]
+fn observed_mapping_invalidation_is_durable_until_explicit_reapproval() {
+    for remote in [false,true] {
+        let (_dir,mut store,binding)=setup();
+        event(&mut store,"invalidated",Some("turn"),Prompt,0);
+        let mut changed=repo(); if remote {changed.remote_hash=capture::hash("changed");}else{changed.disabled=true;}
+        store.event(&changed,capture::Signal{source:"codex",resumed:false,source_id:"invalidated",turn_id:Some("turn"),version:"fixture-v1",event:Stop,clock:&clock(60)}).unwrap();
+        event(&mut store,"invalidated",Some("turn"),Stop,150);
+        let session=&store.preview("invalidated").unwrap()[0];
+        assert_eq!(session.segments.iter().map(|s|s.duration_seconds).sum::<i64>(),0);
+        assert!(session.needs_attention);
+        assert!(store.binding(&repo().key).unwrap().unwrap().revoked);
+        assert!(store.claim(&binding,clock(160).wall).unwrap().is_none());
+        store.approve(binding.clone()).unwrap();
+        assert!(store.claim(&binding,clock(170).wall).unwrap().is_some());
+    }
+}
+#[test]
+fn repo_disable_checkpoints_previously_earned_fragments_without_another_native_hook() {
+    let (_dir,mut store,binding)=setup();
+    event(&mut store,"earned",Some("turn"),Prompt,0);
+    store.control(&repo(),"pause",&clock(30)).unwrap();
+    store.control(&repo(),"disable",&clock(60)).unwrap();
+    assert!(store.claim(&binding,clock(65).wall).unwrap().is_none());
+    store.approve(binding.clone()).unwrap();
+    let (_,body)=body(&mut store,&binding,100);
+    assert_eq!(body["segments"][0]["duration_seconds"],30);
+}
+#[test]
+fn idle_maintenance_expires_only_acknowledged_bodies_with_an_injected_clock() {
+    let (dir,mut store,binding)=setup();
+    event(&mut store,"expired",Some("turn"),Prompt,0);event(&mut store,"expired",Some("turn"),Stop,30);
+    let (row,_)=body(&mut store,&binding,31);store.acknowledge(&row,"server",clock(31).wall).unwrap();
+    event(&mut store,"unsent",Some("turn"),Prompt,40);event(&mut store,"unsent",Some("turn"),Stop,70);
+    store.maintain(clock(31).wall+8*24*3600).unwrap();
+    let database=rusqlite::Connection::open(dir.path().join("capture/capture.sqlite3")).unwrap();
+    let acknowledged:i64=database.query_row("SELECT COUNT(*) FROM outbox WHERE state='acknowledged'",[],|r|r.get(0)).unwrap();
+    assert_eq!(acknowledged,0);assert_eq!(store.status().unwrap().pending,1);assert_eq!(store.preview("expired").unwrap().len(),1);
+}
