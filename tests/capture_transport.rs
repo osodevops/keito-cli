@@ -327,3 +327,109 @@ async fn mapping_change_between_queued_revisions_stops_before_next_upload() {
     );
     assert_eq!(store.status().unwrap().pending, 1);
 }
+
+#[tokio::test]
+async fn malformed_success_acknowledgement_is_not_delivery_evidence() {
+    let server = MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("repo");
+    init(&root);
+    me(&server, "usr_1").await;
+    let (store, _) = seed(home.path(), &root, &server.uri());
+    Mock::given(method("POST")).and(path("/api/v2/agent-sessions")).respond_with(ResponseTemplate::new(201).set_body_json(json!({"agent_session":{"id":"","revision":1,"projection_state":"PROJECTED","review_state":"PENDING"}}))).mount(&server).await;
+    command(home.path(), &root, &server.uri())
+        .args(["capture", "sync", "--json"])
+        .assert()
+        .success();
+    let status = store.status().unwrap();
+    assert_eq!(status.pending, 1);
+    assert!(!status.delivery_verified);
+    assert_eq!(
+        status.queue[0].reason.as_deref(),
+        Some("INVALID_ACKNOWLEDGEMENT")
+    );
+}
+#[tokio::test]
+async fn in_progress_409_remains_retryable_and_server_prose_never_persists() {
+    let server = MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("repo");
+    init(&root);
+    me(&server, "usr_1").await;
+    let (store, _) = seed(home.path(), &root, &server.uri());
+    Mock::given(method("POST"))
+        .and(path("/api/v2/agent-sessions"))
+        .respond_with(
+            ResponseTemplate::new(409)
+                .insert_header("Retry-After", "1")
+                .set_body_json(
+                    json!({"error":{"code":"in_progress","message":"PRIVATE_SERVER_CANARY"}}),
+                ),
+        )
+        .mount(&server)
+        .await;
+    command(home.path(), &root, &server.uri())
+        .args(["capture", "sync", "--json"])
+        .assert()
+        .success();
+    let status = store.status().unwrap();
+    assert_eq!(status.pending, 1);
+    assert_eq!(status.held, 0);
+    assert_eq!(status.queue[0].reason.as_deref(), Some("IN_PROGRESS"));
+    assert!(!serde_json::to_string(&status).unwrap().contains("PRIVATE"));
+}
+#[tokio::test]
+async fn damaged_frozen_body_is_quarantined_before_any_post() {
+    let server = MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("repo");
+    init(&root);
+    me(&server, "usr_1").await;
+    let (store, _) = seed(home.path(), &root, &server.uri());
+    let db = rusqlite::Connection::open(home.path().join("capture/capture.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE outbox SET body=json_set(body,'$.project_id','another_project')",
+        [],
+    )
+    .unwrap();
+    Mock::given(method("POST")).and(path("/api/v2/agent-sessions")).respond_with(ResponseTemplate::new(201).set_body_json(json!({"agent_session":{"id":"canonical-session","revision":1,"projection_state":"PROJECTED","review_state":"PENDING"}}))).mount(&server).await;
+    command(home.path(), &root, &server.uri())
+        .args(["capture", "sync", "--json"])
+        .assert()
+        .failure();
+    assert!(!server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.method == "POST"));
+    assert_eq!(
+        store.status().unwrap().queue[0].reason.as_deref(),
+        Some("FROZEN_PAYLOAD_INVALID")
+    );
+}
+#[tokio::test]
+async fn http_date_retry_after_is_not_replaced_by_short_backoff() {
+    let server = MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("repo");
+    init(&root);
+    me(&server, "usr_1").await;
+    let (_store, _) = seed(home.path(), &root, &server.uri());
+    let future = chrono::Utc::now() + chrono::Duration::seconds(120);
+    let header = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    Mock::given(method("POST"))
+        .and(path("/api/v2/agent-sessions"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", header))
+        .mount(&server)
+        .await;
+    command(home.path(), &root, &server.uri())
+        .args(["capture", "sync", "--json"])
+        .assert()
+        .success();
+    let db = rusqlite::Connection::open(home.path().join("capture/capture.sqlite3")).unwrap();
+    let retry_at: i64 = db
+        .query_row("SELECT retry_at FROM outbox", [], |r| r.get(0))
+        .unwrap();
+    assert!(retry_at >= future.timestamp());
+}
