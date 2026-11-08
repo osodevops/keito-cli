@@ -17,7 +17,8 @@ while [ "$#" -gt 0 ]; do
 done
 case "$agent" in claude-code|codex) ;; *) exit 0 ;; esac
 case "$event" in session-start|prompt|stop|interrupt|session-end) ;; *) exit 0 ;; esac
-[[ "$version" =~ ^[A-Za-z0-9._+-]{1,64}$ ]] || exit 0
+[[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$ ]] || exit 0
+[[ "$version" != *..* ]] || exit 0
 keito_cmd=${KEITO_CLI_BIN:-keito}
 command -v "$keito_cmd" >/dev/null 2>&1 || exit 0
 "$keito_cmd" capture hook --agent "$agent" --event "$event" --harness-version "$version" \

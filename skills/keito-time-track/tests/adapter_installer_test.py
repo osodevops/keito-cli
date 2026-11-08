@@ -327,6 +327,14 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         self.assertFalse((self.root / ".keito/config.yml").exists())
         self.assertFalse(any("setup" in c["args"] for c in self.recorded()))
 
+    def test_api_incompatible_version_is_rejected_without_silent_truncation(self):
+        result = self.install("codex", "--harness-version", "0.167.0+build")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.config_path("codex").exists())
+        result = self.run_script("hooks/stop.sh", payload="{}", env={**self.env, "KEITO_HARNESS_VERSION": "0.167.0+build"})
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(self.recorded(), [])
+
     def test_management_scripts_delegate_without_legacy_state(self):
         for path, args, expected in [
             ("scripts/status.sh", [], ["capture", "status"]),

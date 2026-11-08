@@ -125,15 +125,15 @@ def check_runtime():
 
 def harness_version(agent, explicit):
     if explicit:
-        if not re.fullmatch(r'[A-Za-z0-9._+-]{1,64}', explicit):
-            raise SafeError('Invalid harness version; use the exact installed version without additional text.')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,63}', explicit) or '..' in explicit:
+            raise SafeError('Harness version is incompatible with the capture API identifier contract. Do not strip build metadata; qualify a supported release before retrying.')
         return explicit
     try:
         output = subprocess.run(['claude' if agent == 'claude-code' else 'codex', '--version'],
                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1)
         match = re.search(r'\b\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?\b', output.stdout)
         if output.returncode == 0 and match:
-            return match[0]
+            return harness_version(agent, match[0])
     except (OSError, subprocess.TimeoutExpired):
         pass
     return 'unknown'

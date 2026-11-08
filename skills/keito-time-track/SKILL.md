@@ -61,6 +61,15 @@ Removal preserves unrelated settings and refuses to delete modified skill
 payloads. It does not delete capture evidence or restore previously disabled
 legacy plugins automatically.
 
+## Plugin qualification
+
+Claude plugin registrations do not snapshot the running executable version.
+They use `KEITO_HARNESS_VERSION` when explicitly provided, otherwise `unknown`.
+Unknown means unqualified: never report a plugin as ready or live-delivery
+verified from installed files. The direct installer records the selected
+observed version; both routes still need real trust/dispatch qualification.
+These scripts do not run a version-discovery subprocess on every hook.
+
 ## Capture and privacy contract
 
 - `SessionStart` preserves session identity; `UserPromptSubmit` opens a turn;
