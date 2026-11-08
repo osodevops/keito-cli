@@ -38,6 +38,19 @@ if sys.argv[1:] == ['capture', '--help']:
 record = {'args': sys.argv[1:], 'payload': sys.stdin.read() if sys.argv[1:3] == ['capture', 'hook'] else ''}
 if 'setup' in sys.argv:
     record['mapping_at_setup'] = json.loads((Path.cwd() / '.keito/config.yml').read_text())
+if os.environ.get('FAKE_EXPECT_PRELAUNCH'):
+    import fcntl
+    pending = Path(os.environ['KEITO_CAPTURE_HOME']) / 'capture-invocations' / (os.environ.get('KEITO_CAPTURE_INVOCATION_NONCE', '') + '.pending')
+    record['prelaunch_valid'] = pending.is_file() and pending.read_bytes() == b'KEITO_CAPTURE_PENDING_V1\\n'
+    record['prelaunch_locked'] = False
+    if pending.is_file():
+        with pending.open('rb') as marker:
+            try:
+                fcntl.flock(marker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                record['prelaunch_locked'] = True
+if os.environ.get('FAKE_CORE_PID'):
+    Path(os.environ['FAKE_CORE_PID']).write_text(str(os.getpid()) + ' ' + str(os.getppid()))
 with open(os.environ['FAKE_CALLS'], 'a') as stream:
     stream.write(json.dumps(record) + '\\n')
 if os.environ.get('FAKE_PICKER') == '1':
@@ -64,12 +77,15 @@ if os.environ.get('FAKE_IGNORE_TERM'):
     if os.environ.get('FAKE_TERM_MARKER'):
         Path(os.environ['FAKE_TERM_MARKER']).write_text('TERM ignored')
 time.sleep(float(os.environ.get('FAKE_SLEEP', '0')))
-sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
+exit_code = int(os.environ.get('FAKE_EXIT', '0'))
+if exit_code == 0 and os.environ.get('FAKE_NO_ACK') != '1' and os.environ.get('KEITO_CAPTURE_ACK_FD'):
+    os.write(int(os.environ['KEITO_CAPTURE_ACK_FD']), os.environ.get('FAKE_ACK_BYTES', 'KEITO_CAPTURE_DURABLE_V1\\n').encode())
+sys.exit(exit_code)
 """)
         self.bin.chmod(0o700)
         self.env = {**os.environ, "HOME": str(self.home), "KEITO_CLI_BIN": str(self.bin),
                     "KEITO_AGENT_TYPE": "codex", "KEITO_HARNESS_VERSION": "0.167.0",
-                    "FAKE_CALLS": str(self.calls)}
+                    "FAKE_CALLS": str(self.calls), "KEITO_CAPTURE_HOME": str((self.root / 'capture-state').resolve())}
         for key in ("CLAUDE_PLUGIN_ROOT", "KEITO_SKILL_HOME", "KEITO_API_KEY", "KEITO_ACCOUNT_ID"):
             self.env.pop(key, None)
         # Warm only the fake Python executable before measuring adapter latency.
@@ -118,6 +134,211 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         result = self.run_script("hooks/stop.sh", payload="{}", env={**self.env, "FAKE_SLEEP": "3"})
         self.assertLess(time.monotonic() - started, 1.0)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
+    def test_durable_prelaunch_marker_precedes_core_and_only_exact_private_ack_clears_it(self):
+        result = self.run_script('hooks/prompt.sh', payload='PRIVATE_PRELAUNCH_CANARY',
+            env={**self.env, 'FAKE_EXPECT_PRELAUNCH': '1'})
+        self.assertEqual((result.returncode,result.stdout,result.stderr),(0,'',''))
+        call = self.recorded()[-1]
+        self.assertTrue(call['prelaunch_valid'])
+        self.assertTrue(call['prelaunch_locked'])
+        directory = Path(self.env['KEITO_CAPTURE_HOME']) / 'capture-invocations'
+        self.assertEqual(list(directory.iterdir()), [])
+        for value in ('missing', 'KEITO_CAPTURE_DURABLE_V1\nextra', 'KEITO_CAPTURE_DURABLE_V1'):
+            env = {**self.env, 'FAKE_NO_ACK': '1'} if value == 'missing' else {**self.env, 'FAKE_ACK_BYTES': value}
+            result = self.run_script('hooks/stop.sh',payload='PRIVATE_PRELAUNCH_CANARY',env=env)
+            self.assertEqual((result.returncode,result.stdout,result.stderr),(0,'',''))
+        markers = list(directory.iterdir())
+        self.assertEqual(len(markers),3)
+        for marker in markers:
+            self.assertRegex(marker.name,r'^[a-f0-9]{64}\.pending$')
+            self.assertEqual(marker.read_bytes(),b'KEITO_CAPTURE_PENDING_V1\n')
+            self.assertEqual(marker.stat().st_mode & 0o777,0o600)
+        self.assertEqual(directory.stat().st_mode & 0o777,0o700)
+
+    def test_first_attempt_core_that_never_enters_handler_retains_failure_evidence(self):
+        # No preflight/warmup of this executable. Delay is before its first
+        # observable handler action, matching the retained cold-core failure.
+        core = self.root / 'cold-never-entered'
+        entered = self.root / 'handler-entered'
+        core.write_text('#!/bin/sh\nsleep 2\nprintf entered > "$FAKE_ENTRY"\n')
+        core.chmod(0o700)
+        started = time.monotonic()
+        result = self.run_script('hooks/stop.sh',payload='PRIVATE_COLD_CANARY',
+            env={**self.env,'KEITO_CLI_BIN':str(core),'FAKE_ENTRY':str(entered)})
+        self.assertLess(time.monotonic()-started,1.0)
+        self.assertEqual((result.returncode,result.stdout,result.stderr),(0,'',''))
+        self.assertFalse(entered.exists())
+        directory = Path(self.env['KEITO_CAPTURE_HOME']) / 'capture-invocations'
+        self.assertTrue(directory.is_dir(),'A prelaunch marker must exist even when the core never reaches its handler')
+        markers = list(directory.iterdir())
+        self.assertEqual(len(markers),1)
+        self.assertEqual(markers[0].read_bytes(),b'KEITO_CAPTURE_PENDING_V1\n')
+        import fcntl
+        with markers[0].open('rb') as marker:
+            fcntl.flock(marker,fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_guard_refuses_symlinked_capture_root_or_invocation_directory(self):
+        external = self.root / 'external-capture'
+        external.mkdir(mode=0o700)
+        link = self.root / 'capture-link'
+        link.symlink_to(external,target_is_directory=True)
+        result = self.run_script('hooks/prompt.sh',payload='{}',env={**self.env,'KEITO_CAPTURE_HOME':str(link)})
+        self.assertEqual((result.returncode,result.stdout,result.stderr),(0,'',''))
+        self.assertEqual(self.recorded(),[])
+        self.assertEqual(list(external.iterdir()),[])
+        capture = Path(self.env['KEITO_CAPTURE_HOME'])
+        capture.mkdir(mode=0o700)
+        (capture / 'capture-invocations').symlink_to(external,target_is_directory=True)
+        result = self.run_script('hooks/prompt.sh',payload='{}')
+        self.assertEqual((result.returncode,result.stdout,result.stderr),(0,'',''))
+        self.assertEqual(self.recorded(),[])
+        self.assertEqual(list(external.iterdir()),[])
+
+    def test_parallel_invocations_have_distinct_locked_markers_until_durable_ack(self):
+        import fcntl
+        env = {**self.env,'FAKE_SLEEP':'0.25','FAKE_EXPECT_PRELAUNCH':'1'}
+        children = [subprocess.Popen(['bash',str(SKILL/'hooks/prompt.sh')],stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,cwd=self.root) for _ in range(2)]
+        def cleanup():
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=2)
+        self.addCleanup(cleanup)
+        for child in children:
+            child.stdin.write(b'PRIVATE_PARALLEL_CANARY'); child.stdin.close(); child.stdin=None
+        directory = Path(self.env['KEITO_CAPTURE_HOME']) / 'capture-invocations'
+        deadline = time.monotonic()+0.5
+        markers = []
+        while time.monotonic()<deadline:
+            markers = list(directory.iterdir()) if directory.exists() else []
+            if len(markers)==2: break
+            time.sleep(0.005)
+        self.assertEqual(len(markers),2)
+        for marker in markers:
+            with marker.open('rb') as stream:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(stream,fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for child in children:
+            out,err=child.communicate(timeout=1)
+            self.assertEqual((child.returncode,out,err),(0,b'',b''))
+        self.assertEqual(list(directory.iterdir()),[])
+
+    def test_missing_core_and_publication_lock_timeout_retain_classified_evidence(self):
+        import fcntl
+        capture = Path(self.env['KEITO_CAPTURE_HOME'])
+        capture.mkdir(mode=0o700)
+        lock = capture / 'capture-invocations-publication.lock'
+        fd = os.open(lock,os.O_RDWR | os.O_CREAT,0o600)
+        try:
+            fcntl.flock(fd,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            started = time.monotonic()
+            result = self.run_script('hooks/prompt.sh',payload='PRIVATE_LOCK_CANARY')
+            self.assertLess(time.monotonic()-started,1.0)
+            self.assertEqual((result.returncode,result.stdout,result.stderr),(0,'',''))
+            self.assertEqual(self.recorded(),[])
+            flags = list((capture/'capture-invocations').iterdir())
+            self.assertEqual(len(flags),1)
+            self.assertTrue(flags[0].name.endswith('.preparing'))
+            self.assertEqual(flags[0].read_bytes(),b'KEITO_CAPTURE_PENDING_V1\n')
+        finally:
+            os.close(fd)
+        result = self.run_script('hooks/prompt.sh',payload='PRIVATE_MISSING_CANARY',
+            env={**self.env,'KEITO_CLI_BIN':'/missing-keito-private'})
+        self.assertEqual((result.returncode,result.stdout,result.stderr),(0,'',''))
+        self.assertEqual(self.recorded(),[])
+        flags = list((capture/'capture-invocations').iterdir())
+        self.assertEqual(len(flags),2)
+        self.assertEqual(sum(p.name.endswith('.pending') for p in flags),1)
+        self.assertTrue(all(p.read_bytes()==b'KEITO_CAPTURE_PENDING_V1\n' for p in flags))
+
+    def test_sigkill_of_guard_releases_marker_lock_even_if_core_survives(self):
+        import fcntl
+        pids = self.root / 'core-and-guard-pids'
+        child = subprocess.Popen(['bash',str(SKILL/'hooks/prompt.sh')],stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,env={**self.env,'FAKE_SLEEP':'3','FAKE_CORE_PID':str(pids)},cwd=self.root)
+        child.stdin.write(b'PRIVATE_GUARD_KILL_CANARY'); child.stdin.close(); child.stdin=None
+        core_pid = None
+        try:
+            deadline = time.monotonic()+0.55
+            while not pids.exists() and time.monotonic()<deadline and child.poll() is None:
+                time.sleep(0.005)
+            self.assertTrue(pids.exists(),'The real guard must launch its child before this SIGKILL observation')
+            core_pid,guard_pid = map(int,pids.read_text().split())
+            os.kill(guard_pid,signal.SIGKILL)
+            out,err = child.communicate(timeout=1)
+            self.assertEqual((child.returncode,out,err),(0,b'',b''))
+            os.kill(core_pid,0)
+            flags = list((Path(self.env['KEITO_CAPTURE_HOME'])/'capture-invocations').iterdir())
+            self.assertEqual(len(flags),1)
+            self.assertEqual(flags[0].read_bytes(),b'KEITO_CAPTURE_PENDING_V1\n')
+            with flags[0].open('rb') as flag:
+                fcntl.flock(flag,fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            if core_pid is not None:
+                try:
+                    os.killpg(core_pid,signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=1)
+
+    def test_real_signals_during_preparation_and_publication_retain_minimized_flags(self):
+        wrapper = r'''
+import os, pathlib, runpy, signal, stat, sys
+script, core, boundary, signum = sys.argv[1:]
+open_real, sync_real, rename_real = os.open, os.fsync, os.rename
+phase = 'starting'
+marker_fd = None
+def stop_at(where):
+    if boundary == where:
+        os.kill(os.getpid(),int(signum))
+def opened(path,*args,**kwargs):
+    global marker_fd, phase
+    fd = open_real(path,*args,**kwargs)
+    if str(path).endswith('.preparing'):
+        marker_fd = fd
+        phase = 'preparing'
+        stop_at('preparing_created')
+    return fd
+def synced(fd):
+    result = sync_real(fd)
+    if fd == marker_fd:
+        stop_at('preparing_file_fsynced')
+    elif phase == 'published' and stat.S_ISDIR(os.fstat(fd).st_mode):
+        stop_at('pending_directory_fsynced')
+    return result
+def renamed(source,destination,*args,**kwargs):
+    global phase
+    result = rename_real(source,destination,*args,**kwargs)
+    if str(destination).endswith('.pending'):
+        phase = 'published'
+        stop_at('pending_renamed')
+    return result
+os.open, os.fsync, os.rename = opened, synced, renamed
+sys.argv = [script,core,'codex','prompt','0.167.0']
+runpy.run_path(script,run_name='__main__')
+'''
+        import fcntl
+        for boundary in ('preparing_created','preparing_file_fsynced','pending_renamed','pending_directory_fsynced'):
+            for sig in (signal.SIGTERM,signal.SIGKILL):
+                with self.subTest(boundary=boundary,signal=int(sig)):
+                    capture = (self.root/('signal-'+boundary+'-'+str(int(sig)))).resolve()
+                    result = subprocess.run([sys.executable,'-c',wrapper,str(SKILL/'hooks/guard.py'),
+                        str(self.bin),boundary,str(int(sig))],input='PRIVATE_SIGNAL_CANARY',
+                        env={**self.env,'KEITO_CAPTURE_HOME':str(capture)},capture_output=True,text=True,timeout=3)
+                    self.assertEqual(result.returncode,0 if sig==signal.SIGTERM else -int(sig),result.stderr)
+                    self.assertEqual((result.stdout,result.stderr),('',''))
+                    flags = list((capture/'capture-invocations').iterdir())
+                    self.assertEqual(len(flags),1)
+                    self.assertRegex(flags[0].name,r'^[a-f0-9]{64}\.(preparing|pending)$')
+                    self.assertTrue(b'KEITO_CAPTURE_PENDING_V1\n'.startswith(flags[0].read_bytes()))
+                    self.assertNotIn(b'PRIVATE_SIGNAL_CANARY',flags[0].read_bytes())
+                    with flags[0].open('rb') as flag:
+                        fcntl.flock(flag,fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertEqual(self.recorded(),[],'No heavy core may start before durable pending publication')
 
     def test_unknown_agent_does_not_invent_identity(self):
         result = self.run_script("hooks/prompt.sh", payload="{}", env={**self.env, "KEITO_AGENT_TYPE": "other"})

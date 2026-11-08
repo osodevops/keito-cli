@@ -20,12 +20,13 @@ case "$event" in session-start|prompt|stop|interrupt|session-end) ;; *) exit 0 ;
 [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$ ]] || exit 0
 [[ "$version" != *..* ]] || exit 0
 keito_cmd=${KEITO_CLI_BIN:-keito}
-command -v "$keito_cmd" >/dev/null 2>&1 || exit 0
-"$keito_cmd" capture hook --agent "$agent" --event "$event" --harness-version "$version" \
+command -v python3 >/dev/null 2>&1 || exit 0
+python3 "${BASH_SOURCE[0]%/*}/guard.py" "$keito_cmd" "$agent" "$event" "$version" \
   <&0 >/dev/null 2>&1 &
 worker=$!
-# The core commits SQLite locally before it acknowledges. Killing a stalled
-# process is safe; the next event/status exposes missing or incomplete evidence.
+# The guard publishes a locked, content-free flag before the heavy core starts.
+# Only a private fixed-byte durable ACK permits exact flag cleanup. A timeout,
+# missing executable or pre-handler death retains evidence for reconciliation.
 # Budget TERM/KILL inside one second, including launch and cleanup margin.
 (
   sleep 0.65
