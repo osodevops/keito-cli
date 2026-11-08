@@ -6,6 +6,7 @@
 mod capture_usage;
 use capture_usage::*;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::{fs, path::PathBuf};
 
 const SESSION: &str = "59455d61-5c59-4419-9cb8-9fb7143c317d";
@@ -83,6 +84,117 @@ fn codex(id: &str, turn: &str, resumed: bool) -> Value {
 }
 fn lifecycle(kind: &str, turn: &str) -> Value {
     json!({"type":"event_msg","payload":{"type":kind,"turn_id":turn,"message":"PRIVATE_EVENT_CANARY"}})
+}
+
+#[test]
+fn baseline_keeps_only_ids_including_provisional_or_nonnumeric_history() {
+    let mut old = claude("msg_old", 81);
+    old["message"]["stop_reason"] = Value::Null;
+    old["message"]["model"] = json!("PRIVATE_HISTORICAL_MODEL/path");
+    old["message"]["usage"] = json!({"input_tokens":"PRIVATE_HISTORY_COUNTER","output_tokens":-1});
+    let missing = json!({"type":"assistant","sessionId":SESSION,"message":{"id":"msg_missing"}});
+    let f = Fixture::new(Harness::ClaudeCode, vec![old, missing]);
+    let baseline = read_active_session_request_ids(&f.approved()).unwrap();
+    assert_eq!(
+        baseline.record_ids,
+        ["msg_old".to_owned(), "msg_missing".to_owned()]
+            .into_iter()
+            .collect()
+    );
+    assert!(baseline.limitations.is_empty());
+    let serialized = serde_json::to_string(&baseline).unwrap();
+    assert!(!serialized.contains("PRIVATE"));
+    assert!(!serialized.contains("usage"));
+    assert!(!serialized.contains("model"));
+    assert_eq!(baseline.source_adapter, "CLAUDE_JSONL_2_1_319_V1");
+}
+
+#[test]
+fn empty_stable_claude_baseline_is_valid_but_tail_or_missing_identity_is_not_complete() {
+    let f = Fixture::new(Harness::ClaudeCode, vec![]);
+    let empty = read_active_session_request_ids(&f.approved()).unwrap();
+    assert!(empty.record_ids.is_empty());
+    assert!(empty.limitations.is_empty());
+    fs::write(&f.path, b"{\"type\":\"assistant\"").unwrap();
+    let partial = read_active_session_request_ids(&f.approved()).unwrap();
+    assert!(partial.limitations.contains(&"INCOMPLETE_TAIL"));
+    f.write(vec![
+        json!({"type":"assistant","sessionId":SESSION,"message":{}}),
+    ]);
+    assert_eq!(
+        read_active_session_request_ids(&f.approved()),
+        Err(UsageReadError::InvalidRecord)
+    );
+}
+
+#[test]
+fn codex_baseline_requires_native_metadata_and_excludes_no_usage_response_ids() {
+    let mut old = codex("resp_old", "turn_old", false);
+    old["payload"]["usage"] = Value::Null;
+    let f = Fixture::new(Harness::Codex, vec![meta(), old.clone()]);
+    let ids = read_active_session_request_ids(&f.approved()).unwrap();
+    assert_eq!(
+        ids.record_ids,
+        ["resp_old".to_owned()].into_iter().collect()
+    );
+    f.write(vec![meta()]);
+    let ids = read_active_session_request_ids(&f.approved()).unwrap();
+    assert!(ids.record_ids.is_empty());
+    assert!(ids.limitations.is_empty());
+    f.write(vec![old]);
+    assert_eq!(
+        read_active_session_request_ids(&f.approved()),
+        Err(UsageReadError::InvalidSession)
+    );
+}
+
+#[test]
+fn excluded_history_is_skipped_before_counter_model_or_finality_decoding() {
+    let mut invalid = claude("msg_old", 81);
+    invalid["message"]["usage"] = json!({"output_tokens":"PRIVATE_INVALID_HISTORY"});
+    invalid["message"]["model"] = json!({"PRIVATE_MODEL":"invalid"});
+    invalid["message"]["stop_reason"] = json!({"PRIVATE_FINALITY":"invalid"});
+    let f = Fixture::new(Harness::ClaudeCode, vec![invalid, claude("msg_new", 7)]);
+    let excluded: BTreeSet<_> = ["msg_old".to_owned()].into_iter().collect();
+    let evidence = read_active_session_excluding_request_ids(&f.approved(), &excluded).unwrap();
+    assert_eq!(evidence.requests.len(), 1);
+    assert_eq!(evidence.requests[0].source_record_id, "msg_new");
+    assert!(!serde_json::to_string(&evidence)
+        .unwrap()
+        .contains("PRIVATE"));
+    let mut old = codex("resp_old", "turn_old", false);
+    old["payload"]["usage"] = json!({"input_tokens":"PRIVATE_INVALID_HISTORY"});
+    let f = Fixture::new(
+        Harness::Codex,
+        vec![
+            meta(),
+            old,
+            context("turn_new"),
+            codex("resp_new", "turn_new", false),
+        ],
+    );
+    let excluded: BTreeSet<_> = ["resp_old".to_owned()].into_iter().collect();
+    let evidence = read_active_session_excluding_request_ids(&f.approved(), &excluded).unwrap();
+    assert_eq!(evidence.requests.len(), 1);
+    assert_eq!(evidence.requests[0].source_record_id, "resp_new");
+}
+
+#[test]
+fn exclusion_never_bypasses_session_identity_or_changed_accepted_request_conflicts() {
+    let mut old = claude("msg_old", 5);
+    old["sessionId"] = json!("other-session");
+    let f = Fixture::new(Harness::ClaudeCode, vec![old]);
+    let excluded: BTreeSet<_> = ["msg_old".to_owned()].into_iter().collect();
+    assert_eq!(
+        read_active_session_excluding_request_ids(&f.approved(), &excluded),
+        Err(UsageReadError::InvalidSession)
+    );
+    f.write(vec![claude("msg_accepted", 5), claude("msg_accepted", 9)]);
+    let evidence = read_active_session_excluding_request_ids(&f.approved(), &excluded).unwrap();
+    assert!(evidence.requests.is_empty());
+    assert!(evidence
+        .limitations
+        .contains(&"CONFLICTING_REQUEST_RECORDS"));
 }
 
 #[test]

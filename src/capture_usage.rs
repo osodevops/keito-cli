@@ -1,8 +1,9 @@
-//! Isolated, unregistered active-session usage parser candidate.
+//! Bounded active-session readers; normal numeric extraction remains gated.
 //!
 //! No consent, hook installation, watcher, raw persistence, complete-coverage
 //! claim, pricing or expense creation. Supported numeric shapes are based on
 //! minimized probes; stream/interruption/finality qualification remains pending.
+//! Consent baselines use identity-only decoding, not historical numeric evidence.
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -161,11 +162,68 @@ pub struct UsageEvidence {
     pub limitations: Vec<&'static str>,
 }
 
+/// Consent baselines retain source identities only, never historical counters,
+/// model names, transcript paths, content or provisional usage snapshots.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ObservedRequestIds {
+    pub source_session_id: String,
+    pub harness_version: &'static str,
+    pub source_adapter: &'static str,
+    pub record_ids: BTreeSet<String>,
+    pub limitations: Vec<&'static str>,
+}
+
+pub fn read_active_session_request_ids(
+    approved: &ApprovedActiveSession,
+) -> Result<ObservedRequestIds, UsageReadError> {
+    let bytes = bounded_snapshot(&approved.path)?;
+    let (lines, incomplete_tail) = complete_lines(&bytes)?;
+    let mut record_ids = BTreeSet::new();
+    let mut saw_meta = false;
+    for line in lines {
+        let header: Header = decode(line)?;
+        match (approved.harness, header.kind.as_str()) {
+            (Harness::ClaudeCode, "assistant") => {
+                record_ids.insert(claude_request_id(approved, line)?);
+            }
+            (Harness::Codex, "session_meta") => {
+                verify_session_meta(approved, line)?;
+                saw_meta = true;
+            }
+            (Harness::Codex, "token_usage_record") => {
+                record_ids.insert(codex_request_id(approved, line, saw_meta)?);
+            }
+            _ => (),
+        }
+    }
+    if approved.harness == Harness::Codex && !saw_meta {
+        return Err(UsageReadError::InvalidSession);
+    }
+    Ok(ObservedRequestIds {
+        source_session_id: approved.session_id.clone(),
+        harness_version: approved.harness.version(),
+        source_adapter: approved.harness.adapter(),
+        record_ids,
+        limitations: if incomplete_tail {
+            vec!["INCOMPLETE_TAIL"]
+        } else {
+            vec![]
+        },
+    })
+}
+
+pub fn read_active_session_excluding_request_ids(
+    approved: &ApprovedActiveSession,
+    excluded: &BTreeSet<String>,
+) -> Result<UsageEvidence, UsageReadError> {
+    let bytes = bounded_snapshot(&approved.path)?;
+    parse_snapshot(approved, &bytes, excluded)
+}
+
 pub fn read_active_session(
     approved: &ApprovedActiveSession,
 ) -> Result<UsageEvidence, UsageReadError> {
-    let bytes = bounded_snapshot(&approved.path)?;
-    parse_snapshot(approved, &bytes)
+    read_active_session_excluding_request_ids(approved, &BTreeSet::new())
 }
 #[cfg(unix)]
 fn bounded_snapshot(path: &Path) -> Result<Vec<u8>, UsageReadError> {
@@ -254,6 +312,14 @@ struct ClaudeIdentity {
     session_id: String,
 }
 #[derive(Deserialize)]
+struct ClaudeObservedRecord {
+    message: ClaudeObservedMessage,
+}
+#[derive(Deserialize)]
+struct ClaudeObservedMessage {
+    id: String,
+}
+#[derive(Deserialize)]
 struct ClaudeRecord {
     #[serde(rename = "sessionId")]
     session_id: String,
@@ -314,6 +380,14 @@ struct CodexRecord {
     root_turn_id: String,
     response_id: String,
     usage: Option<CodexTokens>,
+}
+#[derive(Deserialize)]
+struct CodexObservedRecord {
+    thread_id: String,
+    session_id: String,
+    turn_id: String,
+    root_turn_id: String,
+    response_id: String,
 }
 #[derive(Deserialize)]
 struct CodexTokens {
@@ -393,6 +467,75 @@ fn model(value: Option<String>) -> Result<Option<String>, UsageReadError> {
     }
     Ok(value)
 }
+fn complete_lines(bytes: &[u8]) -> Result<(Vec<&[u8]>, bool), UsageReadError> {
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(UsageReadError::TooLarge);
+    }
+    let mut lines = Vec::new();
+    let mut count = 0;
+    let mut tail = false;
+    for chunk in bytes.split_inclusive(|b| *b == b'\n') {
+        if chunk.last() != Some(&b'\n') {
+            tail = true;
+            break;
+        }
+        let line = &chunk[..chunk.len() - 1];
+        count += 1;
+        if count > MAX_RECORDS || line.len() > MAX_LINE_BYTES {
+            return Err(UsageReadError::TooLarge);
+        }
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            lines.push(line);
+        }
+    }
+    Ok((lines, tail))
+}
+fn claude_request_id(
+    approved: &ApprovedActiveSession,
+    line: &[u8],
+) -> Result<String, UsageReadError> {
+    let identity: ClaudeIdentity = decode(line).map_err(|_| UsageReadError::InvalidSession)?;
+    if identity.session_id != approved.session_id {
+        return Err(UsageReadError::InvalidSession);
+    }
+    let record: ClaudeObservedRecord = decode(line)?;
+    identifier(&record.message.id)?;
+    if !record.message.id.starts_with("msg_") {
+        return Err(UsageReadError::InvalidRecord);
+    }
+    Ok(record.message.id)
+}
+fn verify_session_meta(
+    approved: &ApprovedActiveSession,
+    line: &[u8],
+) -> Result<(), UsageReadError> {
+    let meta: Envelope<SessionMeta> = decode(line).map_err(|_| UsageReadError::InvalidSession)?;
+    if meta.payload.id != approved.session_id || meta.payload.session_id != approved.session_id {
+        return Err(UsageReadError::InvalidSession);
+    }
+    if meta.payload.cli_version.as_deref() != Some(approved.harness.version()) {
+        return Err(UsageReadError::UnsupportedVersion);
+    }
+    Ok(())
+}
+fn codex_request_id(
+    approved: &ApprovedActiveSession,
+    line: &[u8],
+    saw_meta: bool,
+) -> Result<String, UsageReadError> {
+    let raw: Envelope<CodexObservedRecord> = decode(line)?;
+    let raw = raw.payload;
+    if !saw_meta || raw.session_id != approved.session_id || raw.thread_id != approved.session_id {
+        return Err(UsageReadError::InvalidSession);
+    }
+    identifier(&raw.response_id)?;
+    identifier(&raw.turn_id)?;
+    identifier(&raw.root_turn_id)?;
+    if !raw.response_id.starts_with("resp_") {
+        return Err(UsageReadError::InvalidRecord);
+    }
+    Ok(raw.response_id)
+}
 fn validate_counters(request: &RequestUsage) -> Result<(), UsageReadError> {
     if [
         request.input_tokens,
@@ -427,6 +570,7 @@ fn validate_counters(request: &RequestUsage) -> Result<(), UsageReadError> {
 fn parse_snapshot(
     approved: &ApprovedActiveSession,
     bytes: &[u8],
+    excluded: &BTreeSet<String>,
 ) -> Result<UsageEvidence, UsageReadError> {
     let mut limitations = BTreeSet::new();
     let mut contexts: BTreeMap<String, Option<String>> = BTreeMap::new();
@@ -459,6 +603,13 @@ fn parse_snapshot(
         let header: Header = decode(line)?;
         match (approved.harness, header.kind.as_str()) {
             (Harness::ClaudeCode, "assistant") => {
+                let id = claude_request_id(approved, line)?;
+                // A consent baseline excludes historical IDs before decoding
+                // their numeric, model or finality fields. They never become
+                // numeric evidence or conflicts in this authorized epoch.
+                if excluded.contains(&id) {
+                    continue;
+                }
                 // A filename is not identity. Every usage-bearing record must
                 // identify this exact approved session.
                 let identity: ClaudeIdentity =
@@ -522,16 +673,7 @@ fn parse_snapshot(
                 });
             }
             (Harness::Codex, "session_meta") => {
-                let meta: Envelope<SessionMeta> =
-                    decode(line).map_err(|_| UsageReadError::InvalidSession)?;
-                if meta.payload.id != approved.session_id
-                    || meta.payload.session_id != approved.session_id
-                {
-                    return Err(UsageReadError::InvalidSession);
-                }
-                if meta.payload.cli_version.as_deref() != Some(approved.harness.version()) {
-                    return Err(UsageReadError::UnsupportedVersion);
-                }
+                verify_session_meta(approved, line)?;
                 saw_meta = true;
             }
             (Harness::Codex, "event_msg") => {
@@ -589,6 +731,10 @@ fn parse_snapshot(
                 }
             }
             (Harness::Codex, "token_usage_record") => {
+                let id = codex_request_id(approved, line, saw_meta)?;
+                if excluded.contains(&id) {
+                    continue;
+                }
                 let raw: Envelope<CodexRecord> = decode(line)?;
                 let raw = raw.payload;
                 if !saw_meta
