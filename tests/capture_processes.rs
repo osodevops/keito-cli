@@ -100,3 +100,56 @@ fn concurrent_real_hook_processes_persist_once_and_discard_raw_content() {
         assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE"));
     }
 }
+
+#[test]
+fn sqlite_contention_exposes_lost_boundary_as_storage_pause_in_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .arg("init")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let capture = temp.path().join("capture");
+    let _store = Store::open(&capture).unwrap();
+    let database = rusqlite::Connection::open(capture.join("capture.sqlite3")).unwrap();
+    database.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("keito"))
+        .current_dir(&root)
+        .env("KEITO_CAPTURE_HOME", &capture)
+        .args([
+            "capture",
+            "hook",
+            "--agent",
+            "codex",
+            "--event",
+            "prompt",
+            "--harness-version",
+            "0.167.0",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(serde_json::json!({"cwd":root,"session_id":"session-contention","turn_id":"turn-contention","prompt":"PRIVATE_CANARY"}).to_string().as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    database.execute_batch("ROLLBACK").unwrap();
+    let result = Command::new(assert_cmd::cargo::cargo_bin!("keito"))
+        .current_dir(&root)
+        .env("KEITO_CAPTURE_HOME", &capture)
+        .args(["capture", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(status["storage_paused"], true);
+    assert!(status["capture_failure"]["boundary_id"].as_str().is_some());
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("PRIVATE_CANARY"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("held this event"));
+}
