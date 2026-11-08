@@ -6,19 +6,23 @@ use predicates::prelude::*;
 #[test]
 fn capture_status_is_a_local_metadata_only_command() {
     let home = tempfile::tempdir().unwrap();
-    Command::cargo_bin("keito").unwrap()
+    Command::cargo_bin("keito")
+        .unwrap()
         .env("KEITO_CAPTURE_HOME", home.path().join("capture"))
         .args(["capture", "status", "--json"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(predicate::str::contains("\"pending\": 0"))
         .stdout(predicate::str::contains("\"delivery_verified\": false"));
 }
 
 #[test]
 fn capture_setup_requires_explicit_local_consent_and_targets() {
-    Command::cargo_bin("keito").unwrap()
+    Command::cargo_bin("keito")
+        .unwrap()
         .args(["capture", "setup", "--project", "p1", "--task", "t1"])
-        .assert().failure()
+        .assert()
+        .failure()
         .stderr(predicate::str::contains("--agent"));
 }
 
@@ -34,7 +38,9 @@ fn capture_hook_discards_sensitive_input_without_a_mapping() {
     for entry in std::fs::read_dir(home.path()).unwrap() {
         let entry = entry.unwrap();
         if entry.path().is_file() {
-            assert!(!String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap()).contains("PRIVATE"));
+            assert!(
+                !String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap()).contains("PRIVATE")
+            );
         }
     }
 }

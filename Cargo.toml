@@ -36,6 +36,10 @@ thiserror = "2"
 colored = "3"
 dialoguer = "0.12"
 clap_mangen = "0.3"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+sha2 = "0.11.1"
+libc = "0.2.191"
+serde_yaml = "0.9.34"
 
 [dev-dependencies]
 assert_cmd = "2"

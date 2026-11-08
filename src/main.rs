@@ -1,4 +1,5 @@
 mod api;
+mod capture;
 mod cli;
 mod commands;
 mod config;
@@ -35,6 +36,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
     };
 
     match cli.command {
+        cli::Command::Capture(cmd) => commands::capture::run(cmd, &cli.global, output_mode).await,
         cli::Command::Auth(cmd) => commands::auth::run(cmd, &cli.global, output_mode).await,
         cli::Command::Clients(cmd) => commands::clients::run(cmd, &cli.global, output_mode).await,
         cli::Command::Time(cmd) => commands::time::run(cmd, &cli.global, output_mode).await,
