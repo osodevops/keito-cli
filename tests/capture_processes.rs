@@ -150,6 +150,8 @@ fn sqlite_contention_exposes_lost_boundary_as_storage_pause_in_status() {
         )
         .is_err());
     let event_elapsed = core_start.elapsed();
+    #[cfg(feature = "dev-tools")]
+    let admission = probe.last_admission_timing().unwrap().clone();
     let refusal_start = std::time::Instant::now();
     capture::record_failure(
         &capture,
@@ -165,6 +167,26 @@ fn sqlite_contention_exposes_lost_boundary_as_storage_pause_in_status() {
         refusal_elapsed.as_secs_f64() * 1000.0,
         core_elapsed.as_secs_f64() * 1000.0
     );
+    #[cfg(feature = "dev-tools")]
+    {
+        println!(
+            "admission phases: permit={:?} sqlite_begin={:?} sqlite_error={:?} authority={:?}",
+            admission.permit_validation,
+            admission.sqlite_begin,
+            admission.sqlite_error,
+            admission.authority
+        );
+        assert!(admission.permit_validation.is_some());
+        assert!(admission.sqlite_begin.is_some());
+        assert_eq!(
+            admission.sqlite_error,
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert_eq!(
+            admission.authority, None,
+            "authority must not start after failed SQLite admission"
+        );
+    }
     assert!(
         core_elapsed < std::time::Duration::from_millis(700),
         "core admission and marker exceeded watchdog budget: event={event_elapsed:?} refusal={refusal_elapsed:?} total={core_elapsed:?}"

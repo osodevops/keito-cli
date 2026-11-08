@@ -16,6 +16,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(feature = "dev-tools")]
 use std::time::Duration;
 
 pub const MAX_EVENT_BYTES: usize = 1024 * 1024;
@@ -512,7 +513,19 @@ impl CaptureTransaction<'_> {
         Ok(())
     }
 }
+/// Developer-only passive phase observations; no identifiers, paths or payloads.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Debug, Default)]
+pub struct AdmissionTiming {
+    pub permit_validation: Option<Duration>,
+    pub sqlite_begin: Option<Duration>,
+    pub sqlite_error: Option<rusqlite::ErrorCode>,
+    pub authority: Option<Duration>,
+}
+
 pub struct Store {
+    #[cfg(feature = "dev-tools")]
+    last_admission_timing: Option<AdmissionTiming>,
     connection: Connection,
     directory: PathBuf,
     invocation: Option<Permit>,
@@ -609,9 +622,17 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(storage_error)?;
         }
-        let connection = Connection::open(path).map_err(storage_error)?;
+        let mut connection = Connection::open(path).map_err(storage_error)?;
+        let origin = std::time::Instant::now();
+        let mut admission_budget = crate::capture_busy::BusyBudget::default();
         connection
-            .busy_timeout(Duration::from_millis(500))
+            .busy_handler(Some(move |count| {
+                admission_budget.retry(
+                    count,
+                    || std::time::Instant::now().checked_duration_since(origin),
+                    std::thread::sleep,
+                )
+            }))
             .map_err(storage_error)?;
         connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA max_page_count=25600;
             CREATE TABLE IF NOT EXISTS bindings (repo_key TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -624,8 +645,16 @@ impl Store {
             connection,
             directory: directory.to_owned(),
             invocation: None,
+            #[cfg(feature = "dev-tools")]
+            last_admission_timing: None,
         })
     }
+    #[cfg(feature = "dev-tools")]
+    #[doc(hidden)]
+    pub fn last_admission_timing(&self) -> Option<&AdmissionTiming> {
+        self.last_admission_timing.as_ref()
+    }
+
     pub fn hook_invocation(&mut self, nonce: &str) -> Result<(), AppError> {
         self.invocation = Some(Permit::new(&self.directory, nonce)?);
         Ok(())
@@ -643,16 +672,46 @@ impl Store {
         self.transaction_for_event(false)
     }
     fn transaction_for_event(&mut self, event: bool) -> Result<CaptureTransaction<'_>, AppError> {
+        #[cfg(feature = "dev-tools")]
+        let permit_started = {
+            self.last_admission_timing = Some(AdmissionTiming::default());
+            std::time::Instant::now()
+        };
         let directory = self.directory.clone();
         let invocation = if event { self.invocation.clone() } else { None };
         if let Some(permit) = &invocation {
             permit.validate(&directory)?;
         }
-        let inner = self
+        #[cfg(feature = "dev-tools")]
+        let sqlite_started = {
+            self.last_admission_timing
+                .as_mut()
+                .unwrap()
+                .permit_validation = Some(permit_started.elapsed());
+            std::time::Instant::now()
+        };
+        let admission = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(storage_error)?;
-        let authority = AuthorityGuard::acquire(&directory, true)?;
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate);
+        #[cfg(feature = "dev-tools")]
+        {
+            let timing = self.last_admission_timing.as_mut().unwrap();
+            timing.sqlite_begin = Some(sqlite_started.elapsed());
+            timing.sqlite_error = admission
+                .as_ref()
+                .err()
+                .and_then(rusqlite::Error::sqlite_error_code);
+        }
+        let inner = admission.map_err(storage_error)?;
+        #[cfg(feature = "dev-tools")]
+        let authority_started = std::time::Instant::now();
+        let authority = AuthorityGuard::acquire(&directory, true);
+        #[cfg(feature = "dev-tools")]
+        {
+            self.last_admission_timing.as_mut().unwrap().authority =
+                Some(authority_started.elapsed());
+        }
+        let authority = authority?;
         if let Some(permit) = &invocation {
             permit.validate(&directory)?;
         }

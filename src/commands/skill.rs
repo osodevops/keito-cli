@@ -971,6 +971,17 @@ fn relative_display(path: &Path) -> String {
 }
 
 fn capture_diagnostics(global: &GlobalFlags) -> (serde_json::Value, serde_json::Value) {
+    if cfg!(not(unix)) {
+        // Doctor is available on this platform, but must not probe unsupported
+        // native storage/authority or imply repository approval and delivery.
+        return (
+            serde_json::json!({"supported":false,"storage_paused":true,"reason":"UNSUPPORTED_PLATFORM",
+                "current_repository":{"approved":false,"mapping_current":false,"paused":true,"reason":"UNSUPPORTED_PLATFORM"},
+                "delivery_verified":false,"historical_delivery_verified":null,
+                "usage":{"status":"UNAVAILABLE","reason":"UNSUPPORTED_PLATFORM"}}),
+            serde_json::json!({"installed":false,"loaded":false,"running":false,"stale":false,"state":"UNSUPPORTED_PLATFORM"}),
+        );
+    }
     let default_worker = serde_json::json!({"installed":false,"loaded":false,"running":false,"stale":false,"state":"UNKNOWN"});
     let directory = crate::capture_invocations::directory().ok();
     let Some(directory) = directory else {

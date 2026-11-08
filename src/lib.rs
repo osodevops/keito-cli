@@ -2,6 +2,7 @@ mod adapter_files;
 pub mod api;
 pub mod capture;
 mod capture_authority;
+mod capture_busy;
 mod capture_invocations;
 pub mod capture_mapping;
 pub mod capture_runtime_pair;

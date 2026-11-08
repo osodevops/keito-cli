@@ -164,4 +164,16 @@ fn local_doctor_distinguishes_repository_worker_and_delivery_from_credential_pre
     assert_eq!(status["ready"], false);
     assert_eq!(status["delivery_verified"], false);
     assert_eq!(status["hook_trust"], "UNKNOWN_REVIEW_IN_HARNESS");
+    #[cfg(not(unix))]
+    {
+        assert_eq!(status["capture"]["reason"], "UNSUPPORTED_PLATFORM");
+        assert_eq!(status["capture"]["current_repository"]["approved"], false);
+        assert_eq!(status["worker"]["state"], "UNSUPPORTED_PLATFORM");
+        assert_eq!(status["worker"]["installed"], false);
+        assert_eq!(status["worker"]["running"], false);
+        assert!(
+            !home.path().join("capture").exists(),
+            "unsupported doctor created native storage"
+        );
+    }
 }
