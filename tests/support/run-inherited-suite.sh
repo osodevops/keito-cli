@@ -9,7 +9,7 @@ shift 3
 export KEITO_TEST_SERVICE_BOUNDARY_RECEIPT="$root/service-boundary-receipt.json"
 "$cargo_bin" test --locked --all-features --all-targets "$@"
 if [ "$#" -eq 0 ]; then
-  # Finite socket-only tests; isolated startup, no external package imports.
+  # Finite protocol and bootstrap fake/metadata tests; isolated startup.
   python3 -I -S -B tests/support/test_source_qa_protocol.py
   python3 -I -S -B tests/support/test_source_qa_protocol_review_regressions.py
   python3 -I -S -B tests/support/test_source_qa_build_owner.py
