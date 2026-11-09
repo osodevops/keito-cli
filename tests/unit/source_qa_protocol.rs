@@ -6,6 +6,12 @@ const PEER: u32 = 12345;
 
 fn pair() -> (Endpoint, UnixStream) {
     let (reader, writer) = UnixStream::pair().unwrap();
+    writer
+        .set_write_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
+    writer
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
     (
         Endpoint::new(reader, NONCE.into(), Some(PEER)).unwrap(),
         writer,
@@ -184,14 +190,42 @@ fn budgets_are_total_sticky_and_checked_before_increment() {
 #[test]
 fn each_poll_has_fixed_read_and_parse_budgets() {
     let (mut endpoint, mut writer) = pair();
-    for _ in 0..100 {
-        frame(&mut writer, NONCE, "CANCEL|12345|100");
-    }
+    // Exercise a constrained finite transport rather than assuming host socket
+    // buffering can hold one allocation per small write before the first read.
+    let bytes: libc::c_int = 8192;
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                writer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&bytes as *const libc::c_int).cast(),
+                std::mem::size_of_val(&bytes) as libc::socklen_t,
+            )
+        },
+        0
+    );
+    // One bounded write avoids Linux per-write socket-buffer accounting. All
+    // 100 frames remain pending before the first receive, as this test requires.
+    let frames = format!("{NONCE}|CANCEL|12345|100\n").repeat(100);
+    writer.write_all(frames.as_bytes()).unwrap();
     endpoint.receive(true).unwrap();
     assert!(endpoint.last_poll.reads <= MAX_READS);
     assert!(endpoint.last_poll.parsed <= MAX_PARSE);
     assert!(endpoint.owner.borrow().frames < 100);
     assert!(endpoint.pending.len() <= MAX_PENDING);
+    // Prove the budget yielded with work left, then consume the complete finite
+    // input without relaxing the limits or relying on writer packet boundaries.
+    for _ in 0..100 {
+        if endpoint.owner.borrow().frames == 100 {
+            break;
+        }
+        endpoint.receive(true).unwrap();
+        assert!(endpoint.last_poll.reads <= MAX_READS);
+        assert!(endpoint.last_poll.parsed <= MAX_PARSE);
+        assert!(endpoint.pending.len() <= MAX_PENDING);
+    }
+    assert_eq!(endpoint.owner.borrow().frames, 100);
 }
 #[test]
 fn live_registration_trace_round_trip_and_shared_budget() {
