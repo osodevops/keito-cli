@@ -340,6 +340,110 @@ class Tests(unittest.TestCase):
         self.assertFalse(state.proof)
         self.assertEqual(state.first, "TERMINAL")
 
+    def finalizer_case(self, phase):
+        import io
+        import json
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        state = object.__new__(m.BuildRun)
+        state.root = Path("/inert-no-files-opened")
+        state.first, state.secondary = "ORIGINAL_OPERATION", []
+        state.cancelled = False
+        state.keeper, state.keeper_status = 42, None
+        state.child_status = None
+        state.child_attempted = True
+        state.hard, state.end = 1000, 500
+        state.gone = state.release = state.proof = False
+        state.writer_attempted = state.writer_shutdown_ok = False
+        calls, packets = [], []
+        class Child:
+            pid = 43
+            count = 0
+            def poll(self):
+                self.count += 1
+                calls.append("child_wait")
+                return 0 if phase != "late" or self.count >= 3 else None
+        state.child = Child()
+        class ActorStream(Stream):
+            def shutdown(self, _):
+                calls.append("shutdown")
+                if phase == "shutdown":
+                    state.cancel_signal(None, None)
+                self.shutdowns += 1
+        state.channel = m.Channel(ActorStream(), "a" * 32)
+        class Close:
+            def __init__(self, name):
+                self.name = name
+            def close(self):
+                calls.append(self.name)
+                if self.name == "output_close" and phase == "close":
+                    state.cancel_signal(None, None)
+                    raise OSError("synthetic close")
+        state.output, state.trace = Close("output_close"), Close("trace_close")
+        parent, child_end = Close("parent_close"), Close("child_end_close")
+        class Receipt(io.StringIO):
+            def fileno(self):
+                return 99
+        wait_count = 0
+        def wait(*_):
+            nonlocal wait_count
+            wait_count += 1
+            calls.append("keeper_wait")
+            return (42, 0) if phase != "late" or wait_count >= 3 else (0, 0)
+        def sleep(_):
+            calls.append("late_sleep")
+            if phase == "late":
+                state.cancel_signal(None, None)
+        stderr = object()
+        def publish(value, **kwargs):
+            calls.append("stderr_fact" if kwargs.get("file") is stderr else "stdout_fact")
+            if phase == "fact" and kwargs.get("file") is not stderr:
+                state.cancel_signal(None, None)
+                raise OSError("synthetic output")
+            packets.append(json.loads(value))
+        error = None
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(m.os, "waitpid", side_effect=wait))
+            stack.enter_context(patch.object(m.os, "fsync"))
+            stack.enter_context(patch.object(m.time, "monotonic_ns", return_value=1))
+            stack.enter_context(patch.object(m.time, "sleep", side_effect=sleep))
+            stack.enter_context(patch.object(m, "exclusive", side_effect=lambda *_: Receipt()))
+            stack.enter_context(patch.object(m.signal, "signal", side_effect=lambda *args: calls.append("restore_handler")))
+            stack.enter_context(patch.object(m.sys, "stderr", stderr))
+            stack.enter_context(patch("builtins.print", side_effect=publish))
+            try:
+                state.finalize(parent, child_end, False, {m.signal.SIGINT: None, m.signal.SIGTERM: None})
+            except BaseException as caught:
+                error = caught
+        self.assertIsNone(error, "catchable cancellation/secondary errors must not escape finalization")
+        self.assertEqual(state.first, "ORIGINAL_OPERATION")
+        self.assertEqual((state.child_status, state.keeper_status), (0, 0))
+        for name in ["child_wait", "keeper_wait", "child_end_close", "parent_close", "output_close", "trace_close", "restore_handler"]:
+            self.assertIn(name, calls)
+        self.assertEqual(calls.count("restore_handler"), 2)
+        self.assertTrue(packets, "retained facts must reach the bounded fallback")
+        self.assertEqual(packets[-1]["owner_result"]["first_fault"], "ORIGINAL_OPERATION")
+        self.assertFalse(packets[-1]["first_saved"])
+        if phase == "late":
+            self.assertGreaterEqual(state.child.count, 3)
+            self.assertGreaterEqual(wait_count, 3)
+            self.assertIsNone(packets[-1]["cutpoint"]["child_wait"])
+            self.assertEqual(packets[-1]["owner_result"]["child_wait"], 0)
+        if phase == "fact":
+            self.assertIn("stderr_fact", calls)
+
+    def test_r24_cancel_at_finalizer_shutdown_retains_both_waits_and_facts(self):
+        self.finalizer_case("shutdown")
+
+    def test_r24_cancel_during_late_wait_does_not_abort_remaining_collection(self):
+        self.finalizer_case("late")
+
+    def test_r24_cancel_and_fact_output_failure_still_close_and_publish_fallback(self):
+        self.finalizer_case("fact")
+
+    def test_r24_secondary_close_failure_cannot_skip_other_owned_resources(self):
+        self.finalizer_case("close")
+
 
 if __name__ == "__main__":
     unittest.main()
