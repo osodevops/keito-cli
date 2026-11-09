@@ -1883,6 +1883,7 @@ mod tests {
     enum ReadAction {
         Bytes(Vec<u8>),
         Interrupted,
+        Fault,
     }
     #[derive(Default)]
     struct ScriptedIo {
@@ -1900,6 +1901,7 @@ mod tests {
                     Ok(bytes.len())
                 }
                 Some(ReadAction::Interrupted) => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Some(ReadAction::Fault) => Err(io::Error::other("scripted read fault")),
                 None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
             }
         }
@@ -2083,5 +2085,185 @@ mod tests {
         );
         assert!(session.released && channel.eof);
         assert_eq!(session.group.events, events);
+    }
+    // R21 tests use the same keeper_turn and real parent reducer, not a second
+    // parser/state model. All group operations below are fake event recording.
+    fn r21_parent_frame(end: u64, at: u64) -> Vec<u8> {
+        let (left, mut right) = UnixStream::pair().unwrap();
+        right
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        right
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut channel = Channel::new(left, "a".repeat(32)).unwrap();
+        let mut parent = Settlement::new(20 * CLEANUP_NS);
+        parent.progress.phase = Phase::Parked;
+        parent.begin(end, at, &mut channel).unwrap();
+        assert_eq!(parent.progress.deadline_ns, end);
+        let expected = format!("{}|CLEAN|{end}\n", "a".repeat(32)).into_bytes();
+        let mut frame = vec![0; expected.len()];
+        right.read_exact(&mut frame).unwrap();
+        assert_eq!(frame, expected);
+        frame
+    }
+    fn r21_rejected_prefix(prior_fault: bool, invalid_number: bool) {
+        let mut session = helper_fixture();
+        let base = if prior_fault {
+            session.lifetime.operation_end
+        } else {
+            2
+        };
+        if !prior_fault {
+            session.control("CLEAN|1000000000", 1).unwrap();
+        }
+        session.step(&mut || Ok(base)).unwrap();
+        let original = session.first_fault;
+        let grace = session.term_end;
+        let events = session.group.events.clone();
+        let end = base + 100_000_000;
+        let mut bytes = if invalid_number {
+            format!("{}|CLEAN|0001\n", "a".repeat(32)).into_bytes()
+        } else {
+            format!("{}|PARK\n", "b".repeat(32)).into_bytes()
+        };
+        bytes.extend(r21_parent_frame(end, base + 10_000_000));
+        assert!(bytes.len() < MAX_FRAME);
+        let mut channel = scripted_channel(&bytes);
+        let result = keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || {
+            Ok(base + 150_000_000)
+        });
+        assert_eq!(
+            session.group.events, events,
+            "rejected line must not authorize a step before buffered CLEAN"
+        );
+        assert_eq!(session.end, end);
+        assert_eq!(session.term_end, grace);
+        assert_eq!(
+            session.first_fault,
+            original.or(Some(if invalid_number {
+                "KEEPER_CONTROL"
+            } else {
+                "KEEPER_CHANNEL"
+            }))
+        );
+        assert_eq!(result.unwrap_err().to_string(), "KEEPER_CLEANUP_DEADLINE");
+        assert!(!session.gone && !session.released);
+        assert!(channel.stream.output.is_empty());
+    }
+    #[test]
+    fn r21_wrong_nonce_before_accepted_minimum_does_not_authorize_a_group_step() {
+        r21_rejected_prefix(false, false);
+    }
+    #[test]
+    fn r21_prior_expiry_fault_survives_rejected_line_and_buffered_minimum() {
+        r21_rejected_prefix(true, false);
+    }
+    #[test]
+    fn r21_invalid_number_before_valid_minimum_preserves_control_fault() {
+        r21_rejected_prefix(false, true);
+    }
+
+    fn r21_fatal_channel(mut channel: Channel<ScriptedIo>) {
+        let mut session = helper_fixture();
+        session.control("CLEAN|1000000000", 1).unwrap();
+        session.step(&mut || Ok(2)).unwrap();
+        let mut expected = session.group.events.clone();
+        let grace = session.term_end;
+        let result = keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || {
+            Ok(150_000_000)
+        });
+        assert!(
+            result.is_err(),
+            "unrecoverable transport must stop group authority rather than claim drain"
+        );
+        expected.push("disable");
+        assert_eq!(session.group.events, expected);
+        assert_eq!(session.first_fault, Some("KEEPER_CHANNEL"));
+        assert_eq!(session.term_end, grace);
+        assert!(!session.gone && !session.released);
+        assert!(channel.stream.output.is_empty());
+        // Even an explicit later call with valid bytes cannot regain authority.
+        channel.stream.actions.push_back(ReadAction::Bytes(
+            format!("{}|CLEAN|100\n", "a".repeat(32)).into_bytes(),
+        ));
+        assert!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                150_000_001
+            ))
+            .is_err()
+        );
+        assert!(session.step(&mut || Ok(150_000_001)).is_err());
+        assert_eq!(session.group.events, expected);
+    }
+    #[test]
+    fn r21_fatal_read_error_stops_group_authority() {
+        let mut channel = scripted_channel(&[]);
+        channel.stream.actions.push_back(ReadAction::Fault);
+        r21_fatal_channel(channel);
+    }
+    #[test]
+    fn r21_wire_overflow_stops_group_authority() {
+        let mut channel = scripted_channel(format!("{}|CLEAN|100\n", "a".repeat(32)).as_bytes());
+        channel.wire = MAX_WIRE;
+        r21_fatal_channel(channel);
+    }
+    #[test]
+    fn r21_unterminated_frame_limit_stops_group_authority() {
+        r21_fatal_channel(scripted_channel(&[b'x'; MAX_FRAME]));
+    }
+    #[test]
+    fn r21_truncated_eof_stops_group_authority() {
+        let mut channel = scripted_channel(format!("{}|CLEAN|", "a".repeat(32)).as_bytes());
+        channel.stream.actions.push_back(ReadAction::Bytes(vec![]));
+        r21_fatal_channel(channel);
+    }
+    #[test]
+    fn r21_partial_wouldblock_is_not_control_quiescence() {
+        let mut session = helper_fixture();
+        session.control("CLEAN|1000000000", 1).unwrap();
+        session.step(&mut || Ok(2)).unwrap();
+        let events = session.group.events.clone();
+        let mut channel = scripted_channel(format!("{}|CLEAN|", "a".repeat(32)).as_bytes());
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                150_000_000
+            ))
+            .unwrap(),
+            Turn::Again
+        );
+        assert_eq!(session.group.events, events);
+        assert!(!channel.pending.is_empty());
+        channel
+            .stream
+            .actions
+            .push_back(ReadAction::Bytes(b"100000000\n".to_vec()));
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                150_000_001
+            ))
+            .unwrap_err()
+            .to_string(),
+            "KEEPER_CLEANUP_DEADLINE"
+        );
+        assert_eq!(session.end, 100_000_000);
+        assert_eq!(session.group.events, events);
+    }
+    #[test]
+    fn r21_complete_rejected_line_alone_can_clean_after_proven_quiescence() {
+        let mut session = helper_fixture();
+        session.control("CLEAN|1000", 1).unwrap();
+        session.step(&mut || Ok(2)).unwrap();
+        let mut expected = session.group.events.clone();
+        let mut channel = scripted_channel(format!("{}|PARK\n", "b".repeat(32)).as_bytes());
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(3)).unwrap(),
+            Turn::Again
+        );
+        expected.push("query");
+        assert_eq!(session.group.events, expected);
+        assert_eq!(session.first_fault, Some("KEEPER_CHANNEL"));
+        assert!(!session.gone && !session.released);
+        assert!(channel.stream.output.is_empty());
     }
 }
