@@ -408,6 +408,8 @@ class Tests(unittest.TestCase):
             stack.enter_context(patch.object(m.time, "monotonic_ns", return_value=1))
             stack.enter_context(patch.object(m.time, "sleep", side_effect=sleep))
             stack.enter_context(patch.object(m, "exclusive", side_effect=lambda *_: Receipt()))
+            stack.enter_context(patch.object(m.signal, "pthread_sigmask", return_value=set()))
+            stack.enter_context(patch.object(m.signal, "sigpending", return_value=set()))
             stack.enter_context(patch.object(m.signal, "signal", side_effect=lambda *args: calls.append("restore_handler")))
             stack.enter_context(patch.object(m.sys, "stderr", stderr))
             stack.enter_context(patch("builtins.print", side_effect=publish))
@@ -443,6 +445,34 @@ class Tests(unittest.TestCase):
 
     def test_r24_secondary_close_failure_cannot_skip_other_owned_resources(self):
         self.finalizer_case("close")
+
+    def test_r24_cancellation_checkpoint_refuses_admission_without_throwing_in_handler(self):
+        from unittest.mock import patch
+        state = object.__new__(m.BuildRun)
+        state.first, state.secondary, state.cancelled = None, [], False
+        state.channel = m.Channel(Stream([wire("READY")]), "a" * 32)
+        self.assertIsNone(state.cancel_signal(None, None))
+        with patch.object(m.time, "monotonic_ns", return_value=1):
+            with self.assertRaisesRegex(m.Refused, "CANCELLED"):
+                state.wait_frame("READY", 1000)
+        self.assertEqual(state.first, "CANCELLED")
+        self.assertEqual(state.channel.stream.reads, 0)
+
+    def test_r24_cutpoint_secondary_errors_are_not_mutated_by_late_observations(self):
+        state = object.__new__(m.BuildRun)
+        state.first, state.secondary, state.cancelled = "FIRST", [], False
+        state.keeper, state.child, state.keeper_status, state.child_status = 42, None, None, None
+        state.child_attempted = False
+        state.gone = state.release = state.proof = False
+        state.writer_shutdown_ok = False
+        state.channel, state.hard, state.end = None, 1000, 500
+        before = state.facts()
+        state.fail("SECOND")
+        state.keeper_status = 0
+        self.assertEqual(before["secondary_faults"], [])
+        self.assertIsNone(before["keeper_wait"])
+        self.assertEqual(state.facts()["secondary_faults"], ["SECOND"])
+        self.assertEqual(state.facts()["keeper_wait"], 0)
 
 
 if __name__ == "__main__":

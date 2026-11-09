@@ -376,6 +376,7 @@ class BuildRun:
         self.child_attempted = False
         self.first = None
         self.secondary = []
+        self.cancelled = False
         self.end = None
         self.gone = self.release = self.proof = False
         self.channel = None
@@ -389,6 +390,15 @@ class BuildRun:
         elif reason != self.first and reason not in self.secondary and len(self.secondary) < 8:
             self.secondary.append(reason)
 
+    def note_cancelled(self):
+        if getattr(self, "cancelled", False):
+            self.fail("CANCELLED")
+
+    def checkpoint(self):
+        self.note_cancelled()
+        if getattr(self, "cancelled", False):
+            raise Refused(self.first or "CANCELLED")
+
     def event(self, tag):
         try:
             self.trace.write(json.dumps({"event": tag, "at": time.monotonic_ns()}) + "\n")
@@ -396,19 +406,21 @@ class BuildRun:
             os.fsync(self.trace.fileno())
         except OSError:
             raise Refused("RECEIPT") from None
+        self.checkpoint()
 
     def collect(self):
+        self.note_cancelled()
         if self.child is not None and self.child_status is None:
             try:
                 self.child_status = self.child.poll()
-            except OSError:
+            except BaseException:
                 self.fail("CHILD_WAIT")
         if self.keeper is not None and self.keeper_status is None:
             try:
                 pid, status = os.waitpid(self.keeper, os.WNOHANG)
                 if pid:
                     self.keeper_status = os.waitstatus_to_exitcode(status)
-            except OSError:
+            except BaseException:
                 self.fail("KEEPER_WAIT")
         if self.keeper_status is not None and not self.release:
             self.fail("KEEPER_EXIT_EARLY")
@@ -422,17 +434,23 @@ class BuildRun:
             try:
                 self.channel.stream.shutdown(socket.SHUT_WR)
                 self.writer_shutdown_ok = True
-            except OSError:
+            except BaseException:
                 self.fail("SHUTDOWN")
+                try:
+                    self.channel.stream.close()
+                except BaseException:
+                    self.fail("SHUTDOWN_CLOSE")
 
     def wait_frame(self, body, end):
         while time.monotonic_ns() < end:
+            self.checkpoint()
             kind, value = self.channel.receive()
             if kind == "frame":
                 if value != body:
                     raise Refused("HANDSHAKE")
                 if time.monotonic_ns() >= end:
                     raise Refused("HANDSHAKE_LATE")
+                self.checkpoint()
                 return
             if kind in ("eof", "rejected"):
                 raise Refused("HANDSHAKE")
@@ -440,6 +458,7 @@ class BuildRun:
         raise Refused("HANDSHAKE_DEADLINE")
 
     def begin(self):
+        self.note_cancelled()
         # Single immutable broadcast, before cancellation wait collection.
         if self.end is not None:
             raise Refused("CLEAN_ALREADY_BOUND")
@@ -451,6 +470,8 @@ class BuildRun:
     def settle(self):
         while True:
             self.collect()  # Available wait facts survive every previous fault.
+            if self.first:
+                self.close_writer()
             at = time.monotonic_ns()
             if at >= self.end:
                 self.fail("CLEANUP_DEADLINE")
@@ -493,42 +514,89 @@ class BuildRun:
         self.collect()
 
     def cancel_signal(self, _signum, _frame):
-        raise Refused("CANCELLED")
+        # Existing-key, fixed-value latch only. No exception, I/O, or waits in a
+        # handler; explicit normal-work checkpoints stop later admissions.
+        self.cancelled = True
 
-    def finalize(self, parent, child, result_saved, saved_handlers):
-        state = self
-        state.close_writer()
-        if child is not None:
-            child.close()
-        if not result_saved:
-            state.proof = False
+    def guard(self, reason, action):
         try:
-            state.retain_waits()
+            return True, action()
         except BaseException:
-            state.fail("FINAL_WAIT")
-        after = state.facts()
-        after["first_preserved"] = result_saved
-        after["first_result_write_failed"] = not result_saved
-        try:
-            with exclusive(root / "FINAL.json") as output:
+            self.fail(reason)
+            return False, None
+
+    def finalize(self, parent, child, result_saved, saved_handlers, cutpoint=None):
+        self.note_cancelled()
+        # Freeze pre-fallback facts even if FIRST publication failed. facts()
+        # copies its secondary list, so late observations cannot mutate it.
+        if cutpoint is None:
+            cutpoint = self.facts()
+        self.guard("FINAL_SHUTDOWN", self.close_writer)
+        if child is not None:
+            self.guard("CHILD_END_CLOSE", child.close)
+        if not result_saved:
+            self.proof = False
+        self.guard("AVAILABLE_WAITS", self.collect)
+        self.guard("FINAL_WAIT", self.retain_waits)
+        self.note_cancelled()
+        after = self.facts()
+        after.update(first_preserved=result_saved, first_result_write_failed=not result_saved,
+                     cutpoint=cutpoint, handler_restoration_pending=True)
+        def save():
+            with exclusive(self.root / "FINAL.json") as output:
                 json.dump(after, output, indent=2)
                 output.write("\n")
                 output.flush()
                 os.fsync(output.fileno())
-        except BaseException:
-            state.fail("FINAL_RECEIPT")
-        # A bounded fact-only fallback also survives receipt-file failure.
-        print(json.dumps({"owner_result": state.facts(), "first_saved": result_saved}), flush=True)
+        final_saved, _ = self.guard("FINAL_RECEIPT", save)
         if parent is not None:
-            parent.close()
-        state.output.close()
-        state.trace.close()
-        for signum, handler in saved_handlers.items():
-            signal.signal(signum, handler)
+            self.guard("PARENT_END_CLOSE", parent.close)
+        self.guard("OUTPUT_CLOSE", self.output.close)
+        self.guard("TRACE_CLOSE", self.trace.close)
+        self.note_cancelled()
+        def publish(pending):
+            packet = json.dumps({"owner_result": self.facts(), "cutpoint": cutpoint,
+                                 "first_saved": result_saved, "final_saved": final_saved,
+                                 "handler_restoration_pending": pending})
+            if len(packet.encode("utf-8")) > 16384:
+                raise Refused("FACT_LIMIT")
+            ok, _ = self.guard("FACT_STDOUT", lambda: print(packet, flush=True))
+            if not ok:
+                # A second catchable signal/output failure cannot skip an
+                # alternate bounded fact sink or handler restoration.
+                packet = json.dumps({"owner_result": self.facts(), "cutpoint": cutpoint,
+                                     "first_saved": result_saved, "final_saved": final_saved,
+                                     "handler_restoration_pending": pending})
+                self.guard("FACT_STDERR", lambda: print(packet, file=sys.stderr, flush=True))
+        self.guard("FACT_PUBLICATION", lambda: publish(True))
+        # Only the final handler handoff is masked, after waits/closes/facts;
+        # the long bounded cleanup itself uses the non-throwing latch.
+        masked, previous_mask = self.guard("HANDOFF_MASK", lambda: signal.pthread_sigmask(
+            signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM)))
+        restored = False
+        if masked:
+            try:
+                ok, pending = self.guard("PENDING_CANCEL", signal.sigpending)
+                if ok and pending.intersection((signal.SIGINT, signal.SIGTERM)):
+                    self.cancel_signal(None, None)
+                restored = True
+                for signum, handler in saved_handlers.items():
+                    ok, _ = self.guard("RESTORE_HANDLER", lambda s=signum, h=handler: signal.signal(s, h))
+                    restored = restored and ok
+                self.note_cancelled()
+                self.guard("FINAL_FACT_PUBLICATION", lambda: publish(not restored))
+            finally:
+                self.guard("HANDOFF_UNMASK", lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask))
+        else:
+            # Leave this standalone helper's latch installed until failed exit,
+            # rather than restoring defaults during an unprotected handoff.
+            self.guard("FINAL_FACT_PUBLICATION", lambda: publish(True))
 
     def facts(self):
-        return {"first_fault": self.first, "secondary_faults": self.secondary,
+        return {"first_fault": self.first, "secondary_faults": list(self.secondary),
+                "cancelled": getattr(self, "cancelled", False),
                 "keeper_spawned": self.keeper is not None, "child_spawned": self.child is not None,
+                "keeper_pid": self.keeper, "child_pid": getattr(self.child, "pid", None),
                 "child_spawn_attempted": self.child_attempted,
                 "missing_handle_after_attempt_is_unknown": self.child_attempted and self.child is None,
                 "keeper_wait": self.keeper_status, "child_wait": self.child_status,
@@ -600,8 +668,10 @@ def run(spec):
         try:
             state.event("KEEPER_REGISTERED")
             state.wait_frame("READY", min(hard - CAP, time.monotonic_ns() + CAP))
+            state.checkpoint()
             mask = signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM))
             try:
+                state.checkpoint()
                 state.child_attempted = True
                 def join_group():
                     os.setpgid(0, pid)
@@ -652,7 +722,7 @@ def run(spec):
         # the first reason with a later success. No raw exception text escapes.
         state.fail(str(error) if isinstance(error, Refused) else "OWNER_INTERNAL")
     finally:
-        state.finalize(parent, child, result_saved, saved_handlers)
+        state.finalize(parent, child, result_saved, saved_handlers, first_facts)
     return bool(result_saved and first_facts["cleanup_proof"] and first_facts["command_success"]
                 and not state.first and state.all_waited())
 

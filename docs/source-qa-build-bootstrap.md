@@ -49,3 +49,12 @@ required. The proposed Rust actor driver also remains uncompiled text. Parent
 GroupLease runtime acceptance, Scope/core/native/Bash/Python integrations, LIVE
 receipt faults and full BOTH-harness numeric P0-B/default artifact timing/images
 and workers/financial/browser/recovery/rehearsals/release remain open.
+
+Catchable cancellation now records a non-throwing latch. Normal checkpoints stop
+new admission; finalization keeps collecting known waits and attempting every
+owned close and fact publication. A secondary failure cannot skip another stage.
+Only the last handler handoff is masked, after bounded wait/close work; each
+handler restore is guarded. Failed handoff remains reported as pending. FIRST's
+pre-fallback fact snapshot is retained separately from late waits and is included
+in fact fallbacks even when FIRST cannot be published. Secondary-error lists are
+copied into snapshots so later cleanup cannot mutate cutpoint evidence.
