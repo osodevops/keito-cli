@@ -2408,4 +2408,158 @@ mod tests {
         assert!(session.control("RELEASE", 4).is_err());
         assert!(session.park(&mut || Ok(4)).is_err());
     }
+    // R22: no group side effect, including initial PARK and its self-kill
+    // fallback, can precede the same turn's bounded control drain.
+    fn r22_park_with_expired_minimum(fail_park: bool) {
+        let mut session = helper_fixture();
+        session.group.fail_park = fail_park;
+        let mut bytes = format!("{}|PARK\n", "a".repeat(32)).into_bytes();
+        bytes.extend(r21_parent_frame(100_000_000, 10_000_000));
+        let mut channel = scripted_channel(&bytes);
+        let result = keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || {
+            Ok(150_000_000)
+        });
+        assert!(
+            session.group.events.is_empty(),
+            "PARK/self-kill must not precede the buffered minimum"
+        );
+        assert_eq!(session.end, 100_000_000);
+        assert!(channel.stream.output.is_empty());
+        assert_eq!(result.unwrap_err().to_string(), "KEEPER_CLEANUP_DEADLINE");
+        assert!(!session.gone && !session.released && !session.abandoned);
+    }
+    #[test]
+    fn r22_initial_park_consumes_expired_buffered_minimum_before_membership_change() {
+        r22_park_with_expired_minimum(false);
+    }
+    #[test]
+    fn r22_failed_initial_park_cannot_self_kill_before_buffered_minimum() {
+        r22_park_with_expired_minimum(true);
+    }
+    fn r22_pending_park_channel() -> (KeeperSession<FakeGroup>, Channel<ScriptedIo>) {
+        let session = helper_fixture();
+        let bytes = format!("{}|PARK\n", "a".repeat(32)).into_bytes();
+        (session, scripted_channel(&bytes))
+    }
+    #[test]
+    fn r22_park_intent_survives_read_budget_yield_without_group_work() {
+        let (mut session, mut channel) = r22_pending_park_channel();
+        channel
+            .stream
+            .actions
+            .extend((0..7).map(|_| ReadAction::Interrupted));
+        channel
+            .stream
+            .actions
+            .push_back(ReadAction::Bytes(r21_parent_frame(100_000_000, 10_000_000)));
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                150_000_000
+            ))
+            .unwrap(),
+            Turn::Again
+        );
+        assert!(session.group.events.is_empty());
+        assert!(channel.stream.output.is_empty());
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                150_000_001
+            ))
+            .unwrap_err()
+            .to_string(),
+            "KEEPER_CLEANUP_DEADLINE"
+        );
+        assert_eq!(session.end, 100_000_000);
+        assert!(session.group.events.is_empty());
+    }
+    #[test]
+    fn r22_park_intent_survives_partial_wouldblock_without_group_work() {
+        let (mut session, mut channel) = r22_pending_park_channel();
+        channel.stream.actions.push_back(ReadAction::Bytes(
+            format!("{}|CLEAN|", "a".repeat(32)).into_bytes(),
+        ));
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                150_000_000
+            ))
+            .unwrap(),
+            Turn::Again
+        );
+        assert!(session.group.events.is_empty());
+        assert!(channel.stream.output.is_empty());
+        channel
+            .stream
+            .actions
+            .push_back(ReadAction::Bytes(b"100000000\n".to_vec()));
+        assert!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                150_000_001
+            ))
+            .is_err()
+        );
+        assert_eq!(session.end, 100_000_000);
+        assert!(session.group.events.is_empty());
+    }
+    #[test]
+    fn r22_park_intent_is_not_executed_before_fatal_transport_stop() {
+        let (mut session, mut channel) = r22_pending_park_channel();
+        channel.stream.actions.push_back(ReadAction::Fault);
+        assert!(keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(1)).is_err());
+        assert_eq!(session.group.events, ["disable"]);
+        assert!(channel.stream.output.is_empty());
+        assert!(session.authority_stopped);
+        assert_eq!(session.first_fault, Some("KEEPER_CHANNEL"));
+    }
+    #[test]
+    fn r22_duplicate_pending_park_cannot_bypass_minimum_on_failure_cleanup() {
+        let mut session = helper_fixture();
+        let mut bytes = format!("{0}|PARK\n{0}|PARK\n", "a".repeat(32)).into_bytes();
+        bytes.extend(r21_parent_frame(100_000_000, 10_000_000));
+        let mut channel = scripted_channel(&bytes);
+        assert!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                150_000_000
+            ))
+            .is_err()
+        );
+        assert!(session.group.events.is_empty());
+        assert!(channel.stream.output.is_empty());
+        assert_eq!(session.end, 100_000_000);
+        assert_eq!(session.first_fault, Some("KEEPER_CONTROL"));
+    }
+    #[test]
+    fn r22_timely_lone_park_preserves_original_handshake() {
+        let (mut session, mut channel) = r22_pending_park_channel();
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(1)).unwrap(),
+            Turn::Again
+        );
+        assert_eq!(session.group.events, ["park"]);
+        assert!(session.parked);
+        assert_eq!(
+            channel.stream.output,
+            format!("{}|PARKED|42|7|7\n", "a".repeat(32)).as_bytes()
+        );
+        assert!(!session.cleaning && !session.gone && session.first_fault.is_none());
+    }
+    #[test]
+    fn r22_pre_park_eof_retains_failure_cleanup_and_parking_loss_fallback() {
+        for fail_park in [false, true] {
+            let mut session = helper_fixture();
+            session.group.fail_park = fail_park;
+            let mut channel = scripted_channel(&[]);
+            channel.stream.actions.push_back(ReadAction::Bytes(vec![]));
+            let result = keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(1));
+            assert_eq!(session.first_fault, Some("KEEPER_OWNER_EOF"));
+            assert!(!session.gone && !session.released);
+            assert!(channel.stream.output.is_empty());
+            if fail_park {
+                assert!(result.is_err());
+                assert_eq!(session.group.events, ["park", "self-kill"]);
+            } else {
+                assert_eq!(result.unwrap(), Turn::Again);
+                assert_eq!(session.group.events, ["park", "query", "term"]);
+            }
+        }
+    }
 }
