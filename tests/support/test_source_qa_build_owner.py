@@ -446,7 +446,7 @@ class Tests(unittest.TestCase):
     def test_r24_secondary_close_failure_cannot_skip_other_owned_resources(self):
         self.finalizer_case("close")
 
-    def handoff_case(self, original=None, unmask_error=None):
+    def handoff_case(self, original=None, unmask_error=None, final_stdout_failure=False):
         """Actual finalizer, fake waits/IO/masks only; no signal API reaches OS."""
         import io
         import json
@@ -485,6 +485,8 @@ class Tests(unittest.TestCase):
             return set()
         def publish(value, **_):
             calls.append("packet")
+            if final_stdout_failure and "unmask" in calls and not _.get("file"):
+                raise OSError("synthetic final stdout")
             packets.append(json.loads(value))
         cutpoint = state.facts()
         with ExitStack() as stack:
@@ -523,6 +525,8 @@ class Tests(unittest.TestCase):
         else:
             self.assertIsNone(last["owner_result"]["first_fault"])
             self.assertTrue(last["owner_result"]["cleanup_proof"])
+        if final_stdout_failure:
+            self.assertIn("FACT_STDOUT", last["owner_result"]["secondary_faults"])
         self.assertEqual(cutpoint["first_fault"], original)
         self.assertEqual(cutpoint["secondary_faults"], [])
 
@@ -537,6 +541,9 @@ class Tests(unittest.TestCase):
 
     def test_r25_complete_handoff_report_follows_successful_unmask(self):
         self.handoff_case()
+
+    def test_r25_failed_unmask_and_final_stdout_use_failure_only_stderr_packet(self):
+        self.handoff_case(unmask_error=OSError("synthetic unmask"), final_stdout_failure=True)
 
     def test_r24_cancellation_checkpoint_refuses_admission_without_throwing_in_handler(self):
         from unittest.mock import patch

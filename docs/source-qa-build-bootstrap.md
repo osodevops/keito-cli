@@ -54,7 +54,12 @@ Catchable cancellation now records a non-throwing latch. Normal checkpoints stop
 new admission; finalization keeps collecting known waits and attempting every
 owned close and fact publication. A secondary failure cannot skip another stage.
 Only the last handler handoff is masked, after bounded wait/close work; each
-handler restore is guarded. Failed handoff remains reported as pending. FIRST's
+handler restore is guarded. FINAL is an immutable pre-handoff snapshot with
+handler and mask restoration explicitly pending. The last bounded fact packet
+follows the actual unmask attempt; it reports mask uncertainty and the first or
+secondary HANDOFF_UNMASK reason on failure, including late catchable INT. Only
+successful handler and mask restoration reports handoff_complete. No handoff
+retry or receipt overwrite can turn failure into success. FIRST's
 pre-fallback fact snapshot is retained separately from late waits and is included
 in fact fallbacks even when FIRST cannot be published. Secondary-error lists are
 copied into snapshots so later cleanup cannot mutate cutpoint evidence.

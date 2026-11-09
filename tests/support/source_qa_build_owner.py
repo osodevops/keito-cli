@@ -541,7 +541,8 @@ class BuildRun:
         self.note_cancelled()
         after = self.facts()
         after.update(first_preserved=result_saved, first_result_write_failed=not result_saved,
-                     cutpoint=cutpoint, handler_restoration_pending=True)
+                     cutpoint=cutpoint, handler_restoration_pending=True,
+                     mask_restoration_pending=True, handoff_complete=False)
         def save():
             with exclusive(self.root / "FINAL.json") as output:
                 json.dump(after, output, indent=2)
@@ -554,10 +555,12 @@ class BuildRun:
         self.guard("OUTPUT_CLOSE", self.output.close)
         self.guard("TRACE_CLOSE", self.trace.close)
         self.note_cancelled()
-        def publish(pending):
+        def publish(pending, mask_pending=True):
             packet = json.dumps({"owner_result": self.facts(), "cutpoint": cutpoint,
                                  "first_saved": result_saved, "final_saved": final_saved,
-                                 "handler_restoration_pending": pending})
+                                 "handler_restoration_pending": pending,
+                                 "mask_restoration_pending": mask_pending,
+                                 "handoff_complete": not pending and not mask_pending})
             if len(packet.encode("utf-8")) > 16384:
                 raise Refused("FACT_LIMIT")
             ok, _ = self.guard("FACT_STDOUT", lambda: print(packet, flush=True))
@@ -566,14 +569,16 @@ class BuildRun:
                 # alternate bounded fact sink or handler restoration.
                 packet = json.dumps({"owner_result": self.facts(), "cutpoint": cutpoint,
                                      "first_saved": result_saved, "final_saved": final_saved,
-                                     "handler_restoration_pending": pending})
+                                     "handler_restoration_pending": pending,
+                                     "mask_restoration_pending": mask_pending,
+                                     "handoff_complete": not pending and not mask_pending})
                 self.guard("FACT_STDERR", lambda: print(packet, file=sys.stderr, flush=True))
         self.guard("FACT_PUBLICATION", lambda: publish(True))
         # Only the final handler handoff is masked, after waits/closes/facts;
         # the long bounded cleanup itself uses the non-throwing latch.
         masked, previous_mask = self.guard("HANDOFF_MASK", lambda: signal.pthread_sigmask(
             signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM)))
-        restored = False
+        restored, unmasked = False, False
         if masked:
             try:
                 ok, pending = self.guard("PENDING_CANCEL", signal.sigpending)
@@ -584,13 +589,23 @@ class BuildRun:
                     ok, _ = self.guard("RESTORE_HANDLER", lambda s=signum, h=handler: signal.signal(s, h))
                     restored = restored and ok
                 self.note_cancelled()
-                self.guard("FINAL_FACT_PUBLICATION", lambda: publish(not restored))
             finally:
-                self.guard("HANDOFF_UNMASK", lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask))
-        else:
-            # Leave this standalone helper's latch installed until failed exit,
-            # rather than restoring defaults during an unprotected handoff.
-            self.guard("FINAL_FACT_PUBLICATION", lambda: publish(True))
+                def restore_mask():
+                    try:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                    except KeyboardInterrupt:
+                        # A late pending INT can invoke the restored handler
+                        # during unmask. Preserve cancellation as well as the
+                        # uncertain mask disposition; never retry this handoff.
+                        self.cancel_signal(None, None)
+                        raise
+                unmasked, _ = self.guard("HANDOFF_UNMASK", restore_mask)
+        # If masking failed, leave this standalone helper's latch installed
+        # until failed exit. FINAL stays an immutable pre-handoff snapshot.
+        # The LAST bounded packet follows the actual unmask attempt, including
+        # its first/secondary failure and explicit uncertainty, not just intent.
+        self.note_cancelled()
+        self.guard("FINAL_FACT_PUBLICATION", lambda: publish(not restored, not unmasked))
 
     def facts(self):
         return {"first_fault": self.first, "secondary_faults": list(self.secondary),
