@@ -10,7 +10,10 @@ use keito_cli::{
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{symlink, PermissionsExt},
+    os::unix::{
+        fs::{symlink, PermissionsExt},
+        process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -246,7 +249,14 @@ fn refused_core(route: &str, mode: &str) {
         .unwrap()
         .write_all(b"{\"prompt\":\"PRIVATE_DISPATCH_CANARY\"}");
     let out = child.wait_with_output().unwrap();
-    assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+    assert!(
+        out.status.success() && out.stdout.is_empty() && out.stderr.is_empty(),
+        "route={route} mode={mode}: exit={:?} signal={:?} stdout_bytes={} stderr_bytes={} elapsed_ms={:.3} shell_termination_notice={} shell_kill_notice={}",
+        out.status.code(), out.status.signal(), out.stdout.len(), out.stderr.len(),
+        start.elapsed().as_secs_f64() * 1000.0,
+        out.stderr.windows(b"Terminated".len()).any(|bytes| bytes == b"Terminated"),
+        out.stderr.windows(b"Killed".len()).any(|bytes| bytes == b"Killed")
+    );
     assert!(start.elapsed() < Duration::from_secs(1));
     let flags = case.flags();
     assert!(!case.root.join("MUST_NOT_ENTER_CORE").exists());
