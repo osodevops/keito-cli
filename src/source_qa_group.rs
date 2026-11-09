@@ -135,6 +135,15 @@ impl Progress {
     }
 }
 
+/// No complete frame is different from a drained transport. A budget yield
+/// must not authorize the keeper's next query/signal step.
+enum Receive {
+    Frame(String),
+    Quiescent,
+    Eof,
+    BudgetYield,
+}
+
 /// Separate closed keeper protocol. No paths/content/auth/capture fields.
 struct Channel<S = UnixStream> {
     stream: S,
@@ -190,7 +199,7 @@ impl<S: Read + Write> Channel<S> {
         }
         Ok(())
     }
-    fn receive(&mut self) -> io::Result<Option<String>> {
+    fn receive_event(&mut self) -> io::Result<Receive> {
         for _ in 0..8 {
             if let Some(end) = self.pending.iter().position(|v| *v == b'\n') {
                 let line: Vec<_> = self.pending.drain(..=end).collect();
@@ -203,13 +212,13 @@ impl<S: Read + Write> Channel<S> {
                 if nonce != self.nonce || body.contains('\r') {
                     return Err(refused("GROUP_NONCE"));
                 }
-                return Ok(Some(body.to_owned()));
+                return Ok(Receive::Frame(body.to_owned()));
             }
             if self.pending.len() >= MAX_FRAME {
                 return Err(refused("GROUP_FRAME_LIMIT"));
             }
             if self.eof {
-                return Ok(None);
+                return Ok(Receive::Eof);
             }
             let mut bytes = [0u8; MAX_FRAME];
             match self.stream.read(&mut bytes) {
@@ -218,18 +227,28 @@ impl<S: Read + Write> Channel<S> {
                     if !self.pending.is_empty() {
                         return Err(refused("GROUP_TRUNCATED"));
                     }
-                    return Ok(None);
+                    return Ok(Receive::Eof);
                 }
                 Ok(n) => {
                     self.charge(n)?;
                     self.pending.extend_from_slice(&bytes[..n]);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(Receive::Quiescent)
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => return Err(refused("GROUP_READ")),
             }
         }
-        Ok(None)
+        Ok(Receive::BudgetYield)
+    }
+    // Parent frame polling performs no group operations. Its EOF predicate is
+    // still separate; a budget yield cannot satisfy terminal+EOF proof.
+    fn receive(&mut self) -> io::Result<Option<String>> {
+        match self.receive_event()? {
+            Receive::Frame(body) => Ok(Some(body)),
+            Receive::Quiescent | Receive::Eof | Receive::BudgetYield => Ok(None),
+        }
     }
     fn wait_frame(&mut self, deadline: u64) -> io::Result<String> {
         while now()? < deadline {
@@ -992,8 +1011,10 @@ fn keeper_turn<G: GroupOps, S: Read + Write>(
     // already-buffered control traffic while signalling proceeds.
     let mut drained = false;
     for _ in 0..8 {
-        match channel.receive() {
-            Ok(Some(body)) if session.first_fault.is_none() => {
+        match channel.receive_event() {
+            Ok(Receive::Frame(body))
+                if session.first_fault.is_none() || body.starts_with("CLEAN|") =>
+            {
                 let result = if body == "PARK" && !session.parked && !session.cleaning {
                     session
                         .park(clock)
@@ -1005,8 +1026,11 @@ fn keeper_turn<G: GroupOps, S: Read + Write>(
                     session.fail("KEEPER_CONTROL", clock()?);
                 }
             }
-            Ok(Some(_)) => (), // Failure is sticky; no later trace restores it.
-            Ok(None) => {
+            // Failure remains irreversible. Only canonical CLEAN can tighten
+            // its bound; no PARK/RELEASE/GONE/proof path is reopened.
+            Ok(Receive::Frame(_)) => (),
+            Ok(Receive::BudgetYield) => return Ok(Turn::Again),
+            Ok(Receive::Quiescent | Receive::Eof) => {
                 drained = true;
                 break;
             }
