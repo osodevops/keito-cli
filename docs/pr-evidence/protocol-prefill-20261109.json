@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "failed_head": "c88107d407955e9b1a42d325bfc8003e8539f963",
+  "failed_run": 42625955203,
+  "failed_job": 129190288575,
+  "cause": "Budget unit test blocks while filling a Unix socket with100small writes before any reader polls. Hosted Linux test remained active until6hour cancellation; CI Complete failed its prerequisite.",
+  "repair_commit": "5096ae851b5a02cafc9723993c1d1665b1df1549",
+  "repair_scope": "Test transport only; no runtime protocol/installed payload/product deadline change",
+  "fixture_changes": [
+    "Batch exactly100identical frames in one bounded write",
+    "Constrain sender buffer to8192bytes",
+    "Bound test peer socket reads/writes at1second",
+    "Retain all original budget assertions; additionally drain/assert all100frames within bounded per-poll work"
+  ],
+  "verification": {
+    "rust_protocol_tests": 18,
+    "passed": 18,
+    "unrelated_filtered": 153,
+    "default_all_target_check": "PASS",
+    "all_feature_all_target_clippy_warnings_denied": "PASS",
+    "crate_wide_format": "PASS",
+    "diff_check": "PASS",
+    "constrained_linux_transport": {
+      "original": "WouldBlock at frame22 within250ms",
+      "batched": "all100frames received",
+      "scope": "standalone std-only transport reproduction; NOT wholeLinuxcrate or runtimequalification"
+    }
+  },
+  "retained_first_outcomes": [
+    "macOS constrained original test still passed; no localMacREDclaimed",
+    "firstLinuxcontainer compiled but execution denied bynoexec tmpfs; no productfailure",
+    "explicitexec tmpfs successor defaultLinuxsocket accommodated100smallwrites; failedexpected-REDcheck, originalnonreproductionpreserved",
+    "constrained8192Linuxsender original timedout; batchpassed"
+  ],
+  "open_gates": [
+    "freshhostedLinuxCI",
+    "priorintermittentmacOSpluginrefusalcauseremainsunresolved",
+    "fullcooperativeprocessownershipandGroupLease",
+    "defaultartifactFIRST/p95",
+    "fullnumericBOTHactualharnesses",
+    "appworkers/financial/browser/rehearsal/guardedrelease/pilot"
+  ],
+  "logs_sha256": {
+    "cli-c881-ubuntu-cancelled.log": "3391eccc46b297a8b8618d65604e3cbdcc35d74f866aaba3bad64e237e9b11d4",
+    "cli-c881-socket-constrained-first.log": "1e3d5526ea76a86e4d71c5d997a5dca81acb7247fdb53e7b834a4aacd8668986",
+    "cli-c881-linux-transport-first.log": "de9930189277740da2c9e1c8d3065e956adc8a5f435ac35ad37abeb96a8f58fd",
+    "cli-c881-linux-transport-v2.log": "f20fed3ad90ea3a5f53d341acbfbb39c6455f37aaecc2d995b35ec3cca07afdb",
+    "cli-c881-linux-transport-v3-constrained.log": "2da355cf9c7fcda6f2acce0100563b94c2ba162dce88f1dc52d0fce4dedbae07",
+    "protocol-rust-c881-prefill-fix.log": "9cc707b72ba0aa0890ece45479410e2bb7795121445abf76deae7022e543b7b3",
+    "protocol-clippy-c881-prefill-fix.log": "f94a9d36030fadddfb0adc22d640ba575f9d73dd0ab7849ee86f03c57c2600cc",
+    "protocol-default-check-c881-prefill-fix.log": "77d182cea7d90bb2ad95d4e8069ed7cc70a0aa023d1824486edbc256d2d65225",
+    "cli-c881-prefill-format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}
