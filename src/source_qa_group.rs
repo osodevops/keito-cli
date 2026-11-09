@@ -2302,4 +2302,110 @@ mod tests {
         assert!(!session.gone && !session.released);
         assert!(channel.stream.output.is_empty());
     }
+    #[test]
+    fn r21_recoverable_line_errors_drain_suffix_under_the_same_frame_cap() {
+        let nonce = "a".repeat(32);
+        let variants = [
+            b"missing-pipe\n".to_vec(),
+            vec![255, b'\n'],
+            format!("{nonce}|PARK\r\n").into_bytes(),
+            {
+                let mut b = vec![b'x'; 270];
+                b.push(b'\n');
+                b
+            },
+        ];
+        for bad in variants {
+            let mut session = helper_fixture();
+            session.control("CLEAN|1000000000", 1).unwrap();
+            session.step(&mut || Ok(2)).unwrap();
+            let events = session.group.events.clone();
+            let mut bytes = bad;
+            bytes.extend(r21_parent_frame(100_000_000, 10_000_000));
+            let mut channel = scripted_channel(&[]);
+            // A complete oversized line can be rejected at its known boundary
+            // when a short prefix plus a second bounded read includes newline.
+            channel.stream.actions = bytes
+                .chunks(200)
+                .map(|b| ReadAction::Bytes(b.to_vec()))
+                .collect();
+            assert_eq!(
+                keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                    150_000_000
+                ))
+                .unwrap_err()
+                .to_string(),
+                "KEEPER_CLEANUP_DEADLINE"
+            );
+            assert_eq!(session.end, 100_000_000);
+            assert_eq!(session.group.events, events);
+            assert_eq!(session.first_fault, Some("KEEPER_CHANNEL"));
+            assert!(channel.stream.output.is_empty());
+        }
+    }
+    #[test]
+    fn r21_rejected_frame_cap_yields_before_buffered_minimum() {
+        let mut session = helper_fixture();
+        session.control("CLEAN|1000000000", 1).unwrap();
+        session.step(&mut || Ok(2)).unwrap();
+        let events = session.group.events.clone();
+        let mut bytes = format!("{}|PARK\n", "b".repeat(32)).repeat(8).into_bytes();
+        bytes.extend(r21_parent_frame(100_000_000, 10_000_000));
+        let mut channel = scripted_channel(&bytes);
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                150_000_000
+            ))
+            .unwrap(),
+            Turn::Again
+        );
+        assert_eq!(session.group.events, events);
+        assert_eq!(session.first_fault, Some("KEEPER_CHANNEL"));
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                150_000_001
+            ))
+            .unwrap_err()
+            .to_string(),
+            "KEEPER_CLEANUP_DEADLINE"
+        );
+        assert_eq!(session.end, 100_000_000);
+        assert_eq!(session.group.events, events);
+    }
+    #[test]
+    fn r21_fatal_stop_preserves_prior_expiry_reason() {
+        let mut session = helper_fixture();
+        let at = session.lifetime.operation_end;
+        session.step(&mut || Ok(at)).unwrap();
+        let mut events = session.group.events.clone();
+        let mut channel = scripted_channel(&[]);
+        channel.stream.actions.push_back(ReadAction::Fault);
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(at + 1))
+                .unwrap_err()
+                .to_string(),
+            "KEEPER_LIFETIME"
+        );
+        events.push("disable");
+        assert_eq!(session.group.events, events);
+        assert_eq!(session.first_fault, Some("KEEPER_LIFETIME"));
+        assert!(!session.gone && !session.released);
+    }
+    #[test]
+    fn r21_fatal_error_after_absence_never_reports_terminal_success() {
+        let mut session = helper_fixture();
+        session.group.absent = true;
+        session.control("CLEAN|1000", 1).unwrap();
+        assert!(session.step(&mut || Ok(2)).unwrap());
+        let mut channel = scripted_channel(&[]);
+        channel.stream.actions.push_back(ReadAction::Fault);
+        assert!(keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(3)).is_err());
+        assert!(session.gone);
+        assert!(!session.released);
+        assert!(session.authority_stopped);
+        assert_eq!(session.first_fault, Some("KEEPER_CHANNEL"));
+        assert!(channel.stream.output.is_empty());
+        assert!(session.control("RELEASE", 4).is_err());
+        assert!(session.park(&mut || Ok(4)).is_err());
+    }
 }

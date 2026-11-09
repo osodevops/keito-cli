@@ -31,6 +31,16 @@ first fault, restarting grace or reopening normal control/proof. The actual
 keeper_main turn function is shared with fake-transport regressions, so tests
 exercise these dispatch decisions rather than separate model methods.
 
+A rejected complete line has a known consumed boundary. It poisons proof but
+continues the bounded failure-only drain, so a valid shorter CLEAN behind it is
+applied before group work. WouldBlock with a partial frame yields instead of
+claiming the queue empty. Fatal reads, wire overflow, an unterminated frame limit
+or truncated EOF leave no trustworthy drain boundary: the keeper permanently
+disables group operations and exits failed. Even a later valid frame cannot
+restore that authority. Physical cleanup may then remain unknown; no GONE or
+clean proof may be issued, and caller registry/wait reporting must retain that
+failure. This is a conservative authority stop, not evidence of group absence.
+
 The same decreasing end covers GONE, RELEASE and empty EOF. RELEASE plus write EOF
 seals the last shared bound; a later smaller request is explicitly refused with
 GROUP_BOUND_SEALED, rather than silently shortening only the parent. That terminal
