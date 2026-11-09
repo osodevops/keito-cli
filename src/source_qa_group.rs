@@ -943,14 +943,16 @@ impl<G: GroupOps> KeeperSession<G> {
             self.gone = true;
             return Ok(true);
         }
-        if self.term_end.is_none() {
+        if let Some(term_end) = self.term_end {
+            if !self.killed && clock()? >= term_end {
+                self.check_time(clock)?;
+                self.killed = true;
+                self.group.signal(libc::SIGKILL)?;
+            }
+        } else {
             let at = self.check_time(clock)?;
             self.term_end = Some(at.saturating_add(TERM_NS));
             self.group.signal(libc::SIGTERM)?;
-        } else if !self.killed && clock()? >= self.term_end.unwrap() {
-            self.check_time(clock)?;
-            self.killed = true;
-            self.group.signal(libc::SIGKILL)?;
         }
         Ok(false)
     }
@@ -1066,8 +1068,10 @@ pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io
             Ok(_) => (),
             Err(error) => return Err(error),
         }
-        if session.gone && session.first_fault.is_some() {
-            return Err(refused(session.first_fault.unwrap()));
+        if session.gone {
+            if let Some(reason) = session.first_fault {
+                return Err(refused(reason));
+            }
         }
         pause();
     }
