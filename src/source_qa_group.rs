@@ -360,7 +360,7 @@ impl Settlement {
     }
     fn poll(
         &mut self,
-        at: u64,
+        clock: &mut impl FnMut() -> io::Result<u64>,
         pid: libc::pid_t,
         channel: &mut Channel,
         keeper: &mut impl DirectWait,
@@ -375,6 +375,13 @@ impl Settlement {
                 group_absent: true,
             }));
         }
+        let at = match clock() {
+            Ok(at) => at,
+            Err(_) => {
+                self.progress.fail("GROUP_CLOCK");
+                return Err(refused(self.progress.first_fault.unwrap()));
+            }
+        };
         if !self.cleanup_sent {
             self.progress.fail("GROUP_CLEANUP_NOT_STARTED");
         }
@@ -385,7 +392,11 @@ impl Settlement {
             return Err(refused(reason));
         }
         let outcome = (|| {
-            if let Some(body) = channel.receive()? {
+            let body = channel.receive()?;
+            if clock()? >= self.progress.deadline_ns {
+                return Err(refused("GROUP_CLEANUP_DEADLINE"));
+            }
+            if let Some(body) = body {
                 if let Some(expected) = &self.expected_ready {
                     if body != *expected {
                         return Err(refused("GROUP_READY"));
@@ -406,6 +417,9 @@ impl Settlement {
                 && (!has_workload || self.workload_status.is_some())
                 && !self.release_sent
             {
+                if clock()? >= self.progress.deadline_ns {
+                    return Err(refused("GROUP_CLEANUP_DEADLINE"));
+                }
                 channel.send("RELEASE")?;
                 channel
                     .stream
@@ -418,6 +432,9 @@ impl Settlement {
                     return Err(refused("GROUP_KEEPER_FAILED"));
                 }
                 if channel.eof && channel.pending.is_empty() && self.release_sent {
+                    if clock()? >= self.progress.deadline_ns {
+                        return Err(refused("GROUP_CLEANUP_DEADLINE"));
+                    }
                     self.progress.advance(Phase::Gone, Phase::Released)?;
                     return Ok(Some(GroupProof {
                         workload_status: self.workload_status,
@@ -437,6 +454,7 @@ impl Settlement {
 // Only literals generated here enter durable diagnostics; never raw OS errors.
 fn safe_reason(error: &io::Error) -> &'static str {
     match error.to_string().as_str() {
+        "GROUP_CLEANUP_DEADLINE" => "GROUP_CLEANUP_DEADLINE",
         "GROUP_NONCE" => "GROUP_NONCE",
         "GROUP_FRAME" => "GROUP_FRAME",
         "GROUP_FRAME_LIMIT" => "GROUP_FRAME_LIMIT",
@@ -707,21 +725,13 @@ impl GroupLease {
             self.fail(reason.0);
         }
         // Always collect available waits, including on clock failure/expiry.
-        let at = now();
-        let result = match at {
-            Ok(at) => self.settlement.poll(
-                at,
-                self.keeper_pid,
-                &mut self.channel,
-                &mut self.keeper,
-                self.workload.as_mut(),
-            ),
-            Err(error) => {
-                self.settlement
-                    .collect(&mut self.keeper, self.workload.as_mut());
-                Err(error)
-            }
-        };
+        let result = self.settlement.poll(
+            &mut now,
+            self.keeper_pid,
+            &mut self.channel,
+            &mut self.keeper,
+            self.workload.as_mut(),
+        );
         // Preserve first specific literal; never replace it with a wrapper.
         if result.is_err() {
             let reason = self
@@ -1232,7 +1242,13 @@ mod tests {
         };
         frame(&mut peer, "GONE|42");
         assert!(state
-            .poll(1, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .poll(
+                &mut || Ok(1),
+                42,
+                &mut channel,
+                &mut keeper,
+                Some(&mut workload)
+            )
             .unwrap()
             .is_none());
         assert_eq!(state.progress.phase, Phase::Gone);
@@ -1240,7 +1256,13 @@ mod tests {
         frame(&mut peer, "GONE|42");
         assert_eq!(
             state
-                .poll(2, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .poll(
+                    &mut || Ok(2),
+                    42,
+                    &mut channel,
+                    &mut keeper,
+                    Some(&mut workload)
+                )
                 .unwrap_err()
                 .to_string(),
             "GROUP_TERMINAL"
@@ -1251,7 +1273,13 @@ mod tests {
         peer.shutdown(std::net::Shutdown::Write).unwrap();
         keeper.steps.push_back(exited());
         assert!(state
-            .poll(3, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .poll(
+                &mut || Ok(3),
+                42,
+                &mut channel,
+                &mut keeper,
+                Some(&mut workload)
+            )
             .is_err());
         assert!(state.keeper_status.is_some());
         assert_eq!(state.progress.first_fault, Some("GROUP_TERMINAL"));
@@ -1265,7 +1293,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             state
-                .poll(1, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .poll(
+                    &mut || Ok(1),
+                    42,
+                    &mut channel,
+                    &mut keeper,
+                    Some(&mut workload)
+                )
                 .unwrap_err()
                 .to_string(),
             "GROUP_NONCE"
@@ -1275,7 +1309,13 @@ mod tests {
         workload.steps.push_back(exited());
         assert_eq!(
             state
-                .poll(2, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .poll(
+                    &mut || Ok(2),
+                    42,
+                    &mut channel,
+                    &mut keeper,
+                    Some(&mut workload)
+                )
                 .unwrap_err()
                 .to_string(),
             "GROUP_NONCE"
@@ -1297,7 +1337,13 @@ mod tests {
         };
         assert_eq!(
             state
-                .poll(1000, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .poll(
+                    &mut || Ok(1000),
+                    42,
+                    &mut channel,
+                    &mut keeper,
+                    Some(&mut workload)
+                )
                 .unwrap_err()
                 .to_string(),
             "GROUP_PARK"
@@ -1320,7 +1366,13 @@ mod tests {
         };
         assert_eq!(
             state
-                .poll(1, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .poll(
+                    &mut || Ok(1),
+                    42,
+                    &mut channel,
+                    &mut keeper,
+                    Some(&mut workload)
+                )
                 .unwrap_err()
                 .to_string(),
             "GROUP_PARK"
@@ -1328,7 +1380,13 @@ mod tests {
         assert!(state.keeper_status.is_some() && state.workload_status.is_none());
         assert_eq!(state.progress.secondary_faults, ["GROUP_WORKLOAD_WAIT"]);
         assert!(state
-            .poll(2, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .poll(
+                &mut || Ok(2),
+                42,
+                &mut channel,
+                &mut keeper,
+                Some(&mut workload)
+            )
             .is_err());
         assert!(state.workload_status.is_some());
     }
@@ -1345,7 +1403,13 @@ mod tests {
         };
         assert_eq!(
             state
-                .poll(1000, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .poll(
+                    &mut || Ok(1000),
+                    42,
+                    &mut channel,
+                    &mut keeper,
+                    Some(&mut workload)
+                )
                 .unwrap_err()
                 .to_string(),
             "GROUP_CLEANUP_DEADLINE"
@@ -1366,7 +1430,13 @@ mod tests {
         };
         frame(&mut peer, "GONE|42");
         assert!(state
-            .poll(1, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .poll(
+                &mut || Ok(1),
+                42,
+                &mut channel,
+                &mut keeper,
+                Some(&mut workload)
+            )
             .unwrap()
             .is_none());
         let mut bytes = [0; 128];
@@ -1377,7 +1447,13 @@ mod tests {
         );
         peer.shutdown(std::net::Shutdown::Write).unwrap();
         let proof = state
-            .poll(2, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .poll(
+                &mut || Ok(2),
+                42,
+                &mut channel,
+                &mut keeper,
+                Some(&mut workload),
+            )
             .unwrap()
             .unwrap();
         assert!(proof.group_absent && proof.keeper_status.success());
@@ -1395,7 +1471,7 @@ mod tests {
             }
             assert!(state
                 .poll(
-                    1,
+                    &mut || Ok(1),
                     42,
                     &mut channel,
                     &mut FakeWait::default(),
@@ -1422,14 +1498,26 @@ mod tests {
             };
             frame(&mut peer, "GONE|42");
             assert!(state
-                .poll(1, 42, &mut channel, &mut keeper, None::<&mut FakeWait>)
+                .poll(
+                    &mut || Ok(1),
+                    42,
+                    &mut channel,
+                    &mut keeper,
+                    None::<&mut FakeWait>
+                )
                 .unwrap()
                 .is_none());
             if partial {
                 peer.write_all(b"partial").unwrap();
                 peer.shutdown(std::net::Shutdown::Write).unwrap();
             }
-            let result = state.poll(2, 42, &mut channel, &mut keeper, None::<&mut FakeWait>);
+            let result = state.poll(
+                &mut || Ok(2),
+                42,
+                &mut channel,
+                &mut keeper,
+                None::<&mut FakeWait>,
+            );
             if partial {
                 assert_eq!(result.unwrap_err().to_string(), "GROUP_TRUNCATED");
             } else {
@@ -1556,7 +1644,13 @@ mod tests {
                 frame(&mut peer, "GONE|42");
                 assert_eq!(
                     state
-                        .poll(1, 42, &mut channel, &mut keeper, None::<&mut FakeWait>)
+                        .poll(
+                            &mut || Ok(1),
+                            42,
+                            &mut channel,
+                            &mut keeper,
+                            None::<&mut FakeWait>
+                        )
                         .unwrap_err()
                         .to_string(),
                     "GROUP_READY"
@@ -1566,13 +1660,25 @@ mod tests {
                 frame(&mut peer, "READY|42|42|7");
                 frame(&mut peer, "GONE|42");
                 assert!(state
-                    .poll(1, 42, &mut channel, &mut keeper, None::<&mut FakeWait>)
+                    .poll(
+                        &mut || Ok(1),
+                        42,
+                        &mut channel,
+                        &mut keeper,
+                        None::<&mut FakeWait>
+                    )
                     .unwrap()
                     .is_none());
                 assert!(state.expected_ready.is_none());
                 assert!(!state.group_absent);
                 assert!(state
-                    .poll(2, 42, &mut channel, &mut keeper, None::<&mut FakeWait>)
+                    .poll(
+                        &mut || Ok(2),
+                        42,
+                        &mut channel,
+                        &mut keeper,
+                        None::<&mut FakeWait>
+                    )
                     .unwrap()
                     .is_none());
                 assert!(state.group_absent && state.release_sent);
@@ -1613,7 +1719,13 @@ mod tests {
         let mut workload = FakeWait::default();
         assert_eq!(
             state
-                .poll(1, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .poll(
+                    &mut || Ok(1),
+                    42,
+                    &mut channel,
+                    &mut keeper,
+                    Some(&mut workload)
+                )
                 .unwrap_err()
                 .to_string(),
             "GROUP_EARLY_EOF"
@@ -1622,9 +1734,51 @@ mod tests {
         assert!(state.workload_status.is_none());
         workload.steps.push_back(exited());
         assert!(state
-            .poll(1000, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .poll(
+                &mut || Ok(1000),
+                42,
+                &mut channel,
+                &mut keeper,
+                Some(&mut workload)
+            )
             .is_err());
         assert!(state.workload_status.is_some());
         assert_eq!(state.progress.first_fault, Some("GROUP_EARLY_EOF"));
+    }
+    #[test]
+    fn proof_and_release_recheck_clock_after_receiving_bytes() {
+        for final_proof in [false, true] {
+            let (mut state, mut channel, mut peer) = parent_fixture();
+            let mut keeper = FakeWait::default();
+            let mut times = if final_proof {
+                state.progress.phase = Phase::Gone;
+                state.group_absent = true;
+                state.release_sent = true;
+                keeper.steps.push_back(exited());
+                peer.shutdown(std::net::Shutdown::Write).unwrap();
+                VecDeque::from([Ok(1), Ok(1), Ok(1000)])
+            } else {
+                frame(&mut peer, "GONE|42");
+                VecDeque::from([Ok(1), Ok(1000)])
+            };
+            assert_eq!(
+                state
+                    .poll(
+                        &mut || times.pop_front().unwrap(),
+                        42,
+                        &mut channel,
+                        &mut keeper,
+                        None::<&mut FakeWait>
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                "GROUP_CLEANUP_DEADLINE"
+            );
+            assert_eq!(state.progress.first_fault, Some("GROUP_CLEANUP_DEADLINE"));
+            assert_ne!(state.progress.phase, Phase::Released);
+            if !final_proof {
+                assert!(!state.release_sent);
+            }
+        }
     }
 }
