@@ -1969,4 +1969,119 @@ mod tests {
     fn r20_seven_interruptions_then_completion_yields_before_group_operations() {
         r20_budget_yield(true);
     }
+    fn scripted_channel(bytes: &[u8]) -> Channel<ScriptedIo> {
+        Channel {
+            stream: ScriptedIo {
+                actions: bytes
+                    .chunks(MAX_FRAME)
+                    .map(|b| ReadAction::Bytes(b.to_vec()))
+                    .collect(),
+                ..Default::default()
+            },
+            nonce: "a".repeat(32),
+            pending: vec![],
+            wire: 0,
+            eof: false,
+        }
+    }
+    #[test]
+    fn r20_failed_control_only_tightens_and_never_reopens_normal_trace() {
+        let mut session = helper_fixture();
+        let at = session.lifetime.operation_end;
+        session.step(&mut || Ok(at)).unwrap();
+        let first = session.first_fault;
+        let grace = session.term_end;
+        let end = at + 5_000_000;
+        let payload=format!("{0}|PARK\n{0}|RELEASE\n{0}|GONE|42\n{0}|CLEAN|{1}\n{0}|CLEAN|0001\n{0}|CLEAN|999999999999\n", "a".repeat(32),end);
+        let mut channel = scripted_channel(payload.as_bytes());
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(
+                at + 1_000_000
+            ))
+            .unwrap(),
+            Turn::Again
+        );
+        assert_eq!(session.end, end);
+        assert_eq!(session.first_fault, first);
+        assert_eq!(session.term_end, grace);
+        assert!(!session.released && !session.gone);
+        assert!(channel.stream.output.is_empty());
+    }
+    #[test]
+    fn r20_control_frame_cap_yields_until_last_buffered_minimum_is_consumed() {
+        let mut session = helper_fixture();
+        session.control("CLEAN|1000000000", 1).unwrap();
+        session.step(&mut || Ok(2)).unwrap();
+        let events = session.group.events.clone();
+        let payload = (1..=9)
+            .rev()
+            .map(|n| format!("{}|CLEAN|{}\n", "a".repeat(32), n * 100))
+            .collect::<String>();
+        let mut channel = scripted_channel(payload.as_bytes());
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(150)).unwrap(),
+            Turn::Again
+        );
+        assert_eq!(session.end, 200);
+        assert_eq!(session.group.events, events);
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(150))
+                .unwrap_err()
+                .to_string(),
+            "KEEPER_CLEANUP_DEADLINE"
+        );
+        assert_eq!(session.end, 100);
+        assert_eq!(session.group.events, events);
+    }
+    #[test]
+    fn r20_interrupted_empty_budget_yields_before_proven_quiescence() {
+        let mut session = helper_fixture();
+        session.control("CLEAN|1000", 1).unwrap();
+        session.step(&mut || Ok(2)).unwrap();
+        let events = session.group.events.clone();
+        let mut channel = scripted_channel(&[]);
+        channel.stream.actions = (0..8).map(|_| ReadAction::Interrupted).collect();
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(3)).unwrap(),
+            Turn::Again
+        );
+        assert_eq!(channel.stream.reads, 8);
+        assert_eq!(session.group.events, events);
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(4)).unwrap(),
+            Turn::Again
+        );
+        assert_eq!(channel.stream.reads, 9);
+        let mut expected = events;
+        expected.push("query");
+        assert_eq!(session.group.events, expected);
+    }
+    #[test]
+    fn r20_actual_turn_normal_park_gone_release_eof_positive_control() {
+        let mut session = helper_fixture();
+        session.group.absent = true;
+        let payload = format!("{0}|PARK\n{0}|CLEAN|1000\n", "a".repeat(32));
+        let mut channel = scripted_channel(payload.as_bytes());
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(1)).unwrap(),
+            Turn::Again
+        );
+        assert!(session.gone);
+        assert!(session.first_fault.is_none());
+        assert_eq!(
+            channel.stream.output,
+            format!("{0}|PARKED|42|7|7\n{0}|GONE|42\n", "a".repeat(32)).as_bytes()
+        );
+        let events = session.group.events.clone();
+        channel.stream.actions.push_back(ReadAction::Bytes(
+            format!("{}|RELEASE\n", "a".repeat(32)).into_bytes(),
+        ));
+        channel.stream.actions.push_back(ReadAction::Bytes(vec![]));
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(2)).unwrap(),
+            Turn::Finished
+        );
+        assert!(session.released && channel.eof);
+        assert_eq!(session.group.events, events);
+    }
 }

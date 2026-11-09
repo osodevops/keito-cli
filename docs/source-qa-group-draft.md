@@ -23,6 +23,14 @@ The granted lifetime reserves its final 1.8 seconds for failure cleanup. Expiry
 starts cleanup at that earlier trigger, without extending the immutable hard end.
 Cleanup advances incrementally, receiving deadline reductions before each step.
 TERM grace starts once. Every group syscall checks the current absolute end.
+A receive result distinguishes a frame, WouldBlock quiescence, EOF and a read
+budget yield. A read-budget yield or the eight-frame turn cap skips group work;
+already-buffered reductions are consumed on a later bounded turn first. Failure
+cleanup continues to consume canonical CLEAN minimum bounds without clearing its
+first fault, restarting grace or reopening normal control/proof. The actual
+keeper_main turn function is shared with fake-transport regressions, so tests
+exercise these dispatch decisions rather than separate model methods.
+
 The same decreasing end covers GONE, RELEASE and empty EOF. RELEASE plus write EOF
 seals the last shared bound; a later smaller request is explicitly refused with
 GROUP_BOUND_SEALED, rather than silently shortening only the parent. That terminal
