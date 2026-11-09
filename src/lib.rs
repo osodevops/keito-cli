@@ -21,5 +21,7 @@ pub mod commands;
 pub mod config;
 pub mod error;
 pub mod output;
+#[cfg(all(feature = "dev-tools", unix))]
+pub mod source_qa_protocol;
 pub mod skill_adapter;
 pub mod types;

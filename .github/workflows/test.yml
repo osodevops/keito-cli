@@ -87,6 +87,7 @@ jobs:
         run: |
           qa_root=$(mktemp -d /tmp/keito-source-usage.XXXXXX)
           chmod 700 "$qa_root"
+          python3 -I -S -B tests/support/test_source_qa_protocol.py
           PYTHONDONTWRITEBYTECODE=1 python3 tests/support/test_source_qa_contract.py "$qa_root"
           PYTHONDONTWRITEBYTECODE=1 python3 tests/support/source_qa_manifest.py collect "$PWD" "$qa_root"
           qa_result=0
