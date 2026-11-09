@@ -442,3 +442,37 @@ fn self_revocation_keeps_specific_local_reason_and_never_rewrites_a_frozen_numer
     assert_eq!(status["enabled"], false);
     assert_eq!(status["reason"], "HARNESS_CHANGED");
 }
+
+#[test]
+fn repository_observed_usage_status_never_touches_profile_origin_or_source() {
+    for source in ["claude-code", "codex"] {
+        for mutation in ["hint", "remote", "disabled"] {
+            let mut f = Fixture::new(source);
+            f.consent();
+            let original = f.repository.clone();
+            let denied = Denied::arm();
+            f.store.observe_repository(&original).unwrap();
+            assert_eq!(
+                f.store.numeric_status(&original, source).unwrap()["enabled"],
+                true
+            );
+            match mutation {
+                "hint" => f.repository.hint_hash = hash("changed-hint"),
+                "remote" => f.repository.remote_hash = hash("changed-remote"),
+                "disabled" => f.repository.disabled = true,
+                _ => unreachable!(),
+            }
+            f.store.observe_repository(&f.repository).unwrap();
+            assert_eq!(
+                f.store.numeric_status(&f.repository, source).unwrap()["enabled"],
+                false
+            );
+            f.store.observe_repository(&original).unwrap();
+            assert_eq!(
+                f.store.numeric_status(&original, source).unwrap()["enabled"],
+                false
+            );
+            assert_eq!(denied.counts(), [0; 3], "{source}/{mutation}");
+        }
+    }
+}

@@ -476,3 +476,370 @@ fn default_normal_hooks_remain_metadata_only_even_with_supported_version_and_act
     }
     assert!(!fixture.capture.join("profiles").exists());
 }
+
+// R12 regression: policies below are deliberately unqualified local fixtures.
+// They permit status inspection, never construct a normal numeric capability.
+fn r12_signal(
+    store: &mut Store,
+    repo: &capture::Repository,
+    scope: (&str, &str, &str),
+    boundary: (keito_cli::cli::capture::CaptureEvent, &str, i64),
+) {
+    let (source, version, session) = scope;
+    let (event, turn, seconds) = boundary;
+    store
+        .event(
+            repo,
+            capture::Signal {
+                source,
+                resumed: false,
+                source_id: session,
+                turn_id: Some(turn),
+                version,
+                event,
+                clock: &capture::Clock {
+                    wall: 1_794_067_200 + seconds,
+                    monotonic: 1000 + seconds,
+                    boot: "r12-private-clock".into(),
+                },
+            },
+        )
+        .unwrap();
+}
+
+fn r12_policy(database: &rusqlite::Connection, binding: &Binding, namespace: &str) {
+    let policy = json!({"policy_version":1,"binding_id":binding.id,"binding_version":binding.version,
+        "source_namespace":namespace,"profile_id":capture::hash(format!("r12-unqualified-{namespace}")),
+        "profile_digest":capture::hash("r12-no-functional-profile"),"epoch":10,"enabled":true});
+    database
+        .execute(
+            "INSERT INTO usage_consents(binding_id,namespace,data) VALUES(?1,?2,?3)",
+            rusqlite::params![binding.id, namespace, policy.to_string()],
+        )
+        .unwrap();
+}
+
+fn r12_other_snapshot(database: &rusqlite::Connection, binding: &Binding) -> Vec<String> {
+    let mut output = vec![database
+        .query_row(
+            "SELECT data FROM bindings WHERE repo_key=?1",
+            [&binding.repository_key],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()];
+    for sql in [
+        "SELECT namespace || data FROM usage_consents WHERE binding_id=?1 ORDER BY namespace",
+        "SELECT id || data FROM sessions WHERE binding_id=?1 ORDER BY id",
+        "SELECT json_object('id',id,'body',body,'hash',payload_hash,'state',state,'reason',reason,'claim',claimed_until) FROM outbox WHERE session_id IN(SELECT id FROM sessions WHERE binding_id=?1) ORDER BY id",
+    ] {
+        let mut statement = database.prepare(sql).unwrap();
+        output.extend(statement.query_map([&binding.id], |row| row.get::<_, String>(0)).unwrap().map(Result::unwrap));
+    }
+    output
+}
+
+fn r12_freeze_numeric_fixture(
+    database: &rusqlite::Connection,
+    binding: &Binding,
+    source: &str,
+    source_id: &str,
+) -> (String, String, String) {
+    let session_id: String = database.query_row("SELECT id FROM sessions WHERE binding_id=?1 AND source_id=?2 AND json_extract(data,'$.source_namespace')=?3",
+        rusqlite::params![binding.id, source_id, source], |row| row.get(0)).unwrap();
+    let body: String = database
+        .query_row(
+            "SELECT body FROM outbox WHERE session_id=?1",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut body: Value = serde_json::from_str(&body).unwrap();
+    let record = json!({"source_adapter":if source=="codex" {"CODEX_ROLLOUT_0_167_0_V1"} else {"CLAUDE_JSONL_2_1_319_V1"},
+        "source_record_id":"r12_frozen_request","source_turn_id":if source=="codex" {Some("frozen_turn")} else {None},
+        "model":null,"model_provenance":"UNKNOWN","counter_semantics":"REQUEST_DELTA",
+        "input_basis":if source=="codex" {"CODEX_TOTAL_INPUT"} else {"CLAUDE_UNCACHED_INPUT"},
+        "input_tokens":7,"cached_input_tokens":null,"cache_write_input_tokens":null,"output_tokens":3,"reasoning_output_tokens":null});
+    body["usage"] = json!({"schema_version":1,"status":"PARTIAL","reason":"OBSERVED_REQUEST_RECORDS","records":[record.clone()]});
+    let body = body.to_string();
+    let digest = capture::hash(&body);
+    database
+        .execute(
+            "UPDATE outbox SET body=?2,payload_hash=?3 WHERE session_id=?1",
+            rusqlite::params![session_id, body, digest],
+        )
+        .unwrap();
+    let ledger = json!({"records":[record],"record_revisions":[1],"queued":1,"incomplete":false,"held":false,
+        "consent_epoch":0,"baseline_epoch":0,"excluded_request_ids":[]});
+    database
+        .execute(
+            "UPDATE sessions SET data=json_set(data,'$.usage_ledger',json(?2)) WHERE id=?1",
+            rusqlite::params![session_id, ledger.to_string()],
+        )
+        .unwrap();
+    (session_id, body, digest)
+}
+
+#[test]
+fn normal_usage_status_persists_changed_repository_revocation_after_exact_restoration() {
+    use keito_cli::cli::capture::CaptureEvent::{Prompt, Stop};
+    let mut failures = Vec::new();
+    let mut observations = Vec::new();
+    for (selected, selected_version) in NAMESPACES {
+        for mutation in ["hint", "remote", "disabled"] {
+            let fixture = Fixture::new();
+            // Every case uses TempDir cleanup; aggregate failure facts stay in the test log.
+            let canaries = fixture.source_canaries();
+            let database =
+                rusqlite::Connection::open(fixture.capture.join("capture.sqlite3")).unwrap();
+            let key = capture::hash(fixture.repo.join(".git").to_string_lossy().as_bytes());
+            let mut store = Store::open(&fixture.capture).unwrap();
+            let binding = store.binding(&key).unwrap().unwrap();
+            let repo = capture::Repository {
+                key: binding.repository_key.clone(),
+                remote_hash: binding.remote_hash.clone(),
+                hint_hash: binding.hint_hash.clone(),
+                linked_without_hint: false,
+                disabled: false,
+            };
+            let mut other = binding.clone();
+            other.repository_key = capture::hash("r12-unrelated-repository");
+            other.id = String::new();
+            other.version = 0;
+            let other = store.approve(other).unwrap();
+            let other_repo = capture::Repository {
+                key: other.repository_key.clone(),
+                remote_hash: other.remote_hash.clone(),
+                hint_hash: other.hint_hash.clone(),
+                linked_without_hint: false,
+                disabled: false,
+            };
+            let mut frozen = Vec::new();
+            for (namespace, version) in NAMESPACES {
+                r12_signal(
+                    &mut store,
+                    &repo,
+                    (namespace, version, "11111111-1111-4111-8111-111111111111"),
+                    (Prompt, "frozen_turn", 0),
+                );
+                r12_signal(
+                    &mut store,
+                    &repo,
+                    (namespace, version, "11111111-1111-4111-8111-111111111111"),
+                    (Stop, "frozen_turn", 10),
+                );
+                frozen.push(r12_freeze_numeric_fixture(
+                    &database,
+                    &binding,
+                    namespace,
+                    "11111111-1111-4111-8111-111111111111",
+                ));
+                r12_signal(
+                    &mut store,
+                    &repo,
+                    (namespace, version, SESSION),
+                    (Prompt, "active_turn", 20),
+                );
+                r12_signal(
+                    &mut store,
+                    &other_repo,
+                    (namespace, version, "33333333-3333-4333-8333-333333333333"),
+                    (Prompt, "other_turn", 0),
+                );
+                r12_signal(
+                    &mut store,
+                    &other_repo,
+                    (namespace, version, "33333333-3333-4333-8333-333333333333"),
+                    (Stop, "other_turn", 5),
+                );
+                r12_signal(
+                    &mut store,
+                    &other_repo,
+                    (namespace, version, "44444444-4444-4444-8444-444444444444"),
+                    (Prompt, "other_active", 10),
+                );
+                r12_policy(&database, &binding, namespace);
+                r12_policy(&database, &other, namespace);
+            }
+            drop(store);
+            let unrelated_before = r12_other_snapshot(&database, &other);
+            let original = fixture
+                .cli()
+                .args([
+                    "capture", "usage", "status", "--repo", "--agent", selected, "--json",
+                ])
+                .output()
+                .unwrap();
+            assert!(original.status.success());
+            assert_eq!(
+                serde_json::from_slice::<Value>(&original.stdout).unwrap()["enabled"],
+                true
+            );
+            if mutation == "remote" {
+                let result = fixture
+                    .command(Path::new("/usr/bin/git"))
+                    .args([
+                        "remote",
+                        "add",
+                        "origin",
+                        "https://example.invalid/r12-changed",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(result.status.success());
+            } else {
+                fs::create_dir_all(fixture.repo.join(".keito")).unwrap();
+                fs::write(
+                    fixture.repo.join(".keito/config.yml"),
+                    if mutation == "disabled" {
+                        "agent_tracking:\n  enabled: false\n"
+                    } else {
+                        "project_id: project_r12_changed\n"
+                    },
+                )
+                .unwrap();
+            }
+            let changed = fixture
+                .cli()
+                .args([
+                    "capture", "usage", "status", "--repo", "--agent", selected, "--json",
+                ])
+                .output()
+                .unwrap();
+            assert!(changed.status.success());
+            let changed: Value = serde_json::from_slice(&changed.stdout).unwrap();
+            let observed_raw: String = database
+                .query_row(
+                    "SELECT data FROM bindings WHERE repo_key=?1",
+                    [&binding.repository_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let observed: Value = serde_json::from_str(&observed_raw).unwrap();
+            let active_after_observe: i64=database.query_row("SELECT COUNT(*) FROM sessions WHERE binding_id=?1 AND json_type(data,'$.active')='object'",[&binding.id],|row|row.get(0)).unwrap();
+            if mutation == "remote" {
+                let result = fixture
+                    .command(Path::new("/usr/bin/git"))
+                    .args(["remote", "remove", "origin"])
+                    .output()
+                    .unwrap();
+                assert!(result.status.success());
+            } else {
+                fs::remove_file(fixture.repo.join(".keito/config.yml")).unwrap();
+            }
+            let restored = fixture
+                .cli()
+                .args([
+                    "capture", "usage", "status", "--repo", "--agent", selected, "--json",
+                ])
+                .output()
+                .unwrap();
+            assert!(restored.status.success());
+            fixture.assert_no_raw_leak(&restored);
+            let restored: Value = serde_json::from_slice(&restored.stdout).unwrap();
+            let mut case_failures = Vec::new();
+            for (okay, label) in [
+                (changed["enabled"] == false, "changed-disabled"),
+                (
+                    observed["revoked"] == true && observed["paused"] == true,
+                    "durable-binding",
+                ),
+                (active_after_observe == 0, "clock-abandoned"),
+                (restored["enabled"] == false, "restored-stays-disabled"),
+            ] {
+                if !okay {
+                    case_failures.push(label);
+                }
+            }
+            for (namespace, _) in NAMESPACES {
+                let raw: String = database
+                    .query_row(
+                        "SELECT data FROM usage_consents WHERE binding_id=?1 AND namespace=?2",
+                        rusqlite::params![binding.id, namespace],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let policy: Value = serde_json::from_str(&raw).unwrap();
+                if policy["enabled"] != false || policy["epoch"] != 11 {
+                    case_failures.push("both-binding-policies-revoked");
+                }
+                let raw:String=database.query_row("SELECT data FROM sessions WHERE binding_id=?1 AND source_id=?2 AND json_extract(data,'$.source_namespace')=?3",rusqlite::params![binding.id,SESSION,namespace],|row|row.get(0)).unwrap();
+                let session: Value = serde_json::from_str(&raw).unwrap();
+                if !session["active"].is_null()
+                    || !session["segments"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|segment| {
+                            segment["duration_seconds"] == 0
+                                && segment["completeness"] == "INCOMPLETE"
+                        })
+                {
+                    case_failures.push("observed-clock-zero-incomplete");
+                }
+                if !session["usage_ledger"]["baseline_epoch"].is_null()
+                    || session["usage_ledger"]["consent_epoch"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        == 0
+                {
+                    case_failures.push("fresh-baseline-epoch-required");
+                }
+            }
+            for (session_id, body, digest) in &frozen {
+                let after: (String, String, String) = database
+                    .query_row(
+                        "SELECT body,payload_hash,state FROM outbox WHERE session_id=?1",
+                        [session_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                if after.0 != *body || after.1 != *digest || after.2 != "held" {
+                    case_failures.push("frozen-body-held-unchanged");
+                }
+            }
+            for (event, turn) in [("stop", "active_turn"), ("prompt", "new_turn")] {
+                let input = json!({"session_id":SESSION,"turn_id":turn,"prompt_id":turn,"cwd":fixture.repo,"transcript_path":fixture.source(selected)});
+                let output = fixture
+                    .cli()
+                    .args([
+                        "capture",
+                        "hook",
+                        "--agent",
+                        selected,
+                        "--event",
+                        event,
+                        "--harness-version",
+                        selected_version,
+                    ])
+                    .write_stdin(input.to_string())
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                fixture.assert_no_raw_leak(&output);
+            }
+            let new_active:i64=database.query_row("SELECT COUNT(*) FROM sessions WHERE binding_id=?1 AND json_type(data,'$.active')='object'",[&binding.id],|row|row.get(0)).unwrap();
+            if new_active != 0 {
+                case_failures.push("restored-cannot-resume-or-start-clock");
+            }
+            if r12_other_snapshot(&database, &other) != unrelated_before {
+                case_failures.push("unrelated-repository-unchanged");
+            }
+            for (path, bytes) in canaries {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+            assert!(!fixture.capture.join("profiles").exists());
+            observations.push(json!({"namespace":selected,"mutation":mutation,"fixture_cleanup":"TempDir","failures":case_failures}));
+            failures.extend(
+                case_failures
+                    .iter()
+                    .map(|failure| format!("{selected}/{mutation}/{failure}")),
+            );
+        }
+    }
+    eprintln!("R12_STATUS_FIRST_OBSERVATIONS {}", json!(observations));
+    assert!(
+        failures.is_empty(),
+        "R12 durable usage-status restoration failed: {}",
+        failures.join(", ")
+    );
+}

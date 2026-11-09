@@ -184,7 +184,8 @@ pub async fn run(
         CaptureSubcommand::Usage { command } => match command {
             CaptureUsageSubcommand::Status { agent, .. } => {
                 let repository = current_repo()?;
-                let store = Store::open(&directory()?)?;
+                let mut store = Store::open(&directory()?)?;
+                store.observe_repository(&repository)?;
                 print(
                     store.numeric_status(&repository, agent.namespace())?,
                     global.quiet,
