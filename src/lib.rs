@@ -23,5 +23,7 @@ pub mod error;
 pub mod output;
 pub mod skill_adapter;
 #[cfg(all(feature = "dev-tools", unix))]
+pub mod source_qa_group;
+#[cfg(all(feature = "dev-tools", unix))]
 pub mod source_qa_protocol;
 pub mod types;

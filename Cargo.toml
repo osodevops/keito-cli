@@ -41,6 +41,11 @@ required-features = ["dev-tools"]
 [features]
 dev-tools = []
 
+[[example]]
+name = "source-qa-keeper"
+path = "examples/source_qa_keeper.rs"
+required-features = ["dev-tools"]
+
 [dependencies]
 base64 = "0.22.1"
 clap = { version = "4", features = ["derive", "env", "string"] }
