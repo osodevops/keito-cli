@@ -891,6 +891,7 @@ struct KeeperSession<G> {
     end: u64,
     cleaning: bool,
     parked: bool,
+    park_requested: bool,
     term_end: Option<u64>,
     killed: bool,
     gone: bool,
@@ -907,6 +908,7 @@ impl<G: GroupOps> KeeperSession<G> {
             end: lifetime.hard_end,
             cleaning: false,
             parked: false,
+            park_requested: false,
             term_end: None,
             killed: false,
             gone: false,
@@ -935,6 +937,7 @@ impl<G: GroupOps> KeeperSession<G> {
         self.fail(reason, at);
         if !self.authority_stopped {
             self.authority_stopped = true;
+            self.park_requested = false;
             // Logical disable only: do not query/signal a group when a possibly
             // unread stricter bound is unavailable. FAILED/unknown, not GONE.
             self.group.disable();
@@ -1049,10 +1052,15 @@ fn keeper_turn<G: GroupOps, S: Read + Write>(
             Ok(Receive::Frame(body))
                 if session.first_fault.is_none() || body.starts_with("CLEAN|") =>
             {
-                let result = if body == "PARK" && !session.parked && !session.cleaning {
-                    session
-                        .park(clock)
-                        .and_then(|()| channel.send(&format!("PARKED|{pid}|{park}|{sid}")))
+                let result = if body == "PARK"
+                    && !session.parked
+                    && !session.cleaning
+                    && !session.park_requested
+                {
+                    // Pure bounded intent only. Even membership changes and
+                    // the failure self-kill must wait for the minimum drain.
+                    session.park_requested = true;
+                    Ok(())
                 } else {
                     session.control(&body, clock()?)
                 };
@@ -1086,6 +1094,20 @@ fn keeper_turn<G: GroupOps, S: Read + Write>(
     }
     if !drained {
         return Ok(Turn::Again);
+    }
+    if session.park_requested {
+        session.park_requested = false;
+        if session.first_fault.is_none() {
+            // All readable bounds are now reduced. Fresh end checks precede
+            // PARK and any own-group failure fallback inside park().
+            session.park(clock)?;
+            session.check_time(clock)?;
+            if channel.send(&format!("PARKED|{pid}|{park}|{sid}")).is_err() {
+                // Preserve failure cleanup if the response itself fails after
+                // membership changed; never turn a send fault into a clean exit.
+                session.fail("KEEPER_CONTROL", clock()?);
+            }
+        }
     }
     match session.step(clock) {
         Ok(true) if session.first_fault.is_none() => channel.send(&format!("GONE|{pid}"))?,
