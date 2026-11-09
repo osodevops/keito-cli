@@ -656,8 +656,15 @@ if __name__ == "__main__":
     try:
         if len(sys.argv) != 2:
             raise Refused("ARGS")
-        success = run(spec_read(sys.argv[1]))
+        prepared = spec_read(sys.argv[1])
+    except BaseException as error:
+        code = str(error) if isinstance(error, Refused) else "SETUP"
+        print(json.dumps({"setup_refused": code, "actors_started": False}), flush=True)
+        sys.exit(1)
+    try:
+        success = run(prepared)
     except BaseException:
-        # No raw argv, environment, path or OS error goes to tool stdout.
+        # Do not call a post-entry error a preflight refusal or fabricate waits.
+        print(json.dumps({"owner_entry_failed": True, "cleanup_qualified": False}), flush=True)
         success = False
     sys.exit(0 if success else 1)
