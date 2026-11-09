@@ -136,8 +136,8 @@ impl Progress {
 }
 
 /// Separate closed keeper protocol. No paths/content/auth/capture fields.
-struct Channel {
-    stream: UnixStream,
+struct Channel<S = UnixStream> {
+    stream: S,
     nonce: String,
     pending: Vec<u8>,
     wire: usize,
@@ -160,6 +160,8 @@ impl Channel {
             eof: false,
         })
     }
+}
+impl<S: Read + Write> Channel<S> {
     fn charge(&mut self, bytes: usize) -> io::Result<()> {
         self.wire = self
             .wire
@@ -968,6 +970,76 @@ impl<G: GroupOps> KeeperSession<G> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Turn {
+    Again,
+    Finished,
+}
+fn keeper_turn<G: GroupOps, S: Read + Write>(
+    session: &mut KeeperSession<G>,
+    channel: &mut Channel<S>,
+    pid: libc::pid_t,
+    park: u64,
+    sid: u64,
+    clock: &mut impl FnMut() -> io::Result<u64>,
+) -> io::Result<Turn> {
+    let at = clock()?;
+    if at >= session.end {
+        return Err(refused("KEEPER_CLEANUP_DEADLINE"));
+    }
+    // Drain bounded traffic BEFORE the next syscall step. When the parse
+    // cap is reached, yield without group ops; reductions cannot sit behind
+    // already-buffered control traffic while signalling proceeds.
+    let mut drained = false;
+    for _ in 0..8 {
+        match channel.receive() {
+            Ok(Some(body)) if session.first_fault.is_none() => {
+                let result = if body == "PARK" && !session.parked && !session.cleaning {
+                    session
+                        .park(clock)
+                        .and_then(|()| channel.send(&format!("PARKED|{pid}|{park}|{sid}")))
+                } else {
+                    session.control(&body, clock()?)
+                };
+                if result.is_err() {
+                    session.fail("KEEPER_CONTROL", clock()?);
+                }
+            }
+            Ok(Some(_)) => (), // Failure is sticky; no later trace restores it.
+            Ok(None) => {
+                drained = true;
+                break;
+            }
+            Err(_) => {
+                session.fail("KEEPER_CHANNEL", clock()?);
+                drained = true;
+                break;
+            }
+        }
+    }
+    if channel.eof {
+        if session.released && session.first_fault.is_none() {
+            session.check_time(clock)?;
+            return Ok(Turn::Finished);
+        }
+        session.fail("KEEPER_OWNER_EOF", clock()?);
+    }
+    if !drained {
+        return Ok(Turn::Again);
+    }
+    match session.step(clock) {
+        Ok(true) if session.first_fault.is_none() => channel.send(&format!("GONE|{pid}"))?,
+        Ok(_) => (),
+        Err(error) => return Err(error),
+    }
+    if session.gone {
+        if let Some(reason) = session.first_fault {
+            return Err(refused(reason));
+        }
+    }
+    Ok(Turn::Again)
+}
+
 /// Entry point of the dev-only keeper example. No product code calls this.
 pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io::Result<()> {
     let values: Vec<String> = arguments
@@ -1028,62 +1100,10 @@ pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io
     let mut clock = now;
     channel.send(&format!("READY|{pid}|{pid}|{sid}"))?;
     loop {
-        let at = now()?;
-        if at >= session.end {
-            return Err(refused("KEEPER_CLEANUP_DEADLINE"));
+        match keeper_turn(&mut session, &mut channel, pid, park, sid, &mut clock)? {
+            Turn::Finished => return Ok(()),
+            Turn::Again => pause(),
         }
-        // Drain bounded traffic BEFORE the next syscall step. When the parse
-        // cap is reached, yield without group ops; reductions cannot sit behind
-        // already-buffered control traffic while signalling proceeds.
-        let mut drained = false;
-        for _ in 0..8 {
-            match channel.receive() {
-                Ok(Some(body)) if session.first_fault.is_none() => {
-                    let result = if body == "PARK" && !session.parked && !session.cleaning {
-                        session
-                            .park(&mut clock)
-                            .and_then(|()| channel.send(&format!("PARKED|{pid}|{park}|{sid}")))
-                    } else {
-                        session.control(&body, now()?)
-                    };
-                    if result.is_err() {
-                        session.fail("KEEPER_CONTROL", now()?);
-                    }
-                }
-                Ok(Some(_)) => (), // Failure is sticky; no later trace restores it.
-                Ok(None) => {
-                    drained = true;
-                    break;
-                }
-                Err(_) => {
-                    session.fail("KEEPER_CHANNEL", now()?);
-                    drained = true;
-                    break;
-                }
-            }
-        }
-        if channel.eof {
-            if session.released && session.first_fault.is_none() {
-                session.check_time(&mut clock)?;
-                return Ok(());
-            }
-            session.fail("KEEPER_OWNER_EOF", now()?);
-        }
-        if !drained {
-            pause();
-            continue;
-        }
-        match session.step(&mut clock) {
-            Ok(true) if session.first_fault.is_none() => channel.send(&format!("GONE|{pid}"))?,
-            Ok(_) => (),
-            Err(error) => return Err(error),
-        }
-        if session.gone {
-            if let Some(reason) = session.first_fault {
-                return Err(refused(reason));
-            }
-        }
-        pause();
     }
 }
 
