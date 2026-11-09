@@ -446,6 +446,98 @@ class Tests(unittest.TestCase):
     def test_r24_secondary_close_failure_cannot_skip_other_owned_resources(self):
         self.finalizer_case("close")
 
+    def handoff_case(self, original=None, unmask_error=None):
+        """Actual finalizer, fake waits/IO/masks only; no signal API reaches OS."""
+        import io
+        import json
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        state = object.__new__(m.BuildRun)
+        state.root = Path("/inert-handoff-no-files-opened")
+        state.first, state.secondary, state.cancelled = original, [], False
+        state.keeper, state.keeper_status = 42, 0
+        state.child_status, state.child_attempted = 0, True
+        state.hard, state.end = 1000, 500
+        state.gone = state.release = state.proof = True
+        state.writer_attempted = state.writer_shutdown_ok = True
+        state.channel = m.Channel(Stream(), "a" * 32)
+        state.channel.eof = True
+        calls, packets, saved = [], [], []
+        class Child:
+            pid = 43
+        state.child = Child()
+        class Close:
+            def __init__(self, name):
+                self.name = name
+            def close(self):
+                calls.append(self.name)
+        state.output, state.trace = Close("output_close"), Close("trace_close")
+        class Receipt(io.StringIO):
+            def fileno(self):
+                return 99
+            def close(self):
+                saved.append(json.loads(self.getvalue()))
+                super().close()
+        def mask(how, _):
+            calls.append("mask" if how == m.signal.SIG_BLOCK else "unmask")
+            if how == m.signal.SIG_SETMASK and unmask_error is not None:
+                raise unmask_error
+            return set()
+        def publish(value, **_):
+            calls.append("packet")
+            packets.append(json.loads(value))
+        cutpoint = state.facts()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(m.os, "waitpid", side_effect=AssertionError("already waited")))
+            stack.enter_context(patch.object(m.os, "fsync"))
+            stack.enter_context(patch.object(m, "exclusive", side_effect=lambda *_: Receipt()))
+            stack.enter_context(patch.object(m.signal, "pthread_sigmask", side_effect=mask))
+            stack.enter_context(patch.object(m.signal, "sigpending", return_value=set()))
+            stack.enter_context(patch.object(m.signal, "signal", side_effect=lambda *_: calls.append("handler")))
+            stack.enter_context(patch("builtins.print", side_effect=publish))
+            state.finalize(Close("parent_close"), Close("child_end_close"), True,
+                           {m.signal.SIGINT: None, m.signal.SIGTERM: None}, cutpoint)
+        self.assertEqual((state.child_status, state.keeper_status), (0, 0))
+        for name in ["child_end_close", "parent_close", "output_close", "trace_close"]:
+            self.assertEqual(calls.count(name), 1)
+        self.assertEqual(calls.count("handler"), 2)
+        self.assertEqual(calls.count("mask"), 1)
+        self.assertEqual(calls.count("unmask"), 1, "failed handoff must never retry into success")
+        self.assertEqual(len(saved), 1, "FINAL is immutable, not rewritten after handoff")
+        self.assertEqual(saved[0]["cutpoint"], cutpoint)
+        self.assertTrue(saved[0]["handler_restoration_pending"])
+        self.assertTrue(packets)
+        self.assertEqual(packets[-1]["cutpoint"], cutpoint)
+        self.assertEqual(calls[-1], "packet", "final report must follow the actual unmask disposition")
+        last = packets[-1]
+        self.assertEqual(last["mask_restoration_pending"], unmask_error is not None)
+        self.assertEqual(last["handoff_complete"], unmask_error is None)
+        self.assertFalse(last["handler_restoration_pending"])
+        if unmask_error is not None:
+            self.assertEqual(last["owner_result"]["first_fault"], original or "HANDOFF_UNMASK")
+            if original:
+                self.assertIn("HANDOFF_UNMASK", last["owner_result"]["secondary_faults"])
+            if isinstance(unmask_error, KeyboardInterrupt):
+                self.assertTrue(last["owner_result"]["cancelled"])
+                self.assertIn("CANCELLED", last["owner_result"]["secondary_faults"])
+        else:
+            self.assertIsNone(last["owner_result"]["first_fault"])
+            self.assertTrue(last["owner_result"]["cleanup_proof"])
+        self.assertEqual(cutpoint["first_fault"], original)
+        self.assertEqual(cutpoint["secondary_faults"], [])
+
+    def test_r25_unmask_oserror_is_published_as_first_fault_with_unknown_mask(self):
+        self.handoff_case(unmask_error=OSError("synthetic unmask"))
+
+    def test_r25_unmask_oserror_preserves_original_and_publishes_secondary(self):
+        self.handoff_case(original="ORIGINAL_OPERATION", unmask_error=OSError("synthetic unmask"))
+
+    def test_r25_late_interrupt_at_unmask_retains_cancellation_evidence(self):
+        self.handoff_case(unmask_error=KeyboardInterrupt())
+
+    def test_r25_complete_handoff_report_follows_successful_unmask(self):
+        self.handoff_case()
+
     def test_r24_cancellation_checkpoint_refuses_admission_without_throwing_in_handler(self):
         from unittest.mock import patch
         state = object.__new__(m.BuildRun)
