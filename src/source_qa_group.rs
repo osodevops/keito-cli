@@ -1801,4 +1801,148 @@ mod tests {
             }
         }
     }
+    // R20 drives the EXACT outer keeper turn called by keeper_main. The
+    // extracted baseline deliberately retains both reviewed defects for RED.
+    fn r20_failed_reduction(expiry: bool) {
+        let mut session = helper_fixture();
+        let at = if expiry {
+            session.lifetime.operation_end
+        } else {
+            2
+        };
+        if !expiry {
+            session.control("CLEAN|1000000000", 1).unwrap();
+        }
+        session.step(&mut || Ok(at)).unwrap();
+        if !expiry {
+            session.fail("KEEPER_CHANNEL", at);
+        }
+        let first = session.first_fault;
+        assert!(first.is_some());
+        let events = session.group.events.clone();
+        let grace = session.term_end;
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut parent_channel = Channel::new(left, "a".repeat(32)).unwrap();
+        let mut keeper_channel = Channel::new(right, "a".repeat(32)).unwrap();
+        let mut parent = Settlement::new(session.lifetime.hard_end);
+        parent.progress.phase = Phase::Parked;
+        let end = at + 5_000_000;
+        parent
+            .begin(end, at + 1_000_000, &mut parent_channel)
+            .unwrap();
+        assert_eq!(parent.progress.deadline_ns, end);
+        let result = keeper_turn(&mut session, &mut keeper_channel, 42, 7, 7, &mut || {
+            Ok(at + 6_000_000)
+        });
+        assert_eq!(
+            session.end, end,
+            "helper discarded the bound accepted by the actual parent driver"
+        );
+        assert_eq!(session.first_fault, first);
+        assert_eq!(session.term_end, grace);
+        assert_eq!(
+            session.group.events, events,
+            "no group operation after accepted end"
+        );
+        assert_eq!(result.unwrap_err().to_string(), "KEEPER_CLEANUP_DEADLINE");
+        assert!(!session.gone && !session.released);
+    }
+    #[test]
+    fn r20_expiry_fault_still_consumes_parent_accepted_reduction() {
+        r20_failed_reduction(true);
+    }
+    #[test]
+    fn r20_prior_clean_then_fault_still_consumes_parent_accepted_reduction() {
+        r20_failed_reduction(false);
+    }
+
+    enum ReadAction {
+        Bytes(Vec<u8>),
+        Interrupted,
+    }
+    #[derive(Default)]
+    struct ScriptedIo {
+        actions: VecDeque<ReadAction>,
+        reads: usize,
+        output: Vec<u8>,
+    }
+    impl Read for ScriptedIo {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            match self.actions.pop_front() {
+                Some(ReadAction::Bytes(bytes)) => {
+                    assert!(bytes.len() <= buffer.len());
+                    buffer[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Some(ReadAction::Interrupted) => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            }
+        }
+    }
+    impl Write for ScriptedIo {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn r20_budget_yield(interrupted: bool) {
+        let mut session = helper_fixture();
+        session.control("CLEAN|1000000000", 1).unwrap();
+        session.step(&mut || Ok(2)).unwrap();
+        let events = session.group.events.clone();
+        let bytes = format!("{}|CLEAN|100\n", "a".repeat(32)).into_bytes();
+        let actions = if interrupted {
+            (0..7)
+                .map(|_| ReadAction::Interrupted)
+                .chain([ReadAction::Bytes(bytes)])
+                .collect()
+        } else {
+            bytes[..7]
+                .iter()
+                .map(|b| ReadAction::Bytes(vec![*b]))
+                .chain([ReadAction::Bytes(bytes[7..].to_vec())])
+                .collect()
+        };
+        let mut channel = Channel {
+            stream: ScriptedIo {
+                actions,
+                ..Default::default()
+            },
+            nonce: "a".repeat(32),
+            pending: vec![],
+            wire: 0,
+            eof: false,
+        };
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(150)).unwrap(),
+            Turn::Again
+        );
+        assert_eq!(channel.stream.reads, 8, "no ninth read in a receive pass");
+        assert!(channel.pending.ends_with(b"\n"));
+        assert_eq!(
+            session.group.events, events,
+            "budget yield must not authorize group operations"
+        );
+        assert_eq!(
+            keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(150))
+                .unwrap_err()
+                .to_string(),
+            "KEEPER_CLEANUP_DEADLINE"
+        );
+        assert_eq!(session.end, 100);
+        assert_eq!(session.group.events, events);
+        assert!(channel.stream.output.is_empty());
+    }
+    #[test]
+    fn r20_eighth_short_read_completion_yields_before_group_operations() {
+        r20_budget_yield(false);
+    }
+    #[test]
+    fn r20_seven_interruptions_then_completion_yields_before_group_operations() {
+        r20_budget_yield(true);
+    }
 }
