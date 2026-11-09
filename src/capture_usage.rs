@@ -246,10 +246,85 @@ pub fn read_active_session(
 }
 #[cfg(unix)]
 fn bounded_snapshot(path: &Path) -> Result<Vec<u8>, UsageReadError> {
+    let (bytes, _lease) = leased_snapshot(path, None)?;
+    Ok(bytes)
+}
+
+/// Commit-held read-only inode and named-path identity. No Debug/serialization:
+/// neither this transient path nor raw bytes belong to persisted evidence.
+#[cfg(unix)]
+pub(crate) struct SourceLease {
+    file: std::fs::File,
+    path: PathBuf,
+    before: std::fs::Metadata,
+}
+#[cfg(unix)]
+impl SourceLease {
+    pub(crate) fn identity(&self) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        let created = self
+            .before
+            .created()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(crate::capture::hash(format!(
+            "{}:{}:{}:{}:{}",
+            self.before.dev(),
+            self.before.ino(),
+            self.before.uid(),
+            created.as_secs(),
+            created.subsec_nanos()
+        )))
+    }
+    fn same(&self, metadata: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        metadata.is_file()
+            && metadata.nlink() == 1
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.dev() == self.before.dev()
+            && metadata.ino() == self.before.ino()
+            && metadata.mode() == self.before.mode()
+            && metadata.len() == self.before.len()
+            && metadata.mtime() == self.before.mtime()
+            && metadata.mtime_nsec() == self.before.mtime_nsec()
+            && metadata.ctime() == self.before.ctime()
+            && metadata.ctime_nsec() == self.before.ctime_nsec()
+    }
+    pub(crate) fn valid(&self) -> bool {
+        self.file
+            .metadata()
+            .is_ok_and(|metadata| self.same(&metadata))
+            && open_active_file(&self.path)
+                .and_then(|file| file.metadata().map_err(|_| UsageReadError::SourceChanged))
+                .is_ok_and(|metadata| self.same(&metadata))
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn read_request_ids_leased(
+    approved: &ApprovedActiveSession,
+) -> Result<(ObservedRequestIds, SourceLease), UsageReadError> {
+    let (bytes, lease) = leased_snapshot(&approved.path, None)?;
+    let ids = parse_request_ids(&approved.decoder_identity(), &bytes)?;
+    Ok((ids, lease))
+}
+#[cfg(unix)]
+pub(crate) fn read_requests_leased(
+    approved: &ApprovedActiveSession,
+    excluded: &BTreeSet<String>,
+    expected_identity: &str,
+) -> Result<(UsageEvidence, SourceLease), UsageReadError> {
+    let (bytes, lease) = leased_snapshot(&approved.path, Some(expected_identity))?;
+    let evidence = parse_snapshot(&approved.decoder_identity(), &bytes, excluded)?;
+    Ok((evidence, lease))
+}
+
+#[cfg(unix)]
+fn open_active_file(path: &Path) -> Result<std::fs::File, UsageReadError> {
     use std::ffi::CString;
-    use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    use std::os::unix::ffi::OsStrExt;
     // Pin every directory by descriptor. No stat-then-open window, symlink
     // traversal, FIFO blocking, recursive search or fallback filename.
     let name = CString::new("/").map_err(|_| UsageReadError::UnsafePath)?;
@@ -287,7 +362,18 @@ fn bounded_snapshot(path: &Path) -> Result<Vec<u8>, UsageReadError> {
         }
         parent = unsafe { OwnedFd::from_raw_fd(fd) };
     }
-    let mut file = std::fs::File::from(parent);
+    Ok(std::fs::File::from(parent))
+}
+
+#[cfg(unix)]
+fn leased_snapshot(
+    path: &Path,
+    expected_identity: Option<&str>,
+) -> Result<(Vec<u8>, SourceLease), UsageReadError> {
+    #[cfg(test)]
+    crate::capture_usage_test_io::observe(2);
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    let file = open_active_file(path)?;
     let before = file.metadata().map_err(|_| UsageReadError::Unavailable)?;
     if !before.is_file() || before.nlink() != 1 || before.uid() != unsafe { libc::geteuid() } {
         return Err(UsageReadError::UnsafePath);
@@ -295,25 +381,28 @@ fn bounded_snapshot(path: &Path) -> Result<Vec<u8>, UsageReadError> {
     if before.len() > MAX_SNAPSHOT_BYTES as u64 {
         return Err(UsageReadError::TooLarge);
     }
-    let mut bytes = Vec::with_capacity(before.len() as usize);
-    file.by_ref()
+    let mut lease = SourceLease {
+        file,
+        path: path.into(),
+        before,
+    };
+    if expected_identity.is_some_and(|expected| lease.identity().as_deref() != Some(expected)) {
+        return Err(UsageReadError::SourceChanged);
+    }
+    let mut bytes = Vec::with_capacity(lease.before.len() as usize);
+    lease
+        .file
+        .by_ref()
         .take((MAX_SNAPSHOT_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| UsageReadError::Unavailable)?;
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(UsageReadError::TooLarge);
     }
-    let after = file.metadata().map_err(|_| UsageReadError::Unavailable)?;
-    if bytes.len() as u64 != before.len()
-        || before.len() != after.len()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
-        || before.ctime() != after.ctime()
-        || before.ctime_nsec() != after.ctime_nsec()
-    {
+    if bytes.len() as u64 != lease.before.len() || !lease.valid() {
         return Err(UsageReadError::SourceChanged);
     }
-    Ok(bytes)
+    Ok((bytes, lease))
 }
 #[cfg(not(unix))]
 fn bounded_snapshot(_path: &Path) -> Result<Vec<u8>, UsageReadError> {
@@ -876,3 +965,7 @@ fn parse_snapshot(
 #[cfg(test)]
 #[path = "../tests/unit/capture_usage_parser.rs"]
 mod parser_tests;
+
+#[cfg(all(test, unix))]
+#[path = "../tests/unit/capture_usage_lease.rs"]
+mod lease_tests;

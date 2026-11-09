@@ -2,7 +2,9 @@
 
 Capture records observed agent turn duration for review under your existing Keito identity.
 It does not measure human effort, CPU time, verified delivery or permission to charge a client.
-Tokens and provider costs are currently unavailable; absence is never reported as zero.
+Numeric usage is disabled by default and requires separate device-local consent.
+Qualified request observations remain partial; provider expenditure is unknown,
+and missing counters are never reported as zero.
 
 This implementation requires the canonical agent-session API and workspace eligibility.
 A released CLI, installed hook or successful local test does not prove the server is enabled
@@ -165,21 +167,69 @@ is an operator or supervisor setting and must name the same private ledger for b
 and core. Invocation directories require owned, private permissions and paths without
 symlink components.
 
-The numeric-usage candidate remains disabled in normal commands. Its internal qualification
-path establishes an identifier-only baseline at a new enabled native prompt before reading
-new request counters. Pauses, revocation, refused boundaries and known native gaps require
-another prompt baseline; a terminal event cannot supply missing consent retrospectively.
-Baseline identifiers include provisional requests, so their later final records remain
-excluded. Already accepted request records keep their immutable identity across epochs.
-Missing or unsafe baselines leave usage unknown, and no transcript reads occur while paused.
-These controls do not qualify native transcript lag, streaming finality or actual provider cost.
+## Separate numeric usage consent
 
-Canonical request data contains only harness/session identifiers, versioned mapping,
-absolute lifecycle instants, exact integer seconds, completeness and explicit usage
-unavailability. It contains no prompts, assistant prose, transcript, source code, tool
-arguments, raw branches, full repository paths or API keys. Metadata-only capture does not
-read transcript files. Known credential/path patterns are refused in identifiers; this is
-not a claim to detect every possible secret.
+Metadata-only timing consent never authorizes transcript reading. From the approved
+repository, inspect or disable one namespace independently:
+
+```sh
+keito capture usage status --repo --agent codex --json
+keito capture usage disable --repo --agent codex --json
+```
+
+Explicit enable requires the current verified release pair, managed hook registration,
+a canonical owned HOME, and the actual native harness image. The supported parser
+versions are Claude Code 2.1.319 and Codex CLI 0.167.0. Supply owned canonical paths:
+
+```sh
+keito capture usage enable --repo --agent codex \
+  --profile-home /absolute/approved/home \
+  --harness-executable /absolute/codex-launcher \
+  --native-executable /absolute/codex-native --confirm
+```
+
+Use `--agent claude-code` for Claude. A native launcher may omit
+`--native-executable`; a JavaScript launcher must identify its native image separately.
+Enable performs bounded image qualification, one exact-native `--version` probe and
+full managed-install inspection. Functional paths stay in a private device profile
+record. SQLite consent and billing evidence contain no source paths. Status and
+disable do not inspect harness profiles or transcripts; disable remains available
+when a profile or release pair needs repair.
+
+A normal guarded hook checks persisted consent inside its SQLite transaction before
+loading a profile, inspecting origin metadata or opening a source file. It requires
+an exact supported version, unchanged approved installation/profile/runtime, a live
+guard invocation and a coherent same-user native-image ancestor within at most eight
+hops. It inspects PID, start time, parent and image metadata, without reading process
+arguments, environment or enumerating processes. PATH, hook JSON, HOME and a version
+argument alone cannot grant this authority. These cooperative checks do not establish
+provider attestation or protection against a malicious process running as the same OS user.
+Darwin retains the documented kernel path-to-image race.
+
+The next qualified Prompt establishes an identifier-only historical exclusion baseline
+and opaque source identity. Provisional historical request identifiers remain excluded
+when later finalized. Stop/SessionEnd cannot repair a missing baseline, and a replaced
+source requires another qualified Prompt. Symlinks, FIFOs, hardlinks, directories,
+wrong sessions/paths/versions and changed sources remain unavailable. Pauses,
+revocation, reapproval, refused boundaries and native gaps require a fresh baseline.
+Profile, registration, runtime or native image changes require explicit reapproval.
+A late lease failure rolls back new numeric finalization while preserving legitimate
+timing and previous frozen evidence. Numeric disable affects only that namespace;
+metadata timing consent remains separate.
+
+Only minimized request identifiers, optional model/provenance and nullable counters
+can enter usage evidence. Observations remain `PARTIAL`; they do not establish full
+session coverage, streaming finality, transcript lag or provider expenditure. The
+owned inert source-fixture tests exercise the normal command route; real pinned-harness
+trust/lifecycle qualification, final release timing and demonstrations remain separate
+required records. No usage observation automatically creates a charge or expense.
+
+Canonical request data contains harness/session identifiers, versioned mapping,
+absolute lifecycle instants, exact integer seconds, completeness and either qualified
+partial usage or explicit unavailability. It contains no prompts, assistant prose,
+transcript, source code, tool arguments, raw branches, full repository paths or API keys.
+Metadata-only capture does not read transcript files. Known credential/path patterns
+are refused in identifiers; this is not a claim to detect every possible secret.
 
 ## Recover without changing accounting evidence
 

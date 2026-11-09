@@ -262,7 +262,11 @@ created by `/track-time-keito`.
   local paths before persistence. A supervised worker sends frozen revisions;
   retrying never increases their duration. Repository config is only a hint;
   local consent is stored separately, and new captures remain nonbillable
-  pending review. Usage is unavailable until a qualified source exists.
+  pending review. Timing consent is metadata-only. Separate `capture usage
+  enable` consent can admit partial request observations from an approved native
+  harness and exact active source; provider expenditure remains unknown. See
+  [numeric usage consent](docs/capture.md#separate-numeric-usage-consent) for the
+  supported-version and qualification limits.
 
 ### Distribution Model
 

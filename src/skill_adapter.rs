@@ -51,3 +51,7 @@ mod implementation {
 #[cfg(all(unix, test))]
 pub(crate) use implementation::tests;
 pub use implementation::{inspect, install, uninstall};
+#[cfg(unix)]
+pub(crate) fn registration_words(command: &str) -> Option<Vec<String>> {
+    implementation::words(command)
+}

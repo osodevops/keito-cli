@@ -22,8 +22,19 @@ profile_fingerprint() {
 }
 before=$(profile_fingerprint)
 readonly profile before
+source_manifest_parent=
 verify_profile() {
-  local result=$? after
+  local result=$? after complete_result=0
+  if [ -n "$source_manifest_parent" ]; then
+    if PYTHONDONTWRITEBYTECODE=1 python3 "$repo/tests/support/source_qa_manifest.py" verify-complete \
+      "$repo" "$source_manifest_parent" > "$source_manifest_parent/source-qa-outer-complete.log" 2>&1; then
+      complete_result=0
+    else
+      complete_result=$?
+    fi
+    printf 'original_exit=%s\nsource_complete_exit=%s\n' "$result" "$complete_result" > "$source_manifest_parent/source-qa-outer-result.txt"
+    if [ "$result" -eq 0 ] && [ "$complete_result" -ne 0 ]; then result=$complete_result; fi
+  fi
   after=$(profile_fingerprint) || result=98
   if [ "$after" != "$before" ]; then echo 'Operator profile changed; preserve evidence and stop.' >&2; result=98; fi
   exit "$result"
@@ -36,6 +47,10 @@ root=$(cd "$root" && pwd -P)
 chmod 700 "$root"
 "$repo/target/debug/check-service-boundary" prepare "$root"
 printf 'Owned test boundary: %s\n' "$root"
+# Read-only source Git membership is collected before the kernel boundary.
+PYTHONDONTWRITEBYTECODE=1 python3 "$repo/tests/support/source_qa_manifest.py" collect \
+  "$repo" "$root" > "$root/source-qa-outer-collect.log"
+source_manifest_parent=$root
 # This is the only sandbox application. Both checker and Cargo inherit it.
 env -i HOME="$root/home" CODEX_HOME="$root/home/.codex" CLAUDE_CONFIG_DIR="$root/home/.claude" \
   KEITO_CAPTURE_HOME="$root/home/capture" XDG_CONFIG_HOME="$root/home/config" APPDATA="$root/home/AppData" \

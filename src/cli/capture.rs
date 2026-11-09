@@ -32,6 +32,11 @@ pub enum CaptureSubcommand {
     },
     /// Inspect local consent, queue and delivery state (no network)
     Status,
+    /// Inspect or manage separate numeric-usage consent for this repository
+    Usage {
+        #[command(subcommand)]
+        command: CaptureUsageSubcommand,
+    },
     /// Reconcile unfinished intervals after a storage-refused boundary, without inventing time
     Recover {
         /// Acknowledge that refused boundaries cannot be reconstructed
@@ -96,6 +101,46 @@ pub enum CaptureSubcommand {
         event: CaptureEvent,
         #[arg(long)]
         harness_version: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CaptureUsageSubcommand {
+    /// Explicitly approve bounded local numeric reading for this binding/namespace
+    #[command(
+        long_about = "Approve numeric capture separately from metadata-only timing. Only the exact active native session file under this approved HOME's managed .claude/projects or .codex/sessions layout may be read by a qualified guarded hook. Prompts, code, tool arguments and source paths are not retained as usage evidence. Observations remain partial, provider expenditure remains unknown, and charging still requires review. The next qualified Prompt must establish a historical identity exclusion baseline."
+    )]
+    Enable {
+        #[arg(long, required = true)]
+        repo: bool,
+        #[arg(long, value_enum)]
+        agent: CaptureAgent,
+        /// Canonical owned HOME containing the managed harness registration
+        #[arg(long)]
+        profile_home: std::path::PathBuf,
+        /// Canonical approved launcher; a wrapper also requires --native-executable
+        #[arg(long)]
+        harness_executable: std::path::PathBuf,
+        /// Exact native image whose bounded --version result is approved
+        #[arg(long)]
+        native_executable: Option<std::path::PathBuf>,
+        /// Confirm bounded active-file reading and minimized numeric retention
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Withdraw only this namespace's numeric consent; timing consent is separate
+    Disable {
+        #[arg(long, required = true)]
+        repo: bool,
+        #[arg(long, value_enum)]
+        agent: CaptureAgent,
+    },
+    /// Inspect numeric consent without reading harness profiles or session files
+    Status {
+        #[arg(long, required = true)]
+        repo: bool,
+        #[arg(long, value_enum)]
+        agent: CaptureAgent,
     },
 }
 

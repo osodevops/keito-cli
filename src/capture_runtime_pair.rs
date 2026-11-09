@@ -284,3 +284,23 @@ pub fn current() -> Result<CaptureRuntimeIdentity, AppError> {
         Err(refused())
     }
 }
+
+/// Sealed actual verifier result for a normal guarded hook. The public runtime
+/// descriptor remains transport data; callers cannot deserialize this proof.
+#[cfg(unix)]
+pub(crate) struct HookRuntime {
+    identity: CaptureRuntimeIdentity,
+}
+#[cfg(unix)]
+impl HookRuntime {
+    pub(crate) fn current(expected_core: &str) -> Result<Self, AppError> {
+        let identity = current()?;
+        if identity.core_sha256 != expected_core {
+            return Err(refused());
+        }
+        Ok(Self { identity })
+    }
+    pub(crate) fn identity(&self) -> &CaptureRuntimeIdentity {
+        &self.identity
+    }
+}

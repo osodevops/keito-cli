@@ -115,7 +115,12 @@ The platform test inventory is deliberate:
 
 - `capture_store`: 36 POSIX-authority cases on Unix; six pure identifier/Git/mapping
   parser cases remain cross-platform.
-- `capture_usage_integration`: 21 native consent/store/reader cases on Unix.
+- `capture::usage_qualification_tests`: 21 Unix native reader/SQLite ledger
+  qualification cases, moved intact to the private library test child in
+  `tests/unit/capture_usage_qualification.rs`. The old integration target and
+  exported synthetic usage capability are removed. This private `cfg(test)`
+  seam cannot enable numeric capture in default or dev-tools production builds;
+  normal guarded command acceptance remains a separate requirement.
 - `capture_transport`: 11 native consent/queued-store cases on Unix.
 - Parser tests moved from the removed integration target to the private
   `capture_usage::parser_tests` library child in `tests/unit/capture_usage_parser.rs`.
@@ -135,3 +140,68 @@ Actual Windows hosted execution remains necessary; local source partitioning is
 not a passing Windows runtime result. These changes also require fresh independent
 review and a new paired-artifact qualification. The retained 689 source's FIRST
 and p95 observations qualify only that earlier source/artifact slice.
+
+
+## Separate numeric admission and source-only verification
+
+`capture usage enable/status/disable --repo --agent <namespace>` manages separate
+path-free persisted consent. Enable alone performs managed-install inspection,
+bounded streaming native image hashing (512 MiB maximum), and one bounded native
+version probe. A private 0600 functional profile contains device paths; it is not
+billing evidence. Hooks perform metadata freshness checks instead of repeating
+image hashes, version commands or installer inspection.
+
+The normal guarded factory reads current persisted consent inside the transaction
+before functional profile, origin or source operations. A sealed actual runtime
+verifier result and live invocation Permit are required. The supported native image
+must occur in a coherent same-user ancestry chain of at most eight observations;
+PID/start/parent/image changes, unavailable metadata and wrong images fail closed.
+No process arguments/environment, broad process discovery or provider attestation
+are involved. Darwin's cooperative path-to-image limitation remains explicit.
+
+A qualified Prompt binds an opaque source identity and historical request-ID baseline.
+Terminals require that baseline and check source identity before reading bytes.
+Read-only profile/image/source descriptors and coherent origin snapshots remain alive
+through commit. Freshness is checked before reading and at finalization. A numeric-only
+savepoint rolls back uncertain new queue/body/session writes after a late failure,
+then persists the measured timing and previously accepted ledger without rewriting
+prior frozen bodies. Status reasons are a closed local allowlist; the outbound usage
+schema has not gained arbitrary diagnostic fields.
+
+The normal-route developer QA uses a guard-first anchored opt2 dev pair, explicit
+private HOME/config/harness/capture/state/PATH, owned inert Rust native fixtures and
+actual `isolation::checked` before product Command construction. Two namespaces
+exercise explicit normal consent and managed guarded Prompt/Stop; the 38-case negative
+matrix covers stale profile/native/registration/generation, unsafe/replaced source,
+missing/wrong paths, revoke/pause and a wrong native image within an entirely owned
+bounded ancestor chain. Exclusive observations retain each first outcome. Python
+orchestration remains developer-only and is excluded from the installed 21-file payload.
+The macOS full suite runs it inside the existing proved inherited policy, without a
+nested sandbox; Linux CI runs the same source-only runner after its native suite.
+The Linux runner uses explicit private checked operands and environment; it makes
+no kernel service/network-denial claim. Neither source route invokes a real
+harness, service or network operation. Windows retains the 17-command unsupported capture matrix and manual CLI coverage.
+
+This source-only QA does not qualify an actual provider/harness, a default release
+candidate, first quiet-host behavior or the unchanged p95 below 100 ms target. Those
+records require the exact separately reviewed final source/artifact and authorized
+real harness qualification. Partial counters and UNKNOWN provider expenditure never
+authorize automatic charging.
+
+
+The reusable source runner requires an exclusive bounded outer source manifest.
+The outer harness collects tracked, untracked nonignored and deliberately deleted
+membership through read-only Git with hooks/fsmonitor/global config disabled.
+Inside the macOS boundary, verification reads only the approved manifest and owned
+no-follow source files; it never follows the checkout's linked common Git metadata.
+Raw manifest, collector and complete source-set hashes are bound in the receipts.
+Deleted source paths must remain absent. Outer completeness verification runs after
+both successful and failed execution and preserves the original failure status.
+
+Metadata, compiler, fixture and source-QA subprocesses use tracked direct handles.
+A PID/PGID, launch interval and opaque nonce are recorded before normal waiting.
+Timeout, cancellation and receipt exceptions finalize only that owned unreaped
+child group with bounded TERM/KILL and confirmed wait. The inert Unix contract
+batch is a mandatory separate CI phase; it supplies no runtime approval capability.
+These developer controls do not claim general supervision of malicious children,
+unobservable hard kills, escaped groups or processes discovered by enumeration.

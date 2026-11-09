@@ -81,6 +81,23 @@ jobs:
         run: KEITO_TEST_REAL_PROFILE_HOME="$HOME" tests/run-macos-isolated.sh
       - run: cargo test --all-features --all-targets
         if: runner.os != 'macOS'
+      - name: Verify normal numeric capture with an owned source-fixture pair
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          qa_root=$(mktemp -d /tmp/keito-source-usage.XXXXXX)
+          chmod 700 "$qa_root"
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/support/test_source_qa_contract.py "$qa_root"
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/support/source_qa_manifest.py collect "$PWD" "$qa_root"
+          qa_result=0
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/support/run_guarded_usage_qa.py \
+            "$qa_root" "$(command -v cargo)" "$(command -v rustc)" || qa_result=$?
+          complete_result=0
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/support/source_qa_manifest.py verify-complete \
+            "$PWD" "$qa_root" || complete_result=$?
+          printf 'original_exit=%s\nsource_complete_exit=%s\n' "$qa_result" "$complete_result" > "$qa_root/source-qa-outer-result.txt"
+          if [ "$qa_result" -ne 0 ]; then exit "$qa_result"; fi
+          exit "$complete_result"
 
   release-smoke:
     name: Release Smoke

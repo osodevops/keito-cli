@@ -1,8 +1,8 @@
 #![cfg(unix)]
 // Native consent/store/reader assertions require the supported POSIX authority.
-//! Synthetic core qualification only. Native command integration remains disabled.
-use keito_cli::capture::{self, Binding, Clock, Repository, Signal, Store, UsageSource};
-use keito_cli::cli::capture::CaptureEvent::{self, *};
+//! Synthetic core qualification only; normal guarded command acceptance is separate.
+use crate::capture::{self, Binding, Clock, Repository, Signal, Store, UsageSource};
+use crate::cli::capture::CaptureEvent::{self, *};
 use serde_json::{json, Value};
 use std::fs;
 const SESSION: &str = "12345678-1234-4234-8234-123456789abc";

@@ -107,6 +107,20 @@ async fn unsupported_native_commands_never_read_auth_upload_acknowledge_or_chang
             "--harness-version",
             "2.1.319",
         ],
+        vec!["usage", "status", "--repo", "--agent", "codex"],
+        vec!["usage", "disable", "--repo", "--agent", "claude-code"],
+        vec![
+            "usage",
+            "enable",
+            "--repo",
+            "--agent",
+            "codex",
+            "--profile-home",
+            "C:\\owned-inert-fixture\\home",
+            "--harness-executable",
+            "C:\\owned-inert-fixture\\codex.exe",
+            "--confirm",
+        ],
     ];
     for args in commands {
         let mut command = Command::new(&executable);

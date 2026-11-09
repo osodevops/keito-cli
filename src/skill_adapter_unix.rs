@@ -275,7 +275,7 @@ fn parse_config(bytes: Option<&[u8]>) -> Result<Value, AppError> {
 }
 /// Literal POSIX words only. Expansion, executable combinations and uncertainty
 /// preserve the original command. Double-quoted backslash semantics are POSIX.
-fn words(command: &str) -> Option<Vec<String>> {
+pub(super) fn words(command: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;

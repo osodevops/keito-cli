@@ -281,6 +281,14 @@ struct ActiveTurn {
     clock: Option<Clock>,
     part: usize,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct NumericAuthority {
+    profile_id: String,
+    profile_digest: String,
+    epoch: u64,
+    #[serde(default)]
+    source_identity: Option<String>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -304,6 +312,8 @@ pub struct Session {
     pub canonical_server_id: Option<String>,
     #[serde(default)]
     usage_ledger: UsageLedger,
+    #[serde(default)]
+    numeric_authority: Option<NumericAuthority>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -360,6 +370,7 @@ impl Session {
             needs_attention: false,
             canonical_server_id: None,
             usage_ledger: UsageLedger::default(),
+            numeric_authority: None,
         }
     }
     fn close(&mut self, clock: &Clock, complete: bool) -> Result<(), AppError> {
@@ -450,15 +461,195 @@ impl Session {
     }
 }
 
-/// Transient synthetic qualification capability, scoped to one source/native session.
-/// The hook command does not construct this while native qualification is pending.
-/// No paths from this object are serialized, logged, or stored.
-#[doc(hidden)]
-pub struct UsageSource<'a> {
-    pub resolved_home: &'a Path,
-    pub exact_hook_path: &'a Path,
-    pub qualified_source: &'a str,
-    pub qualified_native_session: &'a str,
+/// Private transient input. It is never serialized, logged or stored. Ordinary
+/// production callers cannot construct a synthetic qualification capability.
+struct UsageSource<'a> {
+    resolved_home: &'a Path,
+    exact_hook_path: &'a Path,
+    qualified_source: &'a str,
+    qualified_native_session: &'a str,
+}
+#[cfg(unix)]
+struct NormalHookInput<'a> {
+    path: Option<&'a Path>,
+    runtime: Option<&'a crate::capture_runtime_pair::HookRuntime>,
+}
+#[cfg(not(unix))]
+type NormalHookInput<'a> = std::marker::PhantomData<&'a ()>;
+
+#[cfg(unix)]
+struct NormalFactoryArgs<'a, 'r> {
+    connection: &'a Connection,
+    directory: &'a Path,
+    invocation: Option<&'a Permit>,
+    binding: &'a Binding,
+    source: &'a str,
+    source_id: &'a str,
+    version: &'a str,
+    event: CaptureEvent,
+    input: NormalHookInput<'r>,
+}
+#[cfg(unix)]
+struct EventFinalization<'a> {
+    id: &'a str,
+    binding: &'a Binding,
+    source_id: &'a str,
+    was_refused: bool,
+    time_only: Option<&'a Session>,
+}
+#[cfg(unix)]
+struct NormalFactory<'r> {
+    policy: Option<crate::capture_usage_consent::ConsentPolicy>,
+    runtime: Option<&'r crate::capture_runtime_pair::HookRuntime>,
+    approved: Option<ApprovedActiveSession>,
+    profile: Option<crate::capture_usage_profile::ProfileLease>,
+    origin: Option<crate::capture_usage_origin::OriginLease>,
+    source_lease: Option<crate::capture_usage::SourceLease>,
+    reason: Option<&'static str>,
+    invalidate: bool,
+}
+#[cfg(unix)]
+impl NormalFactory<'_> {
+    fn fail(&mut self, session: &mut Session, reason: &'static str) {
+        self.reason = Some(reason);
+        self.invalidate |= matches!(
+            reason,
+            "PROFILE_CHANGED"
+                | "HARNESS_CHANGED"
+                | "REGISTRATION_CHANGED"
+                | "RUNTIME_CHANGED"
+                | "UNSUPPORTED_HARNESS_VERSION"
+        );
+        session.usage_ledger.require_baseline();
+        if self.invalidate {
+            session.numeric_authority = None;
+        } else if let Some(authority) = &mut session.numeric_authority {
+            authority.source_identity = None;
+        }
+    }
+    fn observe(
+        &mut self,
+        session: &mut Session,
+        event: CaptureEvent,
+        source: &str,
+        version: &str,
+        source_id: &str,
+    ) {
+        if self.policy.is_none() {
+            return;
+        }
+        if let Some(reason) = self.reason {
+            self.fail(session, reason);
+            return;
+        }
+        if let Err(reason) = self.valid() {
+            self.fail(session, reason);
+            return;
+        }
+        let Some(approved) = self.approved.as_ref() else {
+            return;
+        };
+        if event == CaptureEvent::Prompt {
+            match crate::capture_usage::read_request_ids_leased(approved) {
+                Ok((baseline, lease))
+                    if baseline.source_session_id == source_id
+                        && baseline.harness_version == version
+                        && baseline.limitations.is_empty()
+                        && baseline.source_adapter
+                            == if source == "claude-code" {
+                                "CLAUDE_JSONL_2_1_319_V1"
+                            } else {
+                                "CODEX_ROLLOUT_0_167_0_V1"
+                            } =>
+                {
+                    let Some(identity) = lease.identity() else {
+                        self.fail(session, "SOURCE_CHANGED");
+                        return;
+                    };
+                    let same_source = session
+                        .numeric_authority
+                        .as_ref()
+                        .and_then(|authority| authority.source_identity.as_ref())
+                        == Some(&identity);
+                    if !same_source && session.usage_ledger.baseline_ready() {
+                        session.usage_ledger.require_baseline();
+                    }
+                    if !session.usage_ledger.baseline_ready()
+                        && !session.usage_ledger.establish_baseline(baseline.record_ids)
+                    {
+                        self.fail(session, "SOURCE_PARSE_UNAVAILABLE");
+                        return;
+                    }
+                    if let Some(authority) = &mut session.numeric_authority {
+                        authority.source_identity = Some(identity);
+                    }
+                    self.source_lease = Some(lease);
+                    self.reason = Some("OBSERVED_REQUEST_RECORDS");
+                }
+                _ => self.fail(session, "SOURCE_PARSE_UNAVAILABLE"),
+            }
+        } else if matches!(event, CaptureEvent::Stop | CaptureEvent::SessionEnd) {
+            let Some(identity) = session
+                .numeric_authority
+                .as_ref()
+                .and_then(|authority| authority.source_identity.as_deref())
+            else {
+                self.fail(session, "MISSING_QUALIFIED_PROMPT");
+                return;
+            };
+            match crate::capture_usage::read_requests_leased(
+                approved,
+                &session.usage_ledger.excluded_request_ids,
+                identity,
+            ) {
+                Ok((evidence, lease)) => {
+                    session
+                        .usage_ledger
+                        .observe(evidence, source, version, source_id);
+                    self.source_lease = Some(lease);
+                    self.reason = Some("OBSERVED_REQUEST_RECORDS");
+                }
+                Err(crate::capture_usage::UsageReadError::SourceChanged) => {
+                    self.fail(session, "SOURCE_CHANGED")
+                }
+                Err(_) => self.fail(session, "SOURCE_PARSE_UNAVAILABLE"),
+            }
+        }
+    }
+    fn validate_current(
+        &self,
+        connection: &Connection,
+        binding: &Binding,
+    ) -> Result<Result<(), &'static str>, AppError> {
+        // An invalidating failure has already discarded this boundary's new
+        // numeric state. Its own transactional revocation is expected; do not
+        // replace the specific local failure reason with "disabled" afterward.
+        if self.invalidate {
+            return Ok(Ok(()));
+        }
+        if let Some(policy) = &self.policy {
+            if !Store::policy_current(connection, binding, policy)? {
+                return Ok(Err("NUMERIC_CAPTURE_DISABLED"));
+            }
+        }
+        Ok(self.valid())
+    }
+    fn valid(&self) -> Result<(), &'static str> {
+        if let (Some(profile), Some(runtime)) = (&self.profile, self.runtime) {
+            profile.validate(runtime.identity())?;
+        }
+        if self.origin.as_ref().is_some_and(|origin| !origin.valid()) {
+            return Err("HARNESS_ORIGIN_UNAVAILABLE");
+        }
+        if self
+            .source_lease
+            .as_ref()
+            .is_some_and(|lease| !lease.valid())
+        {
+            return Err("SOURCE_CHANGED");
+        }
+        Ok(())
+    }
 }
 
 pub struct Signal<'a> {
@@ -640,7 +831,9 @@ impl Store {
             CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL,
                 payload_hash TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                 retry_at INTEGER NOT NULL DEFAULT 0, claimed_until INTEGER NOT NULL DEFAULT 0, reason TEXT,
-                acknowledged_at INTEGER, UNIQUE(session_id,revision));").map_err(storage_error)?;
+                acknowledged_at INTEGER, UNIQUE(session_id,revision));
+            CREATE TABLE IF NOT EXISTS usage_consents (binding_id TEXT NOT NULL, namespace TEXT NOT NULL, data TEXT NOT NULL,
+                PRIMARY KEY(binding_id,namespace));").map_err(storage_error)?;
         Ok(Self {
             connection,
             directory: directory.to_owned(),
@@ -768,6 +961,8 @@ impl Store {
         Self::check_size(&tx)?;
         let previous = Self::binding_in(&tx, &binding.repository_key)?;
         if let Some(old) = &previous {
+            // Repeating metadata-only setup never renews numeric permission.
+            Self::revoke_numeric_binding(&tx, old)?;
             if old.remote_hash == binding.remote_hash
                 && old.hint_hash == binding.hint_hash
                 && old.workspace_id == binding.workspace_id
@@ -882,6 +1077,7 @@ impl Store {
         binding: &Binding,
         reason: &str,
     ) -> Result<(), AppError> {
+        Self::revoke_numeric_binding(tx, binding)?;
         Self::abandon_revoked_turns(tx, &binding.id, &[])?;
         let mut revoked = binding.clone();
         revoked.revoked = true;
@@ -975,17 +1171,498 @@ impl Store {
     pub fn binding(&self, key: &str) -> Result<Option<Binding>, AppError> {
         Self::binding_in(&self.connection, key)
     }
-    pub fn event(&mut self, repository: &Repository, signal: Signal<'_>) -> Result<(), AppError> {
-        self.event_with_usage(repository, signal, None)
+    /// Path-free local policy inspection. Missing policy exits before any
+    /// functional profile, executable, process-origin or source-file access.
+    pub fn numeric_status(
+        &self,
+        repository: &Repository,
+        namespace: &str,
+    ) -> Result<serde_json::Value, AppError> {
+        use crate::capture_usage_consent::{status, ConsentPolicy};
+        if !matches!(namespace, "claude-code" | "codex") {
+            return Err(AppError::InvalidInput(
+                "Unsupported numeric capture source".into(),
+            ));
+        }
+        let disabled = || status(namespace, false, "NUMERIC_CAPTURE_DISABLED");
+        let Some(binding) = Self::binding_in(&self.connection, &repository.key)? else {
+            return Ok(disabled());
+        };
+        if binding.revoked
+            || binding.paused
+            || !binding.agents.iter().any(|agent| agent == namespace)
+            || !repository.matches_binding(&binding)
+        {
+            return Ok(disabled());
+        }
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT data FROM usage_consents WHERE binding_id=?1 AND namespace=?2",
+                params![binding.id, namespace],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let Some(raw) = raw else {
+            return Ok(disabled());
+        };
+        let policy = serde_json::from_str::<ConsentPolicy>(&raw)
+            .ok()
+            .filter(|policy| policy.matches(&binding, namespace));
+        Ok(match policy {
+            None => status(namespace, false, "NUMERIC_CONSENT_NEEDS_REVIEW"),
+            Some(policy) if !policy.enabled => status(
+                namespace,
+                false,
+                policy
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("NUMERIC_CAPTURE_DISABLED"),
+            ),
+            Some(policy) => status(
+                namespace,
+                true,
+                policy
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("NUMERIC_SOURCE_UNQUALIFIED"),
+            ),
+        })
     }
-    /// Numeric usage is opt-in through an internal, session-scoped qualification capability.
-    /// Ordinary production hooks stay metadata-only until native qualification passes.
-    #[doc(hidden)]
-    pub fn event_with_usage(
+    #[cfg(unix)]
+    fn numeric_eligible(repository: &Repository, binding: &Binding, namespace: &str) -> bool {
+        matches!(namespace, "claude-code" | "codex")
+            && !binding.revoked
+            && !binding.paused
+            && repository.matches_binding(binding)
+            && binding.agents.iter().any(|agent| agent == namespace)
+    }
+    #[cfg(unix)]
+    pub(crate) fn numeric_binding(
+        &self,
+        repository: &Repository,
+        namespace: &str,
+    ) -> Result<Binding, AppError> {
+        Self::binding_in(&self.connection, &repository.key)?.filter(|binding| Self::numeric_eligible(repository, binding, namespace))
+            .ok_or_else(|| AppError::Config("Numeric capture requires a current active metadata-only repository mapping; run capture setup first".into()))
+    }
+    fn numeric_reset_sessions(
+        tx: &Transaction<'_>,
+        binding: &Binding,
+        namespace: &str,
+    ) -> Result<(), AppError> {
+        let mut statement = tx.prepare("SELECT data FROM sessions WHERE binding_id=?1 AND json_extract(data,'$.source_namespace')=?2").map_err(storage_error)?;
+        let rows: Vec<String> = statement
+            .query_map(params![binding.id, namespace], |row| row.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for raw in rows {
+            let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            session.usage_ledger.require_baseline();
+            session.numeric_authority = None;
+            tx.execute(
+                "UPDATE sessions SET data=?2 WHERE id=?1",
+                params![
+                    session.id,
+                    serde_json::to_string(&session).map_err(storage_error)?
+                ],
+            )
+            .map_err(storage_error)?;
+        }
+        Ok(())
+    }
+    fn revoke_numeric_namespace(
+        tx: &Transaction<'_>,
+        binding: &Binding,
+        namespace: &str,
+        create: bool,
+    ) -> Result<(), AppError> {
+        use crate::capture_usage_consent::ConsentPolicy;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT data FROM usage_consents WHERE binding_id=?1 AND namespace=?2",
+                params![binding.id, namespace],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if raw.is_none() && !create {
+            return Ok(());
+        }
+        let old = raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<ConsentPolicy>(raw).ok())
+            .filter(|old| old.matches(binding, namespace));
+        let epoch = old.as_ref().map_or(1, |old| {
+            if old.enabled {
+                old.epoch.saturating_add(1)
+            } else {
+                old.epoch
+            }
+        });
+        let policy = ConsentPolicy {
+            policy_version: 1,
+            binding_id: binding.id.clone(),
+            binding_version: binding.version,
+            source_namespace: namespace.into(),
+            profile_id: old
+                .as_ref()
+                .map_or_else(|| "0".repeat(64), |old| old.profile_id.clone()),
+            profile_digest: old
+                .as_ref()
+                .map_or_else(|| "0".repeat(64), |old| old.profile_digest.clone()),
+            epoch,
+            enabled: false,
+            unavailable_reason: Some("NUMERIC_CAPTURE_DISABLED".into()),
+        };
+        tx.execute("INSERT INTO usage_consents(binding_id,namespace,data) VALUES(?1,?2,?3) ON CONFLICT(binding_id,namespace) DO UPDATE SET data=excluded.data",
+            params![binding.id,namespace,serde_json::to_string(&policy).map_err(storage_error)?]).map_err(storage_error)?;
+        Self::numeric_reset_sessions(tx, binding, namespace)?;
+        tx.execute("UPDATE outbox SET state='held',reason='NUMERIC_CONSENT_REVOKED',claimed_until=0 WHERE state!='acknowledged' AND json_array_length(body,'$.usage.records')>0 AND session_id IN(SELECT id FROM sessions WHERE binding_id=?1 AND json_extract(data,'$.source_namespace')=?2)", params![binding.id,namespace]).map_err(storage_error)?;
+        Ok(())
+    }
+    fn revoke_numeric_binding(tx: &Transaction<'_>, binding: &Binding) -> Result<(), AppError> {
+        for namespace in ["claude-code", "codex"] {
+            Self::revoke_numeric_namespace(tx, binding, namespace, false)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn disable_numeric(
+        &mut self,
+        repository: &Repository,
+        namespace: &str,
+    ) -> Result<serde_json::Value, AppError> {
+        if !matches!(namespace, "claude-code" | "codex") {
+            return Err(AppError::InvalidInput(
+                "Unsupported numeric capture source".into(),
+            ));
+        }
+        let tx = self.transaction()?;
+        let binding = Self::binding_in(&tx, &repository.key)?
+            .ok_or_else(|| AppError::Config("Repository not approved; run capture setup".into()))?;
+        Self::revoke_numeric_namespace(&tx, &binding, namespace, true)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(crate::capture_usage_consent::status(
+            namespace,
+            false,
+            "NUMERIC_CAPTURE_DISABLED",
+        ))
+    }
+    #[cfg(unix)]
+    pub(crate) fn enable_numeric(
+        &mut self,
+        repository: &Repository,
+        namespace: &str,
+        prepared: &crate::capture_usage_profile::PreparedProfile,
+    ) -> Result<serde_json::Value, AppError> {
+        use crate::capture_usage_consent::ConsentPolicy;
+        let tx = self.transaction()?;
+        let refused = tx.failure()?.is_some();
+        if refused {
+            return Err(AppError::Config(
+                "Capture remains paused after a refusal; recover before numeric approval".into(),
+            ));
+        }
+        let binding = Self::binding_in(&tx, &repository.key)?.filter(|binding| Self::numeric_eligible(repository,binding,namespace))
+            .filter(|binding| prepared.matches(binding,namespace)).ok_or_else(|| AppError::Config("Numeric consent changed during approval; explicitly qualify the current profile and mapping again".into()))?;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT data FROM usage_consents WHERE binding_id=?1 AND namespace=?2",
+                params![binding.id, namespace],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let old = raw
+            .as_deref()
+            .map(serde_json::from_str::<ConsentPolicy>)
+            .transpose()
+            .map_err(|_| {
+                AppError::Config(
+                    "Numeric consent needs review; disable it before approving again".into(),
+                )
+            })?;
+        let epoch = old
+            .as_ref()
+            .map_or(Some(1), |old| old.epoch.checked_add(1))
+            .ok_or_else(|| {
+                AppError::Config(
+                    "Numeric consent epoch is exhausted; collection remains disabled".into(),
+                )
+            })?;
+        let policy = ConsentPolicy {
+            policy_version: 1,
+            binding_id: binding.id.clone(),
+            binding_version: binding.version,
+            source_namespace: namespace.into(),
+            profile_id: prepared.id().into(),
+            profile_digest: prepared.digest().into(),
+            epoch,
+            enabled: true,
+            unavailable_reason: Some("NUMERIC_SOURCE_UNQUALIFIED".into()),
+        };
+        tx.execute("INSERT INTO usage_consents(binding_id,namespace,data) VALUES(?1,?2,?3) ON CONFLICT(binding_id,namespace) DO UPDATE SET data=excluded.data", params![binding.id,namespace,serde_json::to_string(&policy).map_err(storage_error)?]).map_err(storage_error)?;
+        Self::numeric_reset_sessions(&tx, &binding, namespace)?;
+        if !prepared.matches(&binding, namespace) {
+            return Err(AppError::Config(
+                "Numeric profile changed before approval committed; explicitly reapprove".into(),
+            ));
+        }
+        tx.ensure_no_new_refusal(refused)?;
+        tx.commit().map_err(storage_error)?;
+        let mut status =
+            crate::capture_usage_consent::status(namespace, true, "NUMERIC_SOURCE_UNQUALIFIED");
+        status["notice"] = serde_json::json!("Only minimized partial request observations may be retained after a qualified new Prompt. Provider expenditure remains unknown; charges require review.");
+        Ok(status)
+    }
+    #[cfg(unix)]
+    fn numeric_policy_in(
+        connection: &Connection,
+        binding: &Binding,
+        source: &str,
+    ) -> Result<Option<crate::capture_usage_consent::ConsentPolicy>, AppError> {
+        let raw: Option<String> = connection
+            .query_row(
+                "SELECT data FROM usage_consents WHERE binding_id=?1 AND namespace=?2",
+                params![binding.id, source],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        Ok(raw
+            .filter(|raw| raw.len() <= 4096)
+            .as_deref()
+            .and_then(|raw| {
+                serde_json::from_str::<crate::capture_usage_consent::ConsentPolicy>(raw).ok()
+            })
+            .filter(|policy| policy.matches(binding, source)))
+    }
+    #[cfg(unix)]
+    fn policy_current(
+        connection: &Connection,
+        binding: &Binding,
+        policy: &crate::capture_usage_consent::ConsentPolicy,
+    ) -> Result<bool, AppError> {
+        Ok(
+            Self::numeric_policy_in(connection, binding, &policy.source_namespace)?.is_some_and(
+                |current| {
+                    current.enabled
+                        && current.epoch == policy.epoch
+                        && current.profile_id == policy.profile_id
+                        && current.profile_digest == policy.profile_digest
+                },
+            ),
+        )
+    }
+    #[cfg(unix)]
+    fn normal_factory<'r>(
+        args: NormalFactoryArgs<'_, 'r>,
+        session: &mut Session,
+    ) -> Result<NormalFactory<'r>, AppError> {
+        let mut state = NormalFactory {
+            policy: None,
+            runtime: args.input.runtime,
+            approved: None,
+            profile: None,
+            origin: None,
+            source_lease: None,
+            reason: None,
+            invalidate: false,
+        };
+        // This database decision precedes every functional profile, native
+        // image/provenance and source-file operation. Old/default bindings are
+        // denied without consulting an executable, profile root or hook path.
+        let Some(policy) = Self::numeric_policy_in(args.connection, args.binding, args.source)?
+            .filter(|policy| policy.enabled)
+        else {
+            if session.numeric_authority.take().is_some() {
+                session.usage_ledger.require_baseline();
+            }
+            return Ok(state);
+        };
+        let same_epoch = session.numeric_authority.as_ref().is_some_and(|authority| {
+            authority.profile_id == policy.profile_id
+                && authority.profile_digest == policy.profile_digest
+                && authority.epoch == policy.epoch
+        });
+        if !same_epoch {
+            session.usage_ledger.require_baseline();
+            session.numeric_authority = Some(NumericAuthority {
+                profile_id: policy.profile_id.clone(),
+                profile_digest: policy.profile_digest.clone(),
+                epoch: policy.epoch,
+                source_identity: None,
+            });
+        }
+        state.policy = Some(policy);
+        if !matches!(
+            args.event,
+            CaptureEvent::Prompt | CaptureEvent::Stop | CaptureEvent::SessionEnd
+        ) {
+            return Ok(state);
+        }
+        if args.event != CaptureEvent::Prompt
+            && (!session.usage_ledger.baseline_ready()
+                || session
+                    .numeric_authority
+                    .as_ref()
+                    .and_then(|authority| authority.source_identity.as_ref())
+                    .is_none())
+        {
+            state.reason = Some("MISSING_QUALIFIED_PROMPT");
+            return Ok(state);
+        }
+        let Some(runtime) = args.input.runtime else {
+            state.reason = Some("LIVE_GUARD_REQUIRED");
+            return Ok(state);
+        };
+        if !args
+            .invocation
+            .is_some_and(|invocation| invocation.validate(args.directory).is_ok())
+        {
+            state.reason = Some("LIVE_GUARD_REQUIRED");
+            return Ok(state);
+        }
+        let expected = match args.source {
+            "claude-code" => "2.1.319",
+            "codex" => "0.167.0",
+            _ => "",
+        };
+        if args.version != expected || session.harness_version != args.version {
+            state.reason = Some("UNSUPPORTED_HARNESS_VERSION");
+            state.invalidate = true;
+            return Ok(state);
+        }
+        let policy = state.policy.as_ref().unwrap();
+        let profile = match crate::capture_usage_profile::ProfileLease::load(
+            args.directory,
+            policy,
+            runtime.identity(),
+        ) {
+            Ok(profile) => profile,
+            Err(reason) => {
+                state.reason = Some(reason);
+                state.invalidate = true;
+                return Ok(state);
+            }
+        };
+        if profile.version() != args.version {
+            state.reason = Some("UNSUPPORTED_HARNESS_VERSION");
+            state.invalidate = true;
+            return Ok(state);
+        }
+        let (native, stamp) = profile.native();
+        let Some(origin) = crate::capture_usage_origin::OriginLease::verify(native, stamp) else {
+            state.reason = Some("HARNESS_ORIGIN_UNAVAILABLE");
+            return Ok(state);
+        };
+        let Some(path) = args.input.path else {
+            state.reason = Some("ACTIVE_SOURCE_UNAVAILABLE");
+            return Ok(state);
+        };
+        let harness = if args.source == "claude-code" {
+            Harness::ClaudeCode
+        } else {
+            Harness::Codex
+        };
+        let approved = match ApprovedActiveSession::new(
+            harness,
+            args.version,
+            profile.home(),
+            path,
+            args.source_id,
+        ) {
+            Ok(approved) => approved,
+            Err(_) => {
+                state.reason = Some("ACTIVE_SOURCE_UNAVAILABLE");
+                return Ok(state);
+            }
+        };
+        // Recheck the still-current row immediately before allowing the caller
+        // to open the exact active source. Transaction ordering makes revoke
+        // before admission win; a stale command-side read cannot authorize it.
+        if !Self::policy_current(args.connection, args.binding, policy)? {
+            state.reason = Some("NUMERIC_CAPTURE_DISABLED");
+            return Ok(state);
+        }
+        state.profile = Some(profile);
+        state.origin = Some(origin);
+        state.approved = Some(approved);
+        Ok(state)
+    }
+    #[cfg(unix)]
+    fn save_numeric_reason(
+        tx: &Transaction<'_>,
+        binding: &Binding,
+        state: &NormalFactory<'_>,
+    ) -> Result<(), AppError> {
+        let (Some(policy), Some(reason)) = (&state.policy, state.reason) else {
+            return Ok(());
+        };
+        if state.invalidate {
+            Self::revoke_numeric_namespace(tx, binding, &policy.source_namespace, false)?;
+        }
+        let Some(mut current) = Self::numeric_policy_in(tx, binding, &policy.source_namespace)?
+        else {
+            return Ok(());
+        };
+        if !state.invalidate
+            && (current.epoch != policy.epoch
+                || current.profile_id != policy.profile_id
+                || current.profile_digest != policy.profile_digest)
+        {
+            return Ok(());
+        }
+        current.unavailable_reason = Some(reason.into());
+        tx.execute(
+            "UPDATE usage_consents SET data=?3 WHERE binding_id=?1 AND namespace=?2",
+            params![
+                binding.id,
+                policy.source_namespace,
+                serde_json::to_string(&current).map_err(storage_error)?
+            ],
+        )
+        .map_err(storage_error)?;
+        Ok(())
+    }
+    pub fn event(&mut self, repository: &Repository, signal: Signal<'_>) -> Result<(), AppError> {
+        self.event_inner(repository, signal, None, None)
+    }
+    #[cfg(unix)]
+    pub(crate) fn event_hook(
+        &mut self,
+        repository: &Repository,
+        signal: Signal<'_>,
+        path: Option<&Path>,
+        runtime: Option<&crate::capture_runtime_pair::HookRuntime>,
+    ) -> Result<(), AppError> {
+        self.event_inner(
+            repository,
+            signal,
+            None,
+            Some(NormalHookInput { path, runtime }),
+        )
+    }
+    // Synthetic ledger qualification is accessible only to this private test
+    // child. It cannot be selected by CLI, environment, default or dev-tools.
+    #[cfg(all(test, unix))]
+    fn event_with_usage(
         &mut self,
         repository: &Repository,
         signal: Signal<'_>,
         usage_source: Option<&UsageSource<'_>>,
+    ) -> Result<(), AppError> {
+        self.event_inner(repository, signal, usage_source, None)
+    }
+    fn event_inner(
+        &mut self,
+        repository: &Repository,
+        signal: Signal<'_>,
+        usage_source: Option<&UsageSource<'_>>,
+        normal_hook: Option<NormalHookInput<'_>>,
     ) -> Result<(), AppError> {
         let Signal {
             source,
@@ -1006,6 +1683,11 @@ impl Store {
         if let Some(id) = turn_id {
             identifier(id)?;
         }
+        #[cfg(unix)]
+        let (factory_directory, factory_invocation) =
+            (self.directory.clone(), self.invocation.clone());
+        #[cfg(not(unix))]
+        let _ = normal_hook;
         let tx = self.transaction_for_event(true)?;
         let self_failure_present = tx.failure()?.is_some();
         if self_failure_present {
@@ -1162,9 +1844,44 @@ impl Store {
                 }
             }
         }
+        #[cfg(unix)]
+        let mut numeric_time_only = None;
+        #[cfg(unix)]
+        let mut normal_factory = if !binding.paused && !self_failure_present {
+            if let Some(input) = normal_hook {
+                // Clone only for an enabled row, after legitimate timing has
+                // been reconciled. A late lease failure can roll back numeric
+                // finalization without dropping that measured interval.
+                if Self::numeric_policy_in(&tx, &binding, source)?
+                    .is_some_and(|policy| policy.enabled)
+                {
+                    numeric_time_only = Some(session.clone());
+                }
+                let mut factory = Self::normal_factory(
+                    NormalFactoryArgs {
+                        connection: &tx,
+                        directory: &factory_directory,
+                        invocation: factory_invocation.as_ref(),
+                        binding: &binding,
+                        source,
+                        source_id,
+                        version,
+                        event,
+                        input,
+                    },
+                    &mut session,
+                )?;
+                factory.observe(&mut session, event, source, version, source_id);
+                Some(factory)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // Timing terminal reconciliation remains available during a pause. It
         // never authorizes a transcript read or changes the numeric consent epoch.
-        if !binding.paused && !self_failure_present {
+        if !binding.paused && !self_failure_present && usage_source.is_some() {
             let approved = usage_source.and_then(|input| {
                 let harness = match source {
                     "claude-code" => Some(Harness::ClaudeCode),
@@ -1242,18 +1959,99 @@ impl Store {
                 }
             }
         }
+        #[cfg(unix)]
+        Self::finalize_normal_event(
+            &tx,
+            &mut session,
+            normal_factory.as_mut(),
+            EventFinalization {
+                id: &id,
+                binding: &binding,
+                source_id,
+                was_refused: self_failure_present,
+                time_only: numeric_time_only.as_ref(),
+            },
+        )?;
+        #[cfg(not(unix))]
+        {
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            Self::finish_event(&tx, &mut session, &id, &binding, source_id)?;
+            tx.ensure_no_new_refusal(self_failure_present)?;
+        }
+        // Leases remain in this frame until the transaction commit completes.
+        tx.commit().map_err(storage_error)
+    }
+    #[cfg(unix)]
+    fn finalize_normal_event(
+        tx: &CaptureTransaction<'_>,
+        session: &mut Session,
+        mut factory: Option<&mut NormalFactory<'_>>,
+        args: EventFinalization<'_>,
+    ) -> Result<(), AppError> {
+        if let Some(factory) = factory.as_deref_mut() {
+            if let Err(reason) = factory.validate_current(tx, args.binding)? {
+                if let Some(time_only) = args.time_only {
+                    *session = time_only.clone();
+                }
+                factory.fail(session, reason);
+            }
+        }
+        // Only this boundary's finalization is rollback-able. Previous frozen
+        // bodies and accepted request identities remain immutable.
+        let numeric_savepoint = factory
+            .as_ref()
+            .is_some_and(|factory| factory.policy.is_some());
+        if numeric_savepoint {
+            tx.execute_batch("SAVEPOINT numeric_finalization")
+                .map_err(storage_error)?;
+        }
+        if let Some(factory) = factory.as_deref() {
+            Self::save_numeric_reason(tx, args.binding, factory)?;
+        }
+        tx.ensure_no_new_refusal(args.was_refused)?;
+        Self::finish_event(tx, session, args.id, args.binding, args.source_id)?;
+        #[cfg(test)]
+        if numeric_savepoint {
+            crate::capture_usage_test_io::after_numeric_write(tx);
+        }
+        if let Some(factory) = factory {
+            if let Err(reason) = factory.validate_current(tx, args.binding)? {
+                if numeric_savepoint {
+                    tx.execute_batch("ROLLBACK TO numeric_finalization")
+                        .map_err(storage_error)?;
+                }
+                if let Some(time_only) = args.time_only {
+                    *session = time_only.clone();
+                }
+                factory.fail(session, reason);
+                Self::save_numeric_reason(tx, args.binding, factory)?;
+                Self::finish_event(tx, session, args.id, args.binding, args.source_id)?;
+            }
+        }
+        if numeric_savepoint {
+            tx.execute_batch("RELEASE numeric_finalization")
+                .map_err(storage_error)?;
+        }
+        tx.ensure_no_new_refusal(args.was_refused)?;
+        Ok(())
+    }
+    fn finish_event(
+        tx: &Transaction<'_>,
+        session: &mut Session,
+        id: &str,
+        binding: &Binding,
+        source_id: &str,
+    ) -> Result<(), AppError> {
         if session.usage_ledger.held {
             session.needs_attention = true;
         }
-        tx.ensure_no_new_refusal(self_failure_present)?;
-        Self::queue(&tx, &mut session)?;
+        Self::queue(tx, session)?;
         if session.usage_ledger.held {
             tx.execute("UPDATE outbox SET state='held',reason='USAGE_RECORD_CONFLICT',claimed_until=0 WHERE session_id=?1 AND state!='acknowledged'",[&session.id]).map_err(storage_error)?;
         }
         tx.execute("INSERT INTO sessions(id,binding_id,source_id,data) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
             params![id,binding.id,source_id,serde_json::to_string(&session).map_err(storage_error)?]).map_err(storage_error)?;
-        tx.ensure_no_new_refusal(self_failure_present)?;
-        tx.commit().map_err(storage_error)
+        Ok(())
     }
     fn queue(tx: &Transaction<'_>, session: &mut Session) -> Result<(), AppError> {
         if session.active.is_some() {
@@ -1340,6 +2138,9 @@ impl Store {
             return Err(AppError::Config(
                 "Storage refusal remains paused; explicitly recover before resuming".into(),
             ));
+        }
+        if action != "resume" {
+            Self::revoke_numeric_binding(&tx, &binding)?;
         }
         if action == "resume" && binding.revoked {
             return Err(AppError::Config(
@@ -1433,6 +2234,7 @@ impl Store {
             .map(|raw| serde_json::from_str(&raw).map_err(storage_error))
             .collect::<Result<_, _>>()?;
         for mut binding in bindings {
+            Self::revoke_numeric_binding(&tx, &binding)?;
             Self::abandon_revoked_turns(&tx, &binding.id, &[])?;
             binding.paused = true;
             binding.revoked = true;
@@ -1750,6 +2552,13 @@ impl Store {
         tx.commit().map_err(storage_error)
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "../tests/unit/capture_usage_factory.rs"]
+mod usage_factory_tests;
+#[cfg(all(test, unix))]
+#[path = "../tests/unit/capture_usage_qualification.rs"]
+mod usage_qualification_tests;
 
 fn validate_frozen(
     row: &Queued,

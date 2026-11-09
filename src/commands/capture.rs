@@ -1,6 +1,6 @@
 use crate::api::client::KeitorClient;
 use crate::capture::{self, Binding, Clock, Repository, Store, MAX_EVENT_BYTES};
-use crate::cli::capture::{CaptureCommand, CaptureSubcommand};
+use crate::cli::capture::{CaptureCommand, CaptureSubcommand, CaptureUsageSubcommand};
 use crate::cli::GlobalFlags;
 use crate::config::{AppConfig, ResolvedAuth};
 use crate::error::AppError;
@@ -181,6 +181,60 @@ pub async fn run(
         ));
     }
     match cmd.command {
+        CaptureSubcommand::Usage { command } => match command {
+            CaptureUsageSubcommand::Status { agent, .. } => {
+                let repository = current_repo()?;
+                let store = Store::open(&directory()?)?;
+                print(
+                    store.numeric_status(&repository, agent.namespace())?,
+                    global.quiet,
+                )
+            }
+            CaptureUsageSubcommand::Disable { agent, .. } => {
+                let repository = current_repo()?;
+                let mut store = Store::open(&directory()?)?;
+                print(
+                    store.disable_numeric(&repository, agent.namespace())?,
+                    global.quiet,
+                )
+            }
+            CaptureUsageSubcommand::Enable {
+                agent,
+                profile_home,
+                harness_executable,
+                native_executable,
+                ..
+            } => {
+                #[cfg(unix)]
+                {
+                    let runtime = crate::capture_runtime_pair::current()?;
+                    let repository = current_repo()?;
+                    let capture_directory = directory()?;
+                    let mut store = Store::open(&capture_directory)?;
+                    let binding = store.numeric_binding(&repository, agent.namespace())?;
+                    let prepared = crate::capture_usage_profile::approve(
+                        crate::capture_usage_profile::ProfileOptions {
+                            directory: &capture_directory,
+                            binding: &binding,
+                            namespace: agent.namespace(),
+                            home: &profile_home,
+                            launcher: &harness_executable,
+                            native: native_executable.as_deref(),
+                            runtime: &runtime,
+                        },
+                    )?;
+                    print(
+                        store.enable_numeric(&repository, agent.namespace(), &prepared)?,
+                        global.quiet,
+                    )
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (agent, profile_home, harness_executable, native_executable);
+                    Err(AppError::Config("Automatic capture is unsupported on this platform; manual time commands remain available".into()))
+                }
+            }
+        },
         CaptureSubcommand::Hook {
             agent,
             event,
@@ -189,17 +243,15 @@ pub async fn run(
             // A malformed/unknown hook must never block coding or echo raw input.
             let mut boundary_id = None;
             let invocation_nonce = std::env::var("KEITO_CAPTURE_INVOCATION_NONCE").ok();
-            if invocation_nonce.is_some() {
-                let runtime = crate::capture_runtime_pair::current()?;
-                if std::env::var("KEITO_CAPTURE_CORE_SHA256").ok().as_deref()
-                    != Some(runtime.core_sha256.as_str())
-                {
-                    return Err(AppError::Config(
-                        "Installed capture runtime changed; reinstall the official release pair"
-                            .into(),
-                    ));
-                }
-            }
+            #[cfg(unix)]
+            let hook_runtime = invocation_nonce
+                .as_ref()
+                .map(|_| {
+                    crate::capture_runtime_pair::HookRuntime::current(
+                        &std::env::var("KEITO_CAPTURE_CORE_SHA256").unwrap_or_default(),
+                    )
+                })
+                .transpose()?;
             let ack_fd = std::env::var("KEITO_CAPTURE_ACK_FD")
                 .ok()
                 .and_then(|fd| fd.parse::<i32>().ok())
@@ -249,19 +301,28 @@ pub async fn run(
                 if let Some(nonce) = &invocation_nonce {
                     store.hook_invocation(nonce)?;
                 }
-                store.event(
+                let signal = capture::Signal {
+                    source: agent.namespace(),
+                    resumed: event == crate::cli::capture::CaptureEvent::SessionStart
+                        && value.get("source").and_then(Value::as_str) == Some("resume"),
+                    source_id,
+                    turn_id,
+                    version: &harness_version,
+                    event,
+                    clock: &Clock::now()?,
+                };
+                #[cfg(unix)]
+                store.event_hook(
                     &repo,
-                    capture::Signal {
-                        source: agent.namespace(),
-                        resumed: event == crate::cli::capture::CaptureEvent::SessionStart
-                            && value.get("source").and_then(Value::as_str) == Some("resume"),
-                        source_id,
-                        turn_id,
-                        version: &harness_version,
-                        event,
-                        clock: &Clock::now()?,
-                    },
+                    signal,
+                    value
+                        .get("transcript_path")
+                        .and_then(Value::as_str)
+                        .map(Path::new),
+                    hook_runtime.as_ref(),
                 )?;
+                #[cfg(not(unix))]
+                store.event(&repo, signal)?;
                 accepted_store = Some(store);
                 Ok(())
             })();
