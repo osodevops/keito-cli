@@ -75,6 +75,7 @@ struct Progress {
     phase: Phase,
     first_fault: Option<&'static str>,
     deadline_ns: u64,
+    secondary_faults: Vec<&'static str>,
 }
 impl Progress {
     fn new(deadline_ns: u64) -> Self {
@@ -82,6 +83,7 @@ impl Progress {
             phase: Phase::AwaitReady,
             first_fault: None,
             deadline_ns,
+            secondary_faults: Vec::new(),
         }
     }
     fn advance(&mut self, from: Phase, to: Phase) -> io::Result<()> {
@@ -101,11 +103,30 @@ impl Progress {
         self.phase = to;
         Ok(())
     }
+    fn begin_cleanup(&mut self) -> io::Result<()> {
+        match self.phase {
+            Phase::AwaitReady | Phase::Ready | Phase::Joined | Phase::Parked => {
+                self.phase = Phase::Cleaning;
+                Ok(())
+            }
+            Phase::Cleaning | Phase::Gone => Ok(()),
+            _ => Err(refused("GROUP_STATE")),
+        }
+    }
     fn shorten(&mut self, deadline_ns: u64) {
         self.deadline_ns = self.deadline_ns.min(deadline_ns);
     }
     fn fail(&mut self, reason: &'static str) {
-        self.first_fault.get_or_insert(reason);
+        if let Some(first) = self.first_fault {
+            if reason != first
+                && !self.secondary_faults.contains(&reason)
+                && self.secondary_faults.len() < 8
+            {
+                self.secondary_faults.push(reason);
+            }
+        } else {
+            self.first_fault = Some(reason);
+        }
         self.phase = Phase::Failed;
     }
     #[cfg(test)]
@@ -157,7 +178,12 @@ impl Channel {
         }
         let bytes = format!("{}|{}\n", self.nonce, body);
         self.charge(bytes.len())?;
-        if self.stream.write(bytes.as_bytes())? != bytes.len() {
+        if self
+            .stream
+            .write(bytes.as_bytes())
+            .map_err(|_| refused("GROUP_WRITE"))?
+            != bytes.len()
+        {
             return Err(refused("GROUP_SHORT_WRITE"));
         }
         Ok(())
@@ -217,32 +243,240 @@ impl Channel {
     }
 }
 
+/// Cleanup is reserved INSIDE the admitted lifetime, never added after expiry.
+#[derive(Clone, Copy)]
+struct Lifetime {
+    operation_end: u64,
+    hard_end: u64,
+}
+impl Lifetime {
+    fn new(at: u64, hard_end: u64) -> io::Result<Self> {
+        let remaining = hard_end
+            .checked_sub(at)
+            .ok_or_else(|| refused("GROUP_LIFETIME"))?;
+        if remaining <= CLEANUP_NS || remaining > MAX_LIFETIME_NS {
+            return Err(refused("GROUP_LIFETIME"));
+        }
+        Ok(Self {
+            operation_end: hard_end - CLEANUP_NS,
+            hard_end,
+        })
+    }
+}
+
+/// Returned even on failure by report(); waits do not rehabilitate clean proof.
+#[derive(Clone, Debug)]
+pub struct GroupReport {
+    pub first_fault: Option<&'static str>,
+    pub secondary_faults: Vec<&'static str>,
+    pub workload_spawned: bool,
+    pub workload_status: Option<ExitStatus>,
+    pub keeper_status: Option<ExitStatus>,
+    pub group_absent: bool,
+    pub release_sent: bool,
+    pub terminal_eof: bool,
+}
 /// Actual direct wait facts, separate from the keeper's group-absence evidence.
+#[derive(Debug)]
 pub struct GroupProof {
     pub workload_status: Option<ExitStatus>,
     pub keeper_status: ExitStatus,
     pub group_absent: bool,
 }
 
-/// Parent must retain this object in its local registry BEFORE calling start or
-/// publishing receipts. Errors retain both handles here; no observer registry is
-/// yet wired to product commands. Drop is failure cleanup, never a clean proof.
+// The same wait/protocol driver is exercised by finite fake handles; no child
+// or group syscall is needed to test faulted/expired explicit finalization.
+trait DirectWait {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
+}
+impl DirectWait for Child {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+}
+struct Settlement {
+    progress: Progress,
+    workload_status: Option<ExitStatus>,
+    keeper_status: Option<ExitStatus>,
+    cleanup_sent: bool,
+    release_sent: bool,
+    group_absent: bool,
+    expected_ready: Option<String>,
+}
+impl Settlement {
+    fn new(hard_end: u64) -> Self {
+        Self {
+            progress: Progress::new(hard_end),
+            workload_status: None,
+            keeper_status: None,
+            cleanup_sent: false,
+            release_sent: false,
+            group_absent: false,
+            expected_ready: None,
+        }
+    }
+    fn begin(&mut self, deadline_ns: u64, at: u64, channel: &mut Channel) -> io::Result<()> {
+        if let Some(first) = self.progress.first_fault {
+            return Err(refused(first));
+        }
+        // RELEASE+write EOF seals the last shared bound. A later reduction
+        // is explicitly refused (never silently accepted only in parent).
+        if self.release_sent {
+            return if deadline_ns < self.progress.deadline_ns {
+                Err(refused("GROUP_BOUND_SEALED"))
+            } else {
+                Ok(())
+            };
+        }
+        let end = deadline_ns
+            .min(at.saturating_add(CLEANUP_NS))
+            .min(self.progress.deadline_ns);
+        if !self.cleanup_sent || end < self.progress.deadline_ns {
+            channel.send(&format!("CLEAN|{end}"))?;
+            self.progress.shorten(end);
+        }
+        self.cleanup_sent = true;
+        // Includes explicit pre-READY cancellation. The queued READY must
+        // still be parsed and matched before a GONE can be accepted.
+        self.progress.begin_cleanup()?;
+        Ok(())
+    }
+    fn collect(&mut self, keeper: &mut impl DirectWait, workload: Option<&mut impl DirectWait>) {
+        // Both known handles get an attempt, even after first failure/deadline.
+        if self.workload_status.is_none() {
+            if let Some(child) = workload {
+                match child.try_wait() {
+                    Ok(status) => self.workload_status = status,
+                    Err(_) => self.progress.fail("GROUP_WORKLOAD_WAIT"),
+                }
+            }
+        }
+        if self.keeper_status.is_none() {
+            match keeper.try_wait() {
+                Ok(status) => self.keeper_status = status,
+                Err(_) => self.progress.fail("GROUP_KEEPER_WAIT"),
+            }
+        }
+    }
+    fn poll(
+        &mut self,
+        at: u64,
+        pid: libc::pid_t,
+        channel: &mut Channel,
+        keeper: &mut impl DirectWait,
+        workload: Option<&mut impl DirectWait>,
+    ) -> io::Result<Option<GroupProof>> {
+        let has_workload = workload.is_some();
+        self.collect(keeper, workload);
+        if self.progress.phase == Phase::Released && self.progress.first_fault.is_none() {
+            return Ok(Some(GroupProof {
+                workload_status: self.workload_status,
+                keeper_status: self.keeper_status.unwrap(),
+                group_absent: true,
+            }));
+        }
+        if !self.cleanup_sent {
+            self.progress.fail("GROUP_CLEANUP_NOT_STARTED");
+        }
+        if at >= self.progress.deadline_ns {
+            self.progress.fail("GROUP_CLEANUP_DEADLINE");
+        }
+        if let Some(reason) = self.progress.first_fault {
+            return Err(refused(reason));
+        }
+        let outcome = (|| {
+            if let Some(body) = channel.receive()? {
+                if let Some(expected) = &self.expected_ready {
+                    if body != *expected {
+                        return Err(refused("GROUP_READY"));
+                    }
+                    self.expected_ready = None;
+                } else {
+                    if body != format!("GONE|{pid}") || self.progress.phase != Phase::Cleaning {
+                        return Err(refused("GROUP_TERMINAL"));
+                    }
+                    self.progress.advance(Phase::Cleaning, Phase::Gone)?;
+                    self.group_absent = true;
+                }
+            }
+            if channel.eof && !self.release_sent {
+                return Err(refused("GROUP_EARLY_EOF"));
+            }
+            if self.progress.phase == Phase::Gone
+                && (!has_workload || self.workload_status.is_some())
+                && !self.release_sent
+            {
+                channel.send("RELEASE")?;
+                channel
+                    .stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .map_err(|_| refused("GROUP_SHUTDOWN"))?;
+                self.release_sent = true;
+            }
+            if let Some(status) = self.keeper_status {
+                if !status.success() {
+                    return Err(refused("GROUP_KEEPER_FAILED"));
+                }
+                if channel.eof && channel.pending.is_empty() && self.release_sent {
+                    self.progress.advance(Phase::Gone, Phase::Released)?;
+                    return Ok(Some(GroupProof {
+                        workload_status: self.workload_status,
+                        keeper_status: status,
+                        group_absent: true,
+                    }));
+                }
+            }
+            Ok(None)
+        })();
+        if let Err(error) = &outcome {
+            self.progress.fail(safe_reason(error));
+        }
+        outcome
+    }
+}
+// Only literals generated here enter durable diagnostics; never raw OS errors.
+fn safe_reason(error: &io::Error) -> &'static str {
+    match error.to_string().as_str() {
+        "GROUP_NONCE" => "GROUP_NONCE",
+        "GROUP_FRAME" => "GROUP_FRAME",
+        "GROUP_FRAME_LIMIT" => "GROUP_FRAME_LIMIT",
+        "GROUP_WIRE_LIMIT" => "GROUP_WIRE_LIMIT",
+        "GROUP_TRUNCATED" => "GROUP_TRUNCATED",
+        "GROUP_READ" => "GROUP_READ",
+        "GROUP_WRITE" => "GROUP_WRITE",
+        "GROUP_SHORT_WRITE" => "GROUP_SHORT_WRITE",
+        "GROUP_TERMINAL" => "GROUP_TERMINAL",
+        "GROUP_SHUTDOWN" => "GROUP_SHUTDOWN",
+        "GROUP_EARLY_EOF" => "GROUP_EARLY_EOF",
+        "GROUP_KEEPER_FAILED" => "GROUP_KEEPER_FAILED",
+        "GROUP_EOF" => "GROUP_EOF",
+        "GROUP_DEADLINE" => "GROUP_DEADLINE",
+        "GROUP_CLOCK" => "GROUP_CLOCK",
+        "GROUP_STATE" => "GROUP_STATE",
+        "GROUP_ADMISSION" => "GROUP_ADMISSION",
+        "GROUP_READY" => "GROUP_READY",
+        "GROUP_PARK" => "GROUP_PARK",
+        "GROUP_SPAWN" => "GROUP_SPAWN",
+        "GROUP_START_STATE" => "GROUP_START_STATE",
+        "GROUP_BOUND_SEALED" => "GROUP_BOUND_SEALED",
+        _ => "GROUP_IO",
+    }
+}
+
+/// Register immediately after spawn_keeper, BEFORE await_ready/start/receipts.
+/// Failed objects retain both handles and expose actual wait facts via report.
 pub struct GroupLease {
     keeper: Child,
     workload: Option<Child>,
-    workload_status: Option<ExitStatus>,
-    keeper_status: Option<ExitStatus>,
+    settlement: Settlement,
     channel: Channel,
-    progress: Progress,
     owner: SharedOwner,
     keeper_pid: libc::pid_t,
     owner_pgid: libc::pid_t,
     sid: libc::pid_t,
-    cleanup_sent: bool,
-    release_sent: bool,
 }
 impl GroupLease {
-    pub fn prepare(
+    pub fn spawn_keeper(
         owner: SharedOwner,
         run_root: &Path,
         keeper_image: &Path,
@@ -253,7 +487,7 @@ impl GroupLease {
             .check_admission()
             .map_err(|_| refused("GROUP_ADMISSION"))?;
         let current = now()?;
-        if lifetime_deadline_ns <= current || lifetime_deadline_ns - current > MAX_LIFETIME_NS {
+        if Lifetime::new(current, lifetime_deadline_ns).is_err() {
             return Err(refused("GROUP_LIFETIME"));
         }
         for path in [run_root, keeper_image] {
@@ -317,40 +551,48 @@ impl GroupLease {
         let keeper = command.spawn()?;
         let keeper_pid = keeper.id() as libc::pid_t;
         // The real handle is owned before any fallible read or publication.
-        let mut lease = Self {
+        let mut settlement = Settlement::new(lifetime_deadline_ns);
+        settlement.expected_ready = Some(format!("READY|{keeper_pid}|{keeper_pid}|{sid}"));
+        let lease = Self {
             keeper,
             workload: None,
-            workload_status: None,
-            keeper_status: None,
+            settlement,
             channel,
-            progress: Progress::new(lifetime_deadline_ns),
             owner,
             keeper_pid,
             owner_pgid,
             sid,
-            cleanup_sent: false,
-            release_sent: false,
         };
         drop(inherited);
         drop(child_end);
-        let ready = lease
+        // Return BEFORE READY I/O. The caller registers even a failing
+        // preparation in its owned registry before calling await_ready.
+        Ok(lease)
+    }
+
+    fn fail(&mut self, reason: &'static str) {
+        self.settlement.progress.fail(reason);
+        let first = self.settlement.progress.first_fault.unwrap();
+        self.owner.borrow_mut().poison(ProtocolError(first));
+        if let Some(child) = &mut self.workload {
+            child.stdin.take();
+        }
+        // EOF requests failure-only keeper cleanup even when CLEAN cannot be
+        // sent. No parent group authority is acquired by this failure path.
+        if self
             .channel
-            .wait_frame(current.saturating_add(CLEANUP_NS).min(lifetime_deadline_ns));
-        match ready {
-            Ok(body) if body == format!("READY|{keeper_pid}|{keeper_pid}|{sid}") => {
-                lease.progress.advance(Phase::AwaitReady, Phase::Ready)?;
-                lease.check_admission()?;
-                Ok(lease)
-            }
-            _ => {
-                lease.fail("GROUP_READY");
-                Err(refused("GROUP_READY"))
-            }
+            .stream
+            .shutdown(std::net::Shutdown::Write)
+            .is_err()
+        {
+            self.settlement.progress.fail("GROUP_SHUTDOWN");
         }
     }
-    fn fail(&mut self, reason: &'static str) {
-        self.progress.fail(reason);
-        self.owner.borrow_mut().poison(ProtocolError(reason));
+    fn checked<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        if let Err(error) = &result {
+            self.fail(safe_reason(error));
+        }
+        result
     }
     fn check_admission(&mut self) -> io::Result<()> {
         if self.owner.borrow().check_admission().is_err() {
@@ -359,53 +601,88 @@ impl GroupLease {
         }
         Ok(())
     }
-    pub fn start(&mut self, command: &mut Command) -> io::Result<()> {
-        let result = self.start_inner(command);
-        if result.is_err() {
-            self.fail("GROUP_START_FAILED");
-        }
-        result
+    pub fn await_ready(&mut self) -> io::Result<()> {
+        let result = (|| {
+            self.check_admission()?;
+            if self.settlement.progress.phase != Phase::AwaitReady {
+                return Err(refused("GROUP_STATE"));
+            }
+            let deadline = now()?.saturating_add(CLEANUP_NS).min(
+                self.settlement
+                    .progress
+                    .deadline_ns
+                    .saturating_sub(CLEANUP_NS),
+            );
+            let body = self.channel.wait_frame(deadline)?;
+            if body != format!("READY|{}|{}|{}", self.keeper_pid, self.keeper_pid, self.sid) {
+                return Err(refused("GROUP_READY"));
+            }
+            self.settlement.expected_ready = None;
+            self.settlement
+                .progress
+                .advance(Phase::AwaitReady, Phase::Ready)?;
+            self.check_admission()
+        })();
+        self.checked(result)
     }
-    fn start_inner(&mut self, command: &mut Command) -> io::Result<()> {
-        self.check_admission()?;
-        if self.progress.phase != Phase::Ready || self.workload.is_some() {
-            self.fail("GROUP_START_STATE");
-            return Err(refused("GROUP_START_STATE"));
-        }
-        let pgid = self.keeper_pid;
-        let sid = self.sid;
-        // Only append libc operations. The original prepared command's fd/image
-        // checks, argv, cwd and environment remain unchanged. setsid commands
-        // are intentionally refused: this lease is for same-session tools.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::getsid(0) != sid || libc::setpgid(0, pgid) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = command.spawn()?;
-        self.workload = Some(child);
-        self.progress.advance(Phase::Ready, Phase::Joined)?;
-        self.check_admission()?;
-        self.channel.send("PARK")?;
-        let response = self.channel.wait_frame(
-            now()?
-                .saturating_add(CLEANUP_NS)
-                .min(self.progress.deadline_ns),
-        )?;
-        if response
-            != format!(
-                "PARKED|{}|{}|{}",
-                self.keeper_pid, self.owner_pgid, self.sid
-            )
-        {
-            self.fail("GROUP_PARK");
-            return Err(refused("GROUP_PARK"));
-        }
-        self.progress.advance(Phase::Joined, Phase::Parked)
+    /// Consume the ORIGINAL prepared Command. Its join callback can never escape
+    /// back to a caller for reuse after release. No argv/env/FD reconstruction.
+    pub fn start(&mut self, mut command: Command) -> io::Result<()> {
+        let result = (|| {
+            self.check_admission()?;
+            if self.settlement.progress.phase != Phase::Ready || self.workload.is_some() {
+                return Err(refused("GROUP_START_STATE"));
+            }
+            if now()?
+                >= self
+                    .settlement
+                    .progress
+                    .deadline_ns
+                    .saturating_sub(CLEANUP_NS)
+            {
+                return Err(refused("GROUP_DEADLINE"));
+            }
+            let pgid = self.keeper_pid;
+            let sid = self.sid;
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::getsid(0) != sid || libc::setpgid(0, pgid) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let child = command.spawn().map_err(|_| refused("GROUP_SPAWN"))?;
+            self.workload = Some(child);
+            self.settlement
+                .progress
+                .advance(Phase::Ready, Phase::Joined)?;
+            self.check_admission()?;
+            self.channel.send("PARK")?;
+            let response = self.channel.wait_frame(
+                now()?.saturating_add(CLEANUP_NS).min(
+                    self.settlement
+                        .progress
+                        .deadline_ns
+                        .saturating_sub(CLEANUP_NS),
+                ),
+            )?;
+            if response
+                != format!(
+                    "PARKED|{}|{}|{}",
+                    self.keeper_pid, self.owner_pgid, self.sid
+                )
+            {
+                return Err(refused("GROUP_PARK"));
+            }
+            self.settlement
+                .progress
+                .advance(Phase::Joined, Phase::Parked)
+        })();
+        self.checked(result)
     }
+    /// Transferred pipes MUST have a caller-scoped close/drain/EOF owner. Neither
+    /// GroupProof nor terminal keeper EOF proves those output streams drained.
     pub fn stdin(&mut self) -> Option<std::process::ChildStdin> {
         self.workload.as_mut()?.stdin.take()
     }
@@ -415,145 +692,111 @@ impl GroupLease {
     pub fn stderr(&mut self) -> Option<std::process::ChildStderr> {
         self.workload.as_mut()?.stderr.take()
     }
-    /// Broadcast cleanup before waiting; another owner's earlier absolute
-    /// deadline may only shorten this lease. No signals are sent by the parent.
     pub fn begin_cleanup(&mut self, deadline_ns: u64) -> io::Result<()> {
-        let result = self.begin_cleanup_inner(deadline_ns);
-        if result.is_err() {
-            self.fail("GROUP_CLEANUP_BEGIN_FAILED");
-        }
-        result
-    }
-    fn begin_cleanup_inner(&mut self, deadline_ns: u64) -> io::Result<()> {
         self.owner.borrow_mut().admission_closed = true;
-        self.progress
-            .shorten(deadline_ns.min(now()?.saturating_add(CLEANUP_NS)));
-        if self.cleanup_sent {
-            return Ok(());
-        }
-        self.cleanup_sent = true;
-        if self.progress.first_fault.is_none() {
-            self.progress.phase = Phase::Cleaning;
-        }
-        if let Some(child) = self.workload.as_mut() {
+        if let Some(child) = &mut self.workload {
             child.stdin.take();
         }
-        self.channel
-            .send(&format!("CLEAN|{}", self.progress.deadline_ns))
+        let result = now().and_then(|at| self.settlement.begin(deadline_ns, at, &mut self.channel));
+        self.checked(result)
     }
     pub fn poll_cleanup(&mut self) -> io::Result<Option<GroupProof>> {
-        let result = self.poll_inner();
+        // A sibling owner fault cannot be rehabilitated by this lease's trace.
+        let owner_fault = self.owner.borrow().first_fault;
+        if let Some(reason) = owner_fault {
+            self.fail(reason.0);
+        }
+        // Always collect available waits, including on clock failure/expiry.
+        let at = now();
+        let result = match at {
+            Ok(at) => self.settlement.poll(
+                at,
+                self.keeper_pid,
+                &mut self.channel,
+                &mut self.keeper,
+                self.workload.as_mut(),
+            ),
+            Err(error) => {
+                self.settlement
+                    .collect(&mut self.keeper, self.workload.as_mut());
+                Err(error)
+            }
+        };
+        // Preserve first specific literal; never replace it with a wrapper.
         if result.is_err() {
-            self.fail("GROUP_CLEANUP_UNPROVEN");
+            let reason = self
+                .settlement
+                .progress
+                .first_fault
+                .unwrap_or_else(|| safe_reason(result.as_ref().err().unwrap()));
+            self.fail(reason);
         }
         result
     }
-    fn poll_inner(&mut self) -> io::Result<Option<GroupProof>> {
-        if self.progress.first_fault.is_some() {
-            return Err(refused("GROUP_PREVIOUS_FAULT"));
+    pub fn report(&self) -> GroupReport {
+        GroupReport {
+            first_fault: self.settlement.progress.first_fault,
+            secondary_faults: self.settlement.progress.secondary_faults.clone(),
+            workload_spawned: self.workload.is_some(),
+            workload_status: self.settlement.workload_status,
+            keeper_status: self.settlement.keeper_status,
+            group_absent: self.settlement.group_absent,
+            release_sent: self.settlement.release_sent,
+            terminal_eof: self.channel.eof && self.channel.pending.is_empty(),
         }
-        if !self.cleanup_sent || now()? >= self.progress.deadline_ns {
-            return Err(refused("GROUP_CLEANUP_DEADLINE"));
-        }
-        if self.workload_status.is_none() {
-            if let Some(child) = self.workload.as_mut() {
-                self.workload_status = child.try_wait()?;
-            }
-        }
-        if let Some(body) = self.channel.receive()? {
-            if body != format!("GONE|{}", self.keeper_pid) || self.release_sent {
-                return Err(refused("GROUP_TERMINAL"));
-            }
-            // The keeper has irreversibly disabled every group operation before
-            // this frame. A later keeper wait cannot authorize another signal.
-            self.progress.phase = Phase::Gone;
-        }
-        if self.progress.phase == Phase::Gone
-            && (self.workload.is_none() || self.workload_status.is_some())
-            && !self.release_sent
-        {
-            self.channel.send("RELEASE")?;
-            self.channel.stream.shutdown(std::net::Shutdown::Write)?;
-            self.release_sent = true;
-        }
-        if self.release_sent && self.keeper_status.is_none() {
-            self.keeper_status = self.keeper.try_wait()?;
-        }
-        if let Some(status) = self.keeper_status {
-            if !status.success()
-                || !self.channel.eof
-                || !self.channel.pending.is_empty()
-                || self.progress.first_fault.is_some()
-            {
-                if !status.success() || self.progress.first_fault.is_some() {
-                    return Err(refused("GROUP_KEEPER_FAILED"));
-                }
-                return Ok(None);
-            }
-            self.progress.phase = Phase::Released;
-            return Ok(Some(GroupProof {
-                workload_status: self.workload_status,
-                keeper_status: status,
-                group_absent: true,
-            }));
-        }
-        Ok(None)
     }
 }
 impl Drop for GroupLease {
     fn drop(&mut self) {
-        if self.progress.phase == Phase::Released {
+        if self.settlement.progress.phase == Phase::Released {
             return;
         }
-        self.owner
-            .borrow_mut()
-            .poison(ProtocolError("GROUP_DROPPED_WITHOUT_PROOF"));
-        // Close the lifeline: the finite keeper must clean its own reserved
-        // group. Do not signal a cached group from this parent after any fault.
-        let _ = self.channel.stream.shutdown(std::net::Shutdown::Both);
+        self.fail("GROUP_DROPPED_WITHOUT_PROOF");
+        // Failure fallback only. One nonblocking collection runs even if the
+        // proof deadline passed. Explicit owner must retain report/unknowns.
+        self.settlement
+            .collect(&mut self.keeper, self.workload.as_mut());
         let deadline = now()
             .unwrap_or(0)
             .saturating_add(CLEANUP_NS)
-            .min(self.progress.deadline_ns);
+            .min(self.settlement.progress.deadline_ns);
         while now().unwrap_or(deadline) < deadline {
-            if self.workload_status.is_none() {
-                if let Some(child) = self.workload.as_mut() {
-                    self.workload_status = child.try_wait().ok().flatten();
-                }
-            }
-            if self.keeper_status.is_none() {
-                self.keeper_status = self.keeper.try_wait().ok().flatten();
-            }
-            if self.keeper_status.is_some()
-                && (self.workload.is_none() || self.workload_status.is_some())
+            self.settlement
+                .collect(&mut self.keeper, self.workload.as_mut());
+            if self.settlement.keeper_status.is_some()
+                && (self.workload.is_none() || self.settlement.workload_status.is_some())
             {
                 break;
             }
             pause();
         }
-        // A deadline/unknown kernel wait remains failed; never label dropped
-        // or unreaped handles clean. Full Scope registry integration is pending.
     }
 }
 
+trait GroupOps {
+    fn park(&mut self) -> io::Result<()>;
+    fn absent(&mut self) -> io::Result<bool>;
+    fn signal(&mut self, signal: libc::c_int) -> io::Result<()>;
+    fn abandon_self_group(&mut self) -> io::Result<()>;
+    fn disable(&mut self);
+}
 struct KeeperGroup {
     pid: libc::pid_t,
     park: libc::pid_t,
     parked: bool,
     no_more_group_ops: bool,
-    cleanup_started: bool,
 }
-impl KeeperGroup {
+impl GroupOps for KeeperGroup {
     fn park(&mut self) -> io::Result<()> {
         if !self.parked {
-            if unsafe { libc::setpgid(0, self.park) } != 0 {
+            if self.no_more_group_ops || unsafe { libc::setpgid(0, self.park) } != 0 {
                 return Err(refused("KEEPER_PARK"));
             }
             self.parked = true;
         }
         Ok(())
     }
-    fn absent(&self) -> io::Result<bool> {
+    fn absent(&mut self) -> io::Result<bool> {
         if !self.parked || self.no_more_group_ops {
             return Err(refused("KEEPER_GROUP_AUTHORITY"));
         }
@@ -565,7 +808,7 @@ impl KeeperGroup {
         }
         Err(refused("KEEPER_GROUP_QUERY"))
     }
-    fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+    fn signal(&mut self, signal: libc::c_int) -> io::Result<()> {
         if !self.parked || self.no_more_group_ops {
             return Err(refused("KEEPER_GROUP_AUTHORITY"));
         }
@@ -576,37 +819,140 @@ impl KeeperGroup {
         }
         Ok(())
     }
-    fn clean(&mut self, deadline: u64) -> io::Result<()> {
-        if self.no_more_group_ops || self.cleanup_started {
-            return Err(refused("KEEPER_CLEAN_TWICE"));
+    fn abandon_self_group(&mut self) -> io::Result<()> {
+        // Failure only: parent parking group vanished before PARK. Our live PID
+        // still reserves THIS group, of which we are still a member. SIGKILL
+        // includes this keeper, so no GONE/proof or subsequent operation exists.
+        if self.parked
+            || self.no_more_group_ops
+            || unsafe { libc::getpid() } != self.pid
+            || unsafe { libc::getpgrp() } != self.pid
+        {
+            return Err(refused("KEEPER_SELF_GROUP_AUTHORITY"));
         }
-        self.cleanup_started = true;
-        self.park()?;
-        if now()? >= deadline {
+        self.no_more_group_ops = true;
+        if unsafe { libc::kill(-self.pid, libc::SIGKILL) } != 0 {
+            return Err(refused("KEEPER_SELF_GROUP_SIGNAL"));
+        }
+        Err(refused("KEEPER_SELF_GROUP_UNPROVEN"))
+    }
+    fn disable(&mut self) {
+        self.no_more_group_ops = true;
+    }
+}
+
+// Incremental cleanup: control reductions/EOF are consumed between steps; TERM
+// grace is set once, never restarted. Every group syscall checks the same end.
+struct KeeperSession<G> {
+    group: G,
+    lifetime: Lifetime,
+    end: u64,
+    cleaning: bool,
+    parked: bool,
+    term_end: Option<u64>,
+    killed: bool,
+    gone: bool,
+    released: bool,
+    abandoned: bool,
+    first_fault: Option<&'static str>,
+}
+impl<G: GroupOps> KeeperSession<G> {
+    fn new(group: G, lifetime: Lifetime) -> Self {
+        Self {
+            group,
+            lifetime,
+            end: lifetime.hard_end,
+            cleaning: false,
+            parked: false,
+            term_end: None,
+            killed: false,
+            gone: false,
+            released: false,
+            abandoned: false,
+            first_fault: None,
+        }
+    }
+    fn fail(&mut self, reason: &'static str, at: u64) {
+        self.first_fault.get_or_insert(reason);
+        if !self.cleaning && !self.gone {
+            self.cleaning = true;
+            self.end = self.end.min(at.saturating_add(CLEANUP_NS));
+        }
+    }
+    fn control(&mut self, body: &str, at: u64) -> io::Result<()> {
+        if at >= self.end {
             return Err(refused("KEEPER_CLEANUP_DEADLINE"));
         }
-        let term_end = now()?.saturating_add(TERM_NS).min(deadline);
-        if !self.absent()? {
-            self.signal(libc::SIGTERM)?;
+        if self.released {
+            return Err(refused("KEEPER_TRAILING_RELEASE"));
         }
-        while now()? < term_end {
-            if self.absent()? {
-                self.no_more_group_ops = true;
-                return Ok(());
-            }
-            pause();
+        if let Some(end) = body.strip_prefix("CLEAN|") {
+            self.end = self
+                .end
+                .min(number(end)?)
+                .min(at.saturating_add(CLEANUP_NS));
+            self.cleaning = true;
+            Ok(())
+        } else if body == "RELEASE" && self.gone && self.first_fault.is_none() {
+            self.released = true;
+            Ok(())
+        } else {
+            Err(refused("KEEPER_STATE"))
         }
-        if !self.absent()? {
-            self.signal(libc::SIGKILL)?;
+    }
+    fn check_time(&self, clock: &mut impl FnMut() -> io::Result<u64>) -> io::Result<u64> {
+        let at = clock()?;
+        if at >= self.end {
+            return Err(refused("KEEPER_CLEANUP_DEADLINE"));
         }
-        while now()? < deadline {
-            if self.absent()? {
-                self.no_more_group_ops = true;
-                return Ok(());
-            }
-            pause();
+        Ok(at)
+    }
+    fn park(&mut self, clock: &mut impl FnMut() -> io::Result<u64>) -> io::Result<()> {
+        self.check_time(clock)?;
+        if let Err(error) = self.group.park() {
+            self.first_fault.get_or_insert("KEEPER_PARK");
+            // Check the bound again after the failed syscall. No extra grace.
+            self.check_time(clock)?;
+            self.abandoned = true;
+            self.group.abandon_self_group()?;
+            return Err(error);
         }
-        Err(refused("KEEPER_GROUP_NOT_ABSENT"))
+        self.parked = true;
+        Ok(())
+    }
+    fn step(&mut self, clock: &mut impl FnMut() -> io::Result<u64>) -> io::Result<bool> {
+        if self.abandoned {
+            return Err(refused("KEEPER_SELF_GROUP_UNPROVEN"));
+        }
+        let at = clock()?;
+        if !self.cleaning && at >= self.lifetime.operation_end {
+            self.fail("KEEPER_LIFETIME", at);
+        }
+        if at >= self.end {
+            return Err(refused("KEEPER_CLEANUP_DEADLINE"));
+        }
+        if !self.cleaning || self.gone {
+            return Ok(false);
+        }
+        if !self.parked {
+            self.park(clock)?;
+        }
+        self.check_time(clock)?;
+        if self.group.absent()? {
+            self.group.disable();
+            self.gone = true;
+            return Ok(true);
+        }
+        if self.term_end.is_none() {
+            let at = self.check_time(clock)?;
+            self.term_end = Some(at.saturating_add(TERM_NS));
+            self.group.signal(libc::SIGTERM)?;
+        } else if !self.killed && clock()? >= self.term_end.unwrap() {
+            self.check_time(clock)?;
+            self.killed = true;
+            self.group.signal(libc::SIGKILL)?;
+        }
+        Ok(false)
     }
 }
 
@@ -658,61 +1004,73 @@ pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io
     }
     let stream = unsafe { UnixStream::from_raw_fd(fd as i32) };
     let mut channel = Channel::new(stream, values[1].clone())?;
-    let mut group = KeeperGroup {
+    let lifetime = Lifetime::new(now()?, deadline)?;
+    let group = KeeperGroup {
         pid: unsafe { libc::getpid() },
         park: park as libc::pid_t,
         parked: false,
         no_more_group_ops: false,
-        cleanup_started: false,
     };
-    let result = (|| {
-        channel.send(&format!("READY|{}|{}|{}", group.pid, group.pid, sid))?;
-        let mut cleaned = false;
-        while now()? < deadline {
-            if let Some(body) = channel.receive()? {
-                if body == "PARK" && !group.parked && !cleaned {
-                    group.park()?;
-                    channel.send(&format!("PARKED|{}|{}|{}", group.pid, park, sid))?;
-                } else if let Some(end) = body.strip_prefix("CLEAN|") {
-                    if cleaned {
-                        return Err(refused("KEEPER_CLEAN_TWICE"));
+    let pid = group.pid;
+    let mut session = KeeperSession::new(group, lifetime);
+    let mut clock = now;
+    channel.send(&format!("READY|{pid}|{pid}|{sid}"))?;
+    loop {
+        let at = now()?;
+        if at >= session.end {
+            return Err(refused("KEEPER_CLEANUP_DEADLINE"));
+        }
+        // Drain bounded traffic BEFORE the next syscall step. When the parse
+        // cap is reached, yield without group ops; reductions cannot sit behind
+        // already-buffered control traffic while signalling proceeds.
+        let mut drained = false;
+        for _ in 0..8 {
+            match channel.receive() {
+                Ok(Some(body)) if session.first_fault.is_none() => {
+                    let result = if body == "PARK" && !session.parked && !session.cleaning {
+                        session
+                            .park(&mut clock)
+                            .and_then(|()| channel.send(&format!("PARKED|{pid}|{park}|{sid}")))
+                    } else {
+                        session.control(&body, now()?)
+                    };
+                    if result.is_err() {
+                        session.fail("KEEPER_CONTROL", now()?);
                     }
-                    let end = number(end)?
-                        .min(deadline)
-                        .min(now()?.saturating_add(CLEANUP_NS));
-                    group.clean(end)?;
-                    cleaned = true;
-                    channel.send(&format!("GONE|{}", group.pid))?;
-                } else if body == "RELEASE" && cleaned {
-                    // RELEASE is terminal only together with empty EOF. Do not
-                    // ignore a duplicate/trailing frame after a valid release.
-                    while now()? < deadline {
-                        if channel.receive()?.is_some() {
-                            return Err(refused("KEEPER_TRAILING_RELEASE"));
-                        }
-                        if channel.eof {
-                            return Ok(());
-                        }
-                        pause();
-                    }
-                    return Err(refused("KEEPER_RELEASE_EOF_DEADLINE"));
-                } else {
-                    return Err(refused("KEEPER_STATE"));
+                }
+                Ok(Some(_)) => (), // Failure is sticky; no later trace restores it.
+                Ok(None) => {
+                    drained = true;
+                    break;
+                }
+                Err(_) => {
+                    session.fail("KEEPER_CHANNEL", now()?);
+                    drained = true;
+                    break;
                 }
             }
-            if channel.eof {
-                return Err(refused("KEEPER_OWNER_EOF"));
-            }
-            pause();
         }
-        Err(refused("KEEPER_LIFETIME"))
-    })();
-    if result.is_err() && !group.no_more_group_ops && !group.cleanup_started {
-        // The keeper's own PID stays reserved throughout this attempt. A
-        // failed emergency cleanup yields no GONE/clean proof to its parent.
-        let _ = group.clean(now()?.saturating_add(CLEANUP_NS).min(deadline));
+        if channel.eof {
+            if session.released && session.first_fault.is_none() {
+                session.check_time(&mut clock)?;
+                return Ok(());
+            }
+            session.fail("KEEPER_OWNER_EOF", now()?);
+        }
+        if !drained {
+            pause();
+            continue;
+        }
+        match session.step(&mut clock) {
+            Ok(true) if session.first_fault.is_none() => channel.send(&format!("GONE|{pid}"))?,
+            Ok(_) => (),
+            Err(error) => return Err(error),
+        }
+        if session.gone && session.first_fault.is_some() {
+            return Err(refused(session.first_fault.unwrap()));
+        }
+        pause();
     }
-    result
 }
 
 #[cfg(test)]
@@ -820,5 +1178,449 @@ mod tests {
         right.shutdown(std::net::Shutdown::Write).unwrap();
         assert!(channel.receive().unwrap().is_none());
         assert!(channel.eof);
+    }
+
+    // R19 regression drivers execute the actual settlement/session methods with
+    // finite fake wait/syscall results and Unix socketpairs, never child actors.
+    use std::{collections::VecDeque, os::unix::process::ExitStatusExt};
+    #[derive(Default)]
+    struct FakeWait {
+        steps: VecDeque<io::Result<Option<ExitStatus>>>,
+        calls: usize,
+    }
+    impl DirectWait for FakeWait {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            self.calls += 1;
+            self.steps.pop_front().unwrap_or(Ok(None))
+        }
+    }
+    fn exited() -> io::Result<Option<ExitStatus>> {
+        Ok(Some(ExitStatus::from_raw(0)))
+    }
+    fn parent_fixture() -> (Settlement, Channel, UnixStream) {
+        let (left, right) = UnixStream::pair().unwrap();
+        right
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        right
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut state = Settlement::new(1000);
+        state.cleanup_sent = true;
+        state.progress.phase = Phase::Cleaning;
+        (state, Channel::new(left, "a".repeat(32)).unwrap(), right)
+    }
+    fn frame(peer: &mut UnixStream, body: &str) {
+        peer.write_all(format!("{}|{body}\n", "a".repeat(32)).as_bytes())
+            .unwrap();
+    }
+    #[test]
+    fn consumed_command_type_cannot_return_a_stale_join_callback() {
+        let _: fn(&mut GroupLease, Command) -> io::Result<()> = GroupLease::start;
+    }
+    #[test]
+    fn duplicate_gone_between_pending_and_completed_wait_is_sticky() {
+        let (mut state, mut channel, mut peer) = parent_fixture();
+        let mut keeper = FakeWait::default();
+        let mut workload = FakeWait {
+            steps: [Ok(None), exited()].into(),
+            calls: 0,
+        };
+        frame(&mut peer, "GONE|42");
+        assert!(state
+            .poll(1, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .unwrap()
+            .is_none());
+        assert_eq!(state.progress.phase, Phase::Gone);
+        assert!(!state.release_sent);
+        frame(&mut peer, "GONE|42");
+        assert_eq!(
+            state
+                .poll(2, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .unwrap_err()
+                .to_string(),
+            "GROUP_TERMINAL"
+        );
+        assert_eq!(state.progress.first_fault, Some("GROUP_TERMINAL"));
+        assert!(state.workload_status.is_some());
+        assert!(!state.release_sent);
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        keeper.steps.push_back(exited());
+        assert!(state
+            .poll(3, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .is_err());
+        assert!(state.keeper_status.is_some());
+        assert_eq!(state.progress.first_fault, Some("GROUP_TERMINAL"));
+    }
+    #[test]
+    fn bad_nonce_cannot_be_rehabilitated_by_gone_and_available_waits() {
+        let (mut state, mut channel, mut peer) = parent_fixture();
+        let mut keeper = FakeWait::default();
+        let mut workload = FakeWait::default();
+        peer.write_all(format!("{}|GONE|42\n", "b".repeat(32)).as_bytes())
+            .unwrap();
+        assert_eq!(
+            state
+                .poll(1, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .unwrap_err()
+                .to_string(),
+            "GROUP_NONCE"
+        );
+        frame(&mut peer, "GONE|42");
+        keeper.steps.push_back(exited());
+        workload.steps.push_back(exited());
+        assert_eq!(
+            state
+                .poll(2, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .unwrap_err()
+                .to_string(),
+            "GROUP_NONCE"
+        );
+        assert!(state.keeper_status.is_some() && state.workload_status.is_some());
+        assert!(!state.group_absent && !state.release_sent);
+    }
+    #[test]
+    fn park_failure_and_expiry_still_collect_both_direct_waits_and_first_reason() {
+        let (mut state, mut channel, _peer) = parent_fixture();
+        state.progress.fail("GROUP_PARK");
+        let mut keeper = FakeWait {
+            steps: [exited()].into(),
+            calls: 0,
+        };
+        let mut workload = FakeWait {
+            steps: [exited()].into(),
+            calls: 0,
+        };
+        assert_eq!(
+            state
+                .poll(1000, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .unwrap_err()
+                .to_string(),
+            "GROUP_PARK"
+        );
+        assert_eq!((keeper.calls, workload.calls), (1, 1));
+        assert!(state.keeper_status.is_some() && state.workload_status.is_some());
+        assert_eq!(state.progress.secondary_faults, ["GROUP_CLEANUP_DEADLINE"]);
+    }
+    #[test]
+    fn wait_error_does_not_skip_other_wait_or_erase_original_fault() {
+        let (mut state, mut channel, _peer) = parent_fixture();
+        state.progress.fail("GROUP_PARK");
+        let mut keeper = FakeWait {
+            steps: [exited()].into(),
+            calls: 0,
+        };
+        let mut workload = FakeWait {
+            steps: [Err(refused("private OS text")), exited()].into(),
+            calls: 0,
+        };
+        assert_eq!(
+            state
+                .poll(1, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .unwrap_err()
+                .to_string(),
+            "GROUP_PARK"
+        );
+        assert!(state.keeper_status.is_some() && state.workload_status.is_none());
+        assert_eq!(state.progress.secondary_faults, ["GROUP_WORKLOAD_WAIT"]);
+        assert!(state
+            .poll(2, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .is_err());
+        assert!(state.workload_status.is_some());
+    }
+    #[test]
+    fn expired_unfaulted_poll_collects_available_waits_but_never_proves_clean() {
+        let (mut state, mut channel, _peer) = parent_fixture();
+        let mut keeper = FakeWait {
+            steps: [exited()].into(),
+            calls: 0,
+        };
+        let mut workload = FakeWait {
+            steps: [exited()].into(),
+            calls: 0,
+        };
+        assert_eq!(
+            state
+                .poll(1000, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .unwrap_err()
+                .to_string(),
+            "GROUP_CLEANUP_DEADLINE"
+        );
+        assert!(state.keeper_status.is_some() && state.workload_status.is_some());
+        assert!(!state.group_absent);
+    }
+    #[test]
+    fn single_gone_waits_and_empty_eof_positive_control() {
+        let (mut state, mut channel, mut peer) = parent_fixture();
+        let mut keeper = FakeWait {
+            steps: [Ok(None), exited()].into(),
+            calls: 0,
+        };
+        let mut workload = FakeWait {
+            steps: [exited()].into(),
+            calls: 0,
+        };
+        frame(&mut peer, "GONE|42");
+        assert!(state
+            .poll(1, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .unwrap()
+            .is_none());
+        let mut bytes = [0; 128];
+        let n = peer.read(&mut bytes).unwrap();
+        assert_eq!(
+            &bytes[..n],
+            format!("{}|RELEASE\n", "a".repeat(32)).as_bytes()
+        );
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let proof = state
+            .poll(2, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .unwrap()
+            .unwrap();
+        assert!(proof.group_absent && proof.keeper_status.success());
+        assert_eq!(state.progress.phase, Phase::Released);
+    }
+    #[test]
+    fn gone_without_clean_and_early_eof_are_refused() {
+        for clean in [false, true] {
+            let (mut state, mut channel, mut peer) = parent_fixture();
+            state.cleanup_sent = clean;
+            if !clean {
+                frame(&mut peer, "GONE|42");
+            } else {
+                peer.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            assert!(state
+                .poll(
+                    1,
+                    42,
+                    &mut channel,
+                    &mut FakeWait::default(),
+                    None::<&mut FakeWait>
+                )
+                .is_err());
+            assert_eq!(
+                state.progress.first_fault,
+                Some(if clean {
+                    "GROUP_EARLY_EOF"
+                } else {
+                    "GROUP_CLEANUP_NOT_STARTED"
+                })
+            );
+        }
+    }
+    #[test]
+    fn missing_eof_and_partial_trailing_bytes_never_prove_clean() {
+        for partial in [false, true] {
+            let (mut state, mut channel, mut peer) = parent_fixture();
+            let mut keeper = FakeWait {
+                steps: [Ok(None), exited()].into(),
+                calls: 0,
+            };
+            frame(&mut peer, "GONE|42");
+            assert!(state
+                .poll(1, 42, &mut channel, &mut keeper, None::<&mut FakeWait>)
+                .unwrap()
+                .is_none());
+            if partial {
+                peer.write_all(b"partial").unwrap();
+                peer.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            let result = state.poll(2, 42, &mut channel, &mut keeper, None::<&mut FakeWait>);
+            if partial {
+                assert_eq!(result.unwrap_err().to_string(), "GROUP_TRUNCATED");
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+        }
+    }
+    #[derive(Default)]
+    struct FakeGroup {
+        events: Vec<&'static str>,
+        absent: bool,
+        fail_park: bool,
+        disabled: bool,
+    }
+    impl GroupOps for FakeGroup {
+        fn park(&mut self) -> io::Result<()> {
+            self.events.push("park");
+            if self.fail_park {
+                Err(refused("KEEPER_PARK"))
+            } else {
+                Ok(())
+            }
+        }
+        fn absent(&mut self) -> io::Result<bool> {
+            assert!(!self.disabled);
+            self.events.push("query");
+            Ok(self.absent)
+        }
+        fn signal(&mut self, sig: i32) -> io::Result<()> {
+            assert!(!self.disabled);
+            self.events
+                .push(if sig == libc::SIGTERM { "term" } else { "kill" });
+            Ok(())
+        }
+        fn abandon_self_group(&mut self) -> io::Result<()> {
+            assert!(!self.disabled);
+            self.events.push("self-kill");
+            self.disabled = true;
+            Err(refused("KEEPER_SELF_GROUP_UNPROVEN"))
+        }
+        fn disable(&mut self) {
+            self.events.push("disable");
+            self.disabled = true;
+        }
+    }
+    fn helper_fixture() -> KeeperSession<FakeGroup> {
+        KeeperSession::new(
+            FakeGroup::default(),
+            Lifetime::new(0, 10 * CLEANUP_NS).unwrap(),
+        )
+    }
+    #[test]
+    fn lifetime_reserves_cleanup_and_equality_never_signals_after_hard_end() {
+        assert!(Lifetime::new(0, CLEANUP_NS).is_err());
+        let mut state = helper_fixture();
+        let trigger = state.lifetime.operation_end;
+        assert!(!state.step(&mut || Ok(trigger - 1)).unwrap());
+        assert!(state.group.events.is_empty());
+        assert!(!state.step(&mut || Ok(trigger)).unwrap());
+        assert_eq!(state.group.events, ["park", "query", "term"]);
+        assert_eq!(state.first_fault, Some("KEEPER_LIFETIME"));
+        let saved = state.group.events.clone();
+        assert!(state.step(&mut || Ok(10 * CLEANUP_NS)).is_err());
+        assert_eq!(state.group.events, saved);
+    }
+    #[test]
+    fn pre_park_parent_loss_uses_failure_only_self_group_fallback_once() {
+        let mut state = helper_fixture();
+        state.group.fail_park = true;
+        state.fail("KEEPER_OWNER_EOF", 1);
+        assert!(state.step(&mut || Ok(1)).is_err());
+        assert_eq!(state.group.events, ["park", "self-kill"]);
+        assert!(!state.gone);
+        assert!(state.step(&mut || Ok(2)).is_err());
+        assert_eq!(state.group.events, ["park", "self-kill"]);
+        assert_eq!(state.first_fault, Some("KEEPER_OWNER_EOF"));
+    }
+    #[test]
+    fn decreasing_bounds_during_term_do_not_restart_grace_or_extend_end() {
+        let mut state = helper_fixture();
+        state.control("CLEAN|100000000", 1).unwrap();
+        assert!(!state.step(&mut || Ok(2)).unwrap());
+        let grace = state.term_end.unwrap();
+        state.control("CLEAN|200000000", 3).unwrap();
+        assert_eq!(state.end, 100000000);
+        state.control("CLEAN|100000000", 4).unwrap();
+        state.control("CLEAN|1000", 5).unwrap();
+        assert_eq!(state.end, 1000);
+        assert_eq!(state.term_end, Some(grace));
+        let saved = state.group.events.clone();
+        assert!(state.step(&mut || Ok(1000)).is_err());
+        assert_eq!(state.group.events, saved);
+    }
+    #[test]
+    fn shortening_after_gone_bounds_release_and_never_touches_group() {
+        let mut state = helper_fixture();
+        state.group.absent = true;
+        state.control("CLEAN|1000", 1).unwrap();
+        assert!(state.step(&mut || Ok(2)).unwrap());
+        let saved = state.group.events.clone();
+        state.control("CLEAN|100", 3).unwrap();
+        assert!(!state.step(&mut || Ok(4)).unwrap());
+        assert_eq!(state.group.events, saved);
+        assert!(state.control("RELEASE", 100).is_err());
+        assert!(!state.released);
+    }
+    #[test]
+    fn syscall_time_crossing_end_stops_before_next_group_operation() {
+        let mut state = helper_fixture();
+        state.control("CLEAN|100", 1).unwrap();
+        let mut times = VecDeque::from([Ok(2), Ok(2), Ok(100)]);
+        assert!(state.step(&mut || times.pop_front().unwrap()).is_err());
+        assert_eq!(state.group.events, ["park"]);
+    }
+    #[test]
+    fn pre_ready_cancellation_requires_the_actual_ready_before_gone() {
+        for invalid in [false, true] {
+            let (mut state, mut channel, mut peer) = parent_fixture();
+            state.progress.phase = Phase::AwaitReady;
+            state.expected_ready = Some("READY|42|42|7".to_owned());
+            state.progress.begin_cleanup().unwrap();
+            let mut keeper = FakeWait::default();
+            if invalid {
+                frame(&mut peer, "GONE|42");
+                assert_eq!(
+                    state
+                        .poll(1, 42, &mut channel, &mut keeper, None::<&mut FakeWait>)
+                        .unwrap_err()
+                        .to_string(),
+                    "GROUP_READY"
+                );
+                assert!(!state.group_absent);
+            } else {
+                frame(&mut peer, "READY|42|42|7");
+                frame(&mut peer, "GONE|42");
+                assert!(state
+                    .poll(1, 42, &mut channel, &mut keeper, None::<&mut FakeWait>)
+                    .unwrap()
+                    .is_none());
+                assert!(state.expected_ready.is_none());
+                assert!(!state.group_absent);
+                assert!(state
+                    .poll(2, 42, &mut channel, &mut keeper, None::<&mut FakeWait>)
+                    .unwrap()
+                    .is_none());
+                assert!(state.group_absent && state.release_sent);
+            }
+        }
+    }
+    #[test]
+    fn parent_driver_sends_each_decrease_and_explicitly_refuses_after_seal() {
+        let (mut state, mut channel, mut peer) = parent_fixture();
+        state.cleanup_sent = false;
+        state.progress.phase = Phase::Parked;
+        state.begin(900, 1, &mut channel).unwrap();
+        state.begin(800, 2, &mut channel).unwrap();
+        state.begin(950, 3, &mut channel).unwrap();
+        assert_eq!(state.progress.deadline_ns, 800);
+        let mut bytes = [0; 256];
+        let n = peer.read(&mut bytes).unwrap();
+        assert_eq!(
+            &bytes[..n],
+            format!("{0}|CLEAN|900\n{0}|CLEAN|800\n", "a".repeat(32)).as_bytes()
+        );
+        state.release_sent = true;
+        assert_eq!(
+            state.begin(700, 4, &mut channel).unwrap_err().to_string(),
+            "GROUP_BOUND_SEALED"
+        );
+        assert_eq!(state.progress.deadline_ns, 800);
+        state.begin(800, 5, &mut channel).unwrap();
+    }
+    #[test]
+    fn peer_death_collects_direct_keeper_wait_and_cannot_look_clean() {
+        let (mut state, mut channel, peer) = parent_fixture();
+        drop(peer);
+        let mut keeper = FakeWait {
+            steps: [exited()].into(),
+            calls: 0,
+        };
+        let mut workload = FakeWait::default();
+        assert_eq!(
+            state
+                .poll(1, 42, &mut channel, &mut keeper, Some(&mut workload))
+                .unwrap_err()
+                .to_string(),
+            "GROUP_EARLY_EOF"
+        );
+        assert!(state.keeper_status.is_some());
+        assert!(state.workload_status.is_none());
+        workload.steps.push_back(exited());
+        assert!(state
+            .poll(1000, 42, &mut channel, &mut keeper, Some(&mut workload))
+            .is_err());
+        assert!(state.workload_status.is_some());
+        assert_eq!(state.progress.first_fault, Some("GROUP_EARLY_EOF"));
     }
 }
