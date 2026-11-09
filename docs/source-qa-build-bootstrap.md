@@ -63,3 +63,11 @@ retry or receipt overwrite can turn failure into success. FIRST's
 pre-fallback fact snapshot is retained separately from late waits and is included
 in fact fallbacks even when FIRST cannot be published. Secondary-error lists are
 copied into snapshots so later cleanup cannot mutate cutpoint evidence.
+
+Every guarded terminal stage normalizes a caught KeyboardInterrupt to the fixed
+cancellation latch and CANCELLED before rebuilding fallback facts, while keeping
+any earlier first reason and the stage failure. If both fact sinks fail, no
+complete final report is claimed. Admission checkpoints after handler installation
+and inside the first masked fork section prevent an already-accepted cancellation
+from creating a keeper; a handle returned before cancellation remains owned and
+must still be waited. Masking alone is not an admission check.

@@ -654,15 +654,17 @@ class Tests(unittest.TestCase):
             if cancellation == "setup":
                 handlers[m.signal.SIGINT](None, None)
             return (1024, 1024)
-        first_block = True
+        first_block, delivered_after_fork = True, False
         def mask(how, _):
-            nonlocal first_block
+            nonlocal first_block, delivered_after_fork
             calls.append("block" if how == m.signal.SIG_BLOCK else "unblock")
             if how == m.signal.SIG_BLOCK and first_block:
                 first_block = False
                 if cancellation == "before_fork":
                     handlers[m.signal.SIGINT](None, None)
-            elif how == m.signal.SIG_SETMASK and cancellation == "after_fork" and state_ref[0].keeper:
+            elif (how == m.signal.SIG_SETMASK and cancellation == "after_fork"
+                  and state_ref[0].keeper and not delivered_after_fork):
+                delivered_after_fork = True
                 handlers[m.signal.SIGINT](None, None)
             return set()
         def fork():
@@ -717,6 +719,7 @@ class Tests(unittest.TestCase):
             self.assertLess(calls.index("fork"), calls.index("unblock"))
             self.assertEqual(state.first, "CANCELLED" if cancellation else "CONTROL_AFTER_KEEPER")
         self.assertEqual(calls.count("block"), calls.count("unblock"))
+        self.assertNotIn("HANDOFF_UNMASK", state.secondary, "late-cancel control delivers only once")
 
     def test_r26_setup_cancellation_prevents_first_keeper_admission(self):
         self.keeper_admission_case("setup")

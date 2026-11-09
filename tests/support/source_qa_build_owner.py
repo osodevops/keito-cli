@@ -521,7 +521,13 @@ class BuildRun:
     def guard(self, reason, action):
         try:
             return True, action()
-        except BaseException:
+        except BaseException as error:
+            if isinstance(error, KeyboardInterrupt):
+                # Restored default INT handlers can throw in ANY guarded tail
+                # stage, including stdout/stderr. Normalize before rebuilding
+                # a fallback packet; the stage code is additional evidence.
+                self.cancel_signal(None, None)
+                self.note_cancelled()
             self.fail(reason)
             return False, None
 
@@ -598,6 +604,7 @@ class BuildRun:
                         # during unmask. Preserve cancellation as well as the
                         # uncertain mask disposition; never retry this handoff.
                         self.cancel_signal(None, None)
+                        self.fail("HANDOFF_UNMASK")
                         raise
                 unmasked, _ = self.guard("HANDOFF_UNMASK", restore_mask)
         # If masking failed, leave this standalone helper's latch installed
@@ -661,6 +668,7 @@ def run(spec):
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             saved_handlers[signum] = signal.signal(signum, state.cancel_signal)
+        state.checkpoint()
         parent, child = socket.socketpair()
         nonce = os.urandom(16).hex()
         state.channel = Channel(parent, nonce)  # Before fork: no lost child on setup error.
@@ -672,6 +680,9 @@ def run(spec):
         # Uncatchable parent death cannot supply direct waits and is not proof.
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM))
         try:
+            # Masking prevents a NEW callback during assignment; it does not
+            # revoke a cancellation already accepted during setup.
+            state.checkpoint()
             pid = os.fork()
             if pid == 0:
                 child_keeper(child, parent, nonce, park, hard, maxfd, mask)
