@@ -31,6 +31,14 @@ first fault, restarting grace or reopening normal control/proof. The actual
 keeper_main turn function is shared with fake-transport regressions, so tests
 exercise these dispatch decisions rather than separate model methods.
 
+PARK parsing records only one pending intent. The membership change, its
+failure-only self-group fallback and PARKED response occur only after the same
+bounded drain has applied readable minimum bounds. Read/frame-budget yields and
+partial controls retain intent without group work; a fatal transport stop clears
+it without executing it. Duplicate pending PARK is a control failure. A timely
+ordinary PARK retains its original response, and a failed PARKED write still
+enters bounded failure cleanup after the membership change.
+
 A rejected complete line has a known consumed boundary. It poisons proof but
 continues the bounded failure-only drain, so a valid shorter CLEAN behind it is
 applied before group work. WouldBlock with a partial frame yields instead of
