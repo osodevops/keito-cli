@@ -545,6 +545,191 @@ class Tests(unittest.TestCase):
     def test_r25_failed_unmask_and_final_stdout_use_failure_only_stderr_packet(self):
         self.handoff_case(unmask_error=OSError("synthetic unmask"), final_stdout_failure=True)
 
+    def terminal_interrupt_case(self, original=None, stderr_interrupt=False):
+        import io
+        import json
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        calls, packets, receipts = [], [], []
+        handoff_done = False
+        class Receipt(io.StringIO):
+            def fileno(self):
+                return 99
+        def receipt(path):
+            item = Receipt()
+            receipts.append(item)
+            return item
+        def mask(how, _):
+            nonlocal handoff_done
+            if how == m.signal.SIG_SETMASK:
+                handoff_done = True
+            return set()
+        def publish(value, **kwargs):
+            sink = "stderr" if kwargs.get("file") is not None else "stdout"
+            calls.append(sink)
+            if handoff_done:
+                if sink == "stdout":
+                    raise OSError("synthetic output") if stderr_interrupt else KeyboardInterrupt()
+                if stderr_interrupt:
+                    raise KeyboardInterrupt()
+            packets.append(json.loads(value))
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(m, "exclusive", side_effect=receipt))
+            stack.enter_context(patch.object(m.os, "fsync"))
+            stack.enter_context(patch.object(m.os, "waitpid", side_effect=AssertionError("already waited")))
+            stack.enter_context(patch.object(m.signal, "pthread_sigmask", side_effect=mask))
+            stack.enter_context(patch.object(m.signal, "sigpending", return_value=set()))
+            stack.enter_context(patch.object(m.signal, "signal", side_effect=lambda *_: calls.append("handler")))
+            stack.enter_context(patch("builtins.print", side_effect=publish))
+            state = m.BuildRun(Path("/inert-terminal-no-files"), 1000)
+            state.first = original
+            state.keeper, state.keeper_status, state.child_status = 42, 0, 0
+            state.child = type("Child", (), {"pid": 43})()
+            state.child_attempted = True
+            state.gone = state.release = state.proof = True
+            state.end = 500
+            cutpoint = state.facts()
+            state.finalize(None, None, True, {m.signal.SIGINT: None, m.signal.SIGTERM: None}, cutpoint)
+        self.assertTrue(state.cancelled, "a caught default INT must retain cancellation provenance")
+        if original:
+            self.assertEqual(state.first, original)
+            self.assertIn("CANCELLED", state.secondary)
+        elif stderr_interrupt:
+            self.assertEqual(state.first, "FACT_STDOUT")
+            self.assertIn("CANCELLED", state.secondary)
+        else:
+            self.assertEqual(state.first, "CANCELLED")
+        self.assertIn("FACT_STDERR" if stderr_interrupt else "FACT_STDOUT", state.secondary)
+        self.assertEqual((state.child_status, state.keeper_status), (0, 0))
+        self.assertEqual(calls.count("handler"), 2)
+        self.assertTrue(all(item.closed for item in receipts))
+        self.assertEqual(cutpoint["first_fault"], original)
+        self.assertFalse(cutpoint["cancelled"])
+        if not stderr_interrupt:
+            last = packets[-1]
+            self.assertTrue(last["owner_result"]["cancelled"])
+            self.assertEqual(last["owner_result"]["first_fault"], original or "CANCELLED")
+            self.assertTrue(last["handoff_complete"])
+            self.assertFalse(last["mask_restoration_pending"])
+            self.assertEqual(last["cutpoint"], cutpoint)
+        else:
+            # Both final sinks failed. The earlier pending snapshot is not a
+            # completed report; failure is retained in state, never upgraded.
+            self.assertFalse(packets[-1]["handoff_complete"])
+
+    def test_r26_final_stdout_interrupt_retains_cancelled_first_and_fallback(self):
+        self.terminal_interrupt_case()
+
+    def test_r26_final_stdout_interrupt_preserves_original_and_cancelled_secondary(self):
+        self.terminal_interrupt_case(original="ORIGINAL_OPERATION")
+
+    def test_r26_stdout_error_then_stderr_interrupt_keeps_both_failures(self):
+        self.terminal_interrupt_case(stderr_interrupt=True)
+
+    def keeper_admission_case(self, cancellation):
+        import io
+        import json
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        state_ref, handlers, packets, calls, files = [], {}, [], [], []
+        class Receipt(io.StringIO):
+            def fileno(self):
+                return 99
+        class Endpoint(Stream):
+            def __init__(self):
+                super().__init__()
+                self.closed = 0
+            def close(self):
+                self.closed += 1
+        parent, child_end = Endpoint(), Endpoint()
+        def receipt(_):
+            item = Receipt();files.append(item);return item
+        actual_build_run = m.BuildRun
+        def build_run(*args):
+            state = actual_build_run(*args);state_ref.append(state);return state
+        def install(signum, handler):
+            handlers[signum] = handler
+            return None
+        def limits(_):
+            if cancellation == "setup":
+                handlers[m.signal.SIGINT](None, None)
+            return (1024, 1024)
+        first_block = True
+        def mask(how, _):
+            nonlocal first_block
+            calls.append("block" if how == m.signal.SIG_BLOCK else "unblock")
+            if how == m.signal.SIG_BLOCK and first_block:
+                first_block = False
+                if cancellation == "before_fork":
+                    handlers[m.signal.SIGINT](None, None)
+            elif how == m.signal.SIG_SETMASK and cancellation == "after_fork" and state_ref[0].keeper:
+                handlers[m.signal.SIGINT](None, None)
+            return set()
+        def fork():
+            calls.append("fork")
+            return 42
+        def event(state, _):
+            state.checkpoint()
+            # The uncancelled admission control deliberately stops here so
+            # this test cannot reach a fake or real workload spawn.
+            raise m.Refused("CONTROL_AFTER_KEEPER")
+        def begin(state):
+            state.end = 500
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(m.os.environ, {"KEITO_BOOTSTRAP_POLICY_CONFIRMED": "source-group-build-only"}, clear=True))
+            stack.enter_context(patch.object(m, "BuildRun", side_effect=build_run))
+            stack.enter_context(patch.object(m, "exclusive", side_effect=receipt))
+            stack.enter_context(patch.object(m.os, "fsync"))
+            stack.enter_context(patch.object(m.socket, "socketpair", return_value=(parent, child_end)))
+            stack.enter_context(patch.object(m.os, "urandom", return_value=b"a" * 16))
+            stack.enter_context(patch.object(m.resource, "getrlimit", side_effect=limits))
+            stack.enter_context(patch.object(m.os, "getpgrp", return_value=99))
+            fork_mock = stack.enter_context(patch.object(m.os, "fork", side_effect=fork))
+            popen = stack.enter_context(patch.object(m.subprocess, "Popen", side_effect=AssertionError("no workload")))
+            waited = stack.enter_context(patch.object(m.os, "waitpid", return_value=(42, 0)))
+            stack.enter_context(patch.object(m.time, "monotonic_ns", return_value=1))
+            stack.enter_context(patch.object(m.time, "sleep", side_effect=AssertionError("no wait loop")))
+            stack.enter_context(patch.object(m.signal, "signal", side_effect=install))
+            stack.enter_context(patch.object(m.signal, "pthread_sigmask", side_effect=mask))
+            stack.enter_context(patch.object(m.signal, "sigpending", return_value=set()))
+            stack.enter_context(patch.object(actual_build_run, "event", event))
+            stack.enter_context(patch.object(actual_build_run, "begin", begin))
+            stack.enter_context(patch.object(actual_build_run, "settle", lambda state: None))
+            stack.enter_context(patch("builtins.print", side_effect=lambda value, **_: packets.append(json.loads(value))))
+            self.assertFalse(m.run({"root": "/inert-admission-no-files", "seconds": 3}))
+        state = state_ref[0]
+        self.assertFalse(state.child_attempted)
+        popen.assert_not_called()
+        self.assertEqual((parent.closed, child_end.closed), (1, 1))
+        self.assertTrue(all(item.closed for item in files))
+        self.assertEqual(packets[-1]["owner_result"]["cancelled"], cancellation is not None)
+        if cancellation in ("setup", "before_fork"):
+            fork_mock.assert_not_called()
+            waited.assert_not_called()
+            self.assertEqual(state.first, "CANCELLED")
+            self.assertIsNone(state.keeper)
+            self.assertIsNone(state.keeper_status)
+            self.assertFalse(packets[-1]["owner_result"]["keeper_spawned"])
+        else:
+            fork_mock.assert_called_once()
+            waited.assert_called_once_with(42, m.os.WNOHANG)
+            self.assertEqual((state.keeper, state.keeper_status), (42, 0))
+            self.assertLess(calls.index("fork"), calls.index("unblock"))
+            self.assertEqual(state.first, "CANCELLED" if cancellation else "CONTROL_AFTER_KEEPER")
+        self.assertEqual(calls.count("block"), calls.count("unblock"))
+
+    def test_r26_setup_cancellation_prevents_first_keeper_admission(self):
+        self.keeper_admission_case("setup")
+
+    def test_r26_cancel_latched_at_mask_boundary_prevents_first_keeper_admission(self):
+        self.keeper_admission_case("before_fork")
+
+    def test_r26_no_cancel_control_keeps_admitted_handle_until_wait(self):
+        self.keeper_admission_case(None)
+
+    def test_r26_unblock_cancellation_keeps_already_admitted_handle_until_wait(self):
+        self.keeper_admission_case("after_fork")
+
     def test_r24_cancellation_checkpoint_refuses_admission_without_throwing_in_handler(self):
         from unittest.mock import patch
         state = object.__new__(m.BuildRun)
