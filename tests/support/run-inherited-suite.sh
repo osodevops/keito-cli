@@ -11,6 +11,7 @@ export KEITO_TEST_SERVICE_BOUNDARY_RECEIPT="$root/service-boundary-receipt.json"
 if [ "$#" -eq 0 ]; then
   # Finite socket-only tests; isolated startup, no external package imports.
   python3 -I -S -B tests/support/test_source_qa_protocol.py
+  python3 -I -S -B tests/support/test_source_qa_protocol_review_regressions.py
   # Developer-only owned pair QA inherits this same proved policy; never nest it.
   PYTHONDONTWRITEBYTECODE=1 python3 tests/support/test_source_qa_contract.py "$root"
   PYTHONDONTWRITEBYTECODE=1 python3 tests/support/run_guarded_usage_qa.py \

@@ -45,6 +45,11 @@ class Budget:
     def __init__(self):
         self.wire = self.frames = self.registrations = 0
         self.first_fault = None
+        self.owner_fault = None
+
+    def poison_owner(self, reason):
+        if self.owner_fault is None:
+            self.owner_fault = reason
 
     def charge(self, kind, amount, limit):
         if self.first_fault:
@@ -53,6 +58,41 @@ class Budget:
             self.first_fault = "LIMIT_" + kind.upper()
             raise ProtocolError(self.first_fault)
         setattr(self, kind, getattr(self, kind) + amount)
+
+
+class MetadataLedger:
+    """The same bounded grammar/ledger at an endpoint and at an outer root."""
+    def __init__(self, root_pid, budget):
+        self.root_pid, self.budget = root_pid, budget
+        self.records = {}
+
+    def observe(self, value):
+        if (not isinstance(value, str) or len(value) + 34 > MAX_FRAME
+                or not value.isascii() or "\n" in value or "\r" in value):
+            raise ProtocolError("METADATA_SCHEMA")
+        fields = value.split("|")
+        if len(fields) != 5 or fields[0] not in ("REGISTER", "WAITED") or not nonce_valid(fields[3]):
+            raise ProtocolError("METADATA_SCHEMA")
+        owner = integer(fields[1], 1, 2147483647)
+        child = integer(fields[2], 1, 2147483647)
+        identity = (owner, child, fields[3])
+        if fields[0] == "REGISTER":
+            integer(fields[4], 0, 18446744073709551615)
+            if owner != self.root_pid and not any(key[1] == owner and not waited for key, waited in self.records.items()):
+                raise ProtocolError("OWNER_EDGE")
+            if (owner == child or child == self.root_pid or identity in self.records
+                    or any(key[1] == child and not waited for key, waited in self.records.items())):
+                raise ProtocolError("DUPLICATE_REGISTRATION")
+            self.budget.charge("registrations", 1, MAX_REGISTRATIONS)
+            self.records[identity] = False
+        else:
+            integer(fields[4], -2147483648, 2147483647)
+            if identity not in self.records or self.records[identity]:
+                raise ProtocolError("UNMATCHED_WAIT")
+            self.records[identity] = True
+
+    def complete(self):
+        return all(self.records.values())
 
 
 class Endpoint:
@@ -85,12 +125,14 @@ class Endpoint:
         self._parent_role = None
         self._sent_live = self._sent_terminal = self._sent_cancel = False
         self._failed_attempted = False
-        self._sent_registrations = {}
+        self._sent_ledger = MetadataLedger(os.getpid(), self.budget)
+        self._sent_registrations = self._sent_ledger.records
 
     def fail(self, reason):
         if self.first_fault is None:
             self.first_fault = reason
         self.settled = False
+        self.budget.poison_owner(self.first_fault)
         if self.on_fault is not None:
             self.on_fault(self.first_fault)
         raise ProtocolError(self.first_fault)
@@ -123,9 +165,14 @@ class Endpoint:
                 self.fail("DUPLICATE_TERMINAL")
             self._failed_attempted = self._sent_terminal = True
             self._send("FAILED|" + str(os.getpid()))
-            self.channel.shutdown(socket.SHUT_WR)
+            try:
+                self.channel.shutdown(socket.SHUT_WR)
+            except OSError:
+                self.fail("SHUTDOWN_FAILED")
             return
         self._check()
+        if tag == "SETTLED" and self.budget.owner_fault is not None:
+            self.fail(self.budget.owner_fault)
         if self._sent_terminal:
             self.fail("POST_TERMINAL_WRITE")
         if tag == "LIVE" and not self._sent_live and not self._sent_cancel:
@@ -151,29 +198,8 @@ class Endpoint:
         self._check()
         if not self._sent_live or self._sent_terminal:
             self.fail("METADATA_SEND_STATE")
-        fields = value.split("|") if isinstance(value, str) and len(value) <= MAX_FRAME else []
-        if len(fields) != 5 or fields[0] not in ("REGISTER", "WAITED"):
-            self.fail("METADATA_SCHEMA")
         try:
-            owner = integer(fields[1], 1, 2147483647)
-            child = integer(fields[2], 1, 2147483647)
-            if not nonce_valid(fields[3]):
-                self.fail("METADATA_SCHEMA")
-            identity = (owner, child, fields[3])
-            if fields[0] == "REGISTER":
-                integer(fields[4], 0, 18446744073709551615)
-                if owner != os.getpid() and not any(key[1] == owner and not waited for key, waited in self._sent_registrations.items()):
-                    self.fail("OWNER_EDGE")
-                if (owner == child or child == os.getpid() or identity in self._sent_registrations
-                        or any(key[1] == child and not waited for key, waited in self._sent_registrations.items())):
-                    self.fail("DUPLICATE_REGISTRATION")
-                self.budget.charge("registrations", 1, MAX_REGISTRATIONS)
-                self._sent_registrations[identity] = False
-            else:
-                integer(fields[4], -2147483648, 2147483647)
-                if identity not in self._sent_registrations or self._sent_registrations[identity]:
-                    self.fail("UNMATCHED_WAIT")
-                self._sent_registrations[identity] = True
+            self._sent_ledger.observe(value)
             self._send(value)
         except ProtocolError as error:
             self.fail(str(error))
@@ -299,10 +325,14 @@ class SourceOwner:
         self.previous = None
         self.deadline_ns = None
         self.budget = Budget()
+        self._forward_ledger = MetadataLedger(os.getpid(), self.budget)
+        self._finished_managers = set()
+        self._closed = False
 
     def fail(self, reason):
         if self.first_fault is None:
             self.first_fault = reason
+        self.budget.poison_owner(self.first_fault)
         self.unsettled = self.admission_closed = True
 
     def __enter__(self):
@@ -327,8 +357,8 @@ class SourceOwner:
     def check(self):
         if self.first_fault:
             raise ProtocolError(self.first_fault)
-        if self.budget.first_fault:
-            self.fail(self.budget.first_fault)
+        if self.budget.first_fault or self.budget.owner_fault:
+            self.fail(self.budget.first_fault or self.budget.owner_fault)
             raise ProtocolError(self.first_fault)
         if self.admission_closed and not self.cancelled:
             self.fail("OWNER_ADMISSION_CLOSED")
@@ -351,14 +381,16 @@ class SourceOwner:
         try:
             if self.first_fault:
                 raise ProtocolError(self.first_fault)
+            if self._closed:
+                raise ProtocolError("OWNER_ALREADY_FINISHED")
             for count, event in enumerate(events):
                 if count >= MAX_FRAMES or not isinstance(event, str) or len(event) + 34 > MAX_FRAME:
                     raise ProtocolError("FORWARD_LIMIT")
+                self.budget.charge("wire", len(event) + 34, MAX_WIRE)
+                self.budget.charge("frames", 1, MAX_FRAMES)
+                self._forward_ledger.observe(event)
                 if self.parent:
                     self.parent.metadata(event)
-                else:
-                    self.budget.charge("wire", len(event) + 34, MAX_WIRE)
-                    self.budget.charge("frames", 1, MAX_FRAMES)
         except ProtocolError as error:
             self.fail(str(error))
             raise
@@ -380,8 +412,8 @@ class SourceOwner:
 
     def finish_managers(self):
         self.admission_closed = True
-        if self.budget.first_fault:
-            self.fail(self.budget.first_fault)
+        if self.budget.first_fault or self.budget.owner_fault:
+            self.fail(self.budget.first_fault or self.budget.owner_fault)
         deadline = time.monotonic_ns() + 4_000_000_000
         self.deadline_ns = min(self.deadline_ns or deadline, deadline)
         if len(self.managers) > MAX_REGISTRATIONS:
@@ -390,19 +422,33 @@ class SourceOwner:
         # Broadcast before waiting. active==None or direct wait is not proof.
         pending = []
         for manager in self.managers:
+            if id(manager) in self._finished_managers:
+                continue
             try:
                 manager.begin_cleanup(self.deadline_ns)
                 pending.append(manager)
             except BaseException:
                 self.fail("MANAGER_CLEANUP_BEGIN")
         while pending:
+            if time.monotonic_ns() >= self.deadline_ns:
+                self.fail("MANAGER_CLEANUP_DEADLINE")
+                break
             remaining = []
             for manager in pending:
                 try:
-                    result = manager.poll_cleanup(self.deadline_ns)
-                    if result is False:
+                    if time.monotonic_ns() >= self.deadline_ns:
+                        self.fail("MANAGER_CLEANUP_DEADLINE")
                         remaining.append(manager)
-                    elif result is not True:
+                        continue
+                    result = manager.poll_cleanup(self.deadline_ns)
+                    if time.monotonic_ns() >= self.deadline_ns:
+                        self.fail("MANAGER_CLEANUP_DEADLINE")
+                        remaining.append(manager)
+                    elif result is False:
+                        remaining.append(manager)
+                    elif result is True:
+                        self._finished_managers.add(id(manager))
+                    else:
                         self.fail("MANAGER_PROOF_SCHEMA")
                 except BaseException:
                     self.fail("MANAGER_CLEANUP_POLL")
@@ -412,6 +458,8 @@ class SourceOwner:
                 break
             if pending:
                 time.sleep(0.001)
+        if not self._forward_ledger.complete():
+            self.fail("UNWAITED_FORWARD_REGISTRATION")
 
     def __exit__(self, exception_type, exception, traceback):
         global CURRENT
@@ -427,6 +475,7 @@ class SourceOwner:
                     self.fail("TERMINAL_WRITE")
                     terminal_error = error
         finally:
+            self._closed = True
             if self.parent:
                 self.parent.close()
             CURRENT = self.previous

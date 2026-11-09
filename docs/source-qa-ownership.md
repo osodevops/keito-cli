@@ -16,6 +16,17 @@ Metadata limits apply across an operation's shared send/receive/forwarding budge
 16384 frames and 4 MiB total metadata. Each poll makes at most eight read attempts
 and parses at most 32 frames. Reason codes contain no offending input.
 
+Containing-owner failure also prevents clean terminal emission from every other
+admitted endpoint. Root forwarding uses the same closed metadata ledger even
+without an upstream socket; unfinished registrations prevent successful finish.
+Each receive, local forward and actual send counts toward its operation budget.
+
+The manager interface currently returns an untimed boolean. A first proof polled
+at or after the shared cleanup deadline is rejected, including a `True` returned
+late. A previously accepted manager proof is cached and is not polled again or
+given a fresh deadline. A manager must close its own admission permanently before
+reporting success. These rules are tested with finite objects, not process actors.
+
 This is a component repair. It is not yet connected to the process-owning runners,
 native fixtures, guardian or core. The Python `SourceOwner` requires explicit
 manager cleanup APIs; the existing `OwnedChildren` does not yet implement them.

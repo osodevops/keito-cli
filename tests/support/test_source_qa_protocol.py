@@ -341,6 +341,131 @@ class ProtocolTests(unittest.TestCase):
                 if expected == "cancel":
                     self.assertTrue(endpoint.cancelled)
 
+    def test_root_forward_validates_unknown_and_impossible_metadata(self):
+        for event in ["unknown", "UNKNOWN|1|2|" + "b" * 32 + "|0",
+                      "REGISTER|9999|12346|" + "b" * 32 + "|1",
+                      "REGISTER|{}|12346|{}|1\nPRIVATE_CANARY".format(os.getpid(), "b" * 32)]:
+            with self.subTest(event=event.split("|", 1)[0]):
+                owner = SourceOwner()
+                with self.assertRaises(ProtocolError) as error:
+                    owner.forward([event])
+                self.assertTrue(owner.unsettled)
+                self.assertNotIn("PRIVATE_CANARY", str(error.exception))
+
+    def test_root_forward_cannot_finish_with_an_unmatched_registration(self):
+        owner = SourceOwner()
+        owner.forward(["REGISTER|{}|12346|{}|1".format(os.getpid(), "b" * 32)])
+        with self.assertRaises(ProtocolError):
+            owner.__exit__(None, None, None)
+        self.assertTrue(owner.unsettled)
+
+    def test_valid_root_forward_closes_ledger_before_finish(self):
+        owner = SourceOwner()
+        identity = "{}|12346|{}".format(os.getpid(), "b" * 32)
+        owner.forward(["REGISTER|" + identity + "|1", "WAITED|" + identity + "|0"])
+        self.assertEqual(owner.budget.registrations, 1)
+        self.assertEqual(owner.budget.frames, 2)
+        owner.__exit__(None, None, None)
+        self.assertFalse(owner.unsettled)
+
+    def test_parent_and_root_forwarding_both_refuse_unmatched_wait(self):
+        for has_parent in [False, True]:
+            owner = SourceOwner()
+            if has_parent:
+                reader, writer = socket.socketpair()
+                self.addCleanup(reader.close)
+                self.addCleanup(writer.close)
+                owner.parent = owner.endpoint(reader, NONCE)
+                owner.parent.send("LIVE")
+            with self.assertRaises(ProtocolError):
+                owner.forward(["WAITED|{}|12346|{}|0".format(os.getpid(), "b" * 32)])
+            self.assertTrue(owner.unsettled)
+
+    def test_failed_terminal_shutdown_error_is_sticky_safe_protocol_error(self):
+        class ShutdownFault:
+            family, type = socket.AF_UNIX, socket.SOCK_STREAM
+            def setblocking(self, value): pass
+            def set_inheritable(self, value): pass
+            def send(self, frame): return len(frame)
+            def shutdown(self, how): raise OSError("PRIVATE_CANARY")
+        owner = SourceOwner()
+        endpoint = owner.endpoint(ShutdownFault(), NONCE)
+        with self.assertRaises(ProtocolError) as error:
+            endpoint.send("FAILED")
+        self.assertEqual(str(error.exception), "SHUTDOWN_FAILED")
+        self.assertTrue(owner.unsettled)
+        self.assertNotIn("PRIVATE_CANARY", owner.first_fault)
+
+    def test_late_cleanup_true_is_not_accepted_as_timely_proof(self):
+        owner = SourceOwner()
+        observed = []
+        class Manager:
+            def begin_cleanup(self, deadline): observed.append("begin")
+            def poll_cleanup(self, deadline): observed.append("poll"); return True
+        owner.managers = [Manager()]
+        owner.deadline_ns = 1
+        owner.finish_managers()
+        self.assertTrue(owner.unsettled)
+        self.assertEqual(observed, ["begin"])
+
+    def test_accepted_manager_proof_is_not_repolled_after_deadline(self):
+        owner = SourceOwner()
+        observed = []
+        class Manager:
+            def begin_cleanup(self, deadline): observed.append("begin")
+            def poll_cleanup(self, deadline): observed.append("poll"); return True
+        owner.managers = [Manager()]
+        owner.finish_managers()
+        self.assertFalse(owner.unsettled)
+        owner.deadline_ns = 1
+        owner.finish_managers()
+        self.assertFalse(owner.unsettled)
+        self.assertEqual(observed, ["begin", "poll"])
+
+    def test_owner_fault_yields_failed_not_clean_at_remote_peer(self):
+        owner = SourceOwner()
+        up, remote = socket.socketpair()
+        down, sender = socket.socketpair()
+        for value in [up, remote, down, sender]:
+            self.addCleanup(value.close)
+        upstream = owner.endpoint(up, NONCE)
+        downstream = owner.endpoint(down, NONCE, PEER)
+        upstream.send("LIVE")
+        sender.sendall(("b" * 32 + "|LIVE|12345\n").encode())
+        with self.assertRaises(ProtocolError) as first:
+            downstream.receive()
+        with self.assertRaises(ProtocolError):
+            upstream.send("SETTLED")
+        upstream.send("FAILED")
+        remote_endpoint = Endpoint(remote, NONCE, os.getpid())
+        with self.assertRaises(ProtocolError) as remote_error:
+            remote_endpoint.receive()
+        self.assertEqual(str(remote_error.exception), "PEER_FAILED")
+        self.assertFalse(remote_endpoint.settled)
+        self.assertEqual(owner.first_fault, str(first.exception))
+
+    def test_manager_true_returning_after_deadline_is_rejected(self):
+        from unittest.mock import patch
+        owner = SourceOwner()
+        owner.deadline_ns = 100
+        class Manager:
+            def begin_cleanup(self, deadline): pass
+            def poll_cleanup(self, deadline): return True
+        manager = Manager()
+        owner.managers = [manager]
+        with patch("source_qa_protocol.time.monotonic_ns", side_effect=[1, 2, 3, 101, 102]):
+            owner.finish_managers()
+        self.assertTrue(owner.unsettled)
+        self.assertEqual(owner.first_fault, "MANAGER_CLEANUP_DEADLINE")
+        self.assertNotIn(id(manager), owner._finished_managers)
+
+    def test_finished_owner_refuses_further_forwarding(self):
+        owner = SourceOwner()
+        owner.__exit__(None, None, None)
+        with self.assertRaises(ProtocolError):
+            owner.forward(["REGISTER|{}|12346|{}|1".format(os.getpid(), "b" * 32)])
+        self.assertEqual(owner.first_fault, "OWNER_ALREADY_FINISHED")
+
 
 if __name__ == "__main__":
     unittest.main()
