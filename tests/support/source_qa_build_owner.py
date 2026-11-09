@@ -492,6 +492,40 @@ class BuildRun:
             time.sleep(0.001)
         self.collect()
 
+    def cancel_signal(self, _signum, _frame):
+        raise Refused("CANCELLED")
+
+    def finalize(self, parent, child, result_saved, saved_handlers):
+        state = self
+        state.close_writer()
+        if child is not None:
+            child.close()
+        if not result_saved:
+            state.proof = False
+        try:
+            state.retain_waits()
+        except BaseException:
+            state.fail("FINAL_WAIT")
+        after = state.facts()
+        after["first_preserved"] = result_saved
+        after["first_result_write_failed"] = not result_saved
+        try:
+            with exclusive(root / "FINAL.json") as output:
+                json.dump(after, output, indent=2)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+        except BaseException:
+            state.fail("FINAL_RECEIPT")
+        # A bounded fact-only fallback also survives receipt-file failure.
+        print(json.dumps({"owner_result": state.facts(), "first_saved": result_saved}), flush=True)
+        if parent is not None:
+            parent.close()
+        state.output.close()
+        state.trace.close()
+        for signum, handler in saved_handlers.items():
+            signal.signal(signum, handler)
+
     def facts(self):
         return {"first_fault": self.first, "secondary_faults": self.secondary,
                 "keeper_spawned": self.keeper is not None, "child_spawned": self.child is not None,
@@ -541,11 +575,9 @@ def run(spec):
     first_facts = None
     result_saved = False
     saved_handlers = {}
-    def cancelled(_signum, _frame):
-        raise Refused("CANCELLED")
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
-            saved_handlers[signum] = signal.signal(signum, cancelled)
+            saved_handlers[signum] = signal.signal(signum, state.cancel_signal)
         parent, child = socket.socketpair()
         nonce = os.urandom(16).hex()
         state.channel = Channel(parent, nonce)  # Before fork: no lost child on setup error.
@@ -620,34 +652,7 @@ def run(spec):
         # the first reason with a later success. No raw exception text escapes.
         state.fail(str(error) if isinstance(error, Refused) else "OWNER_INTERNAL")
     finally:
-        state.close_writer()
-        if child is not None:
-            child.close()
-        if not result_saved:
-            state.proof = False
-        try:
-            state.retain_waits()
-        except BaseException:
-            state.fail("FINAL_WAIT")
-        after = state.facts()
-        after["first_preserved"] = result_saved
-        after["first_result_write_failed"] = not result_saved
-        try:
-            with exclusive(root / "FINAL.json") as output:
-                json.dump(after, output, indent=2)
-                output.write("\n")
-                output.flush()
-                os.fsync(output.fileno())
-        except BaseException:
-            state.fail("FINAL_RECEIPT")
-        # A bounded fact-only fallback also survives receipt-file failure.
-        print(json.dumps({"owner_result": state.facts(), "first_saved": result_saved}), flush=True)
-        if parent is not None:
-            parent.close()
-        state.output.close()
-        state.trace.close()
-        for signum, handler in saved_handlers.items():
-            signal.signal(signum, handler)
+        state.finalize(parent, child, result_saved, saved_handlers)
     return bool(result_saved and first_facts["cleanup_proof"] and first_facts["command_success"]
                 and not state.first and state.all_waited())
 
