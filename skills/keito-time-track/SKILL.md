@@ -1,68 +1,116 @@
 ---
 name: keito-time-track
 description: >
-  Track billable AI coding-session time to Keito through the Keito CLI. Use
-  when the user asks to set up repository time tracking, install or configure
-  the Keito skill, log agent work, check tracking status, pause or resume
-  tracking, disable tracking, or review today's source=agent time entries.
+  Set up explicit repository consent and inspect metadata-only coding-agent
+  activity through the Keito CLI. Use when the user asks to install capture,
+  map a repository, check queued activity, pause or resume capture, disable
+  capture, or review agent time. Activity needs authorized review before billing.
 ---
 
 # Keito Time Track
 
-You are helping the user manage Keito time tracking for coding sessions in
-this repository. Time entries are created automatically by installed lifecycle
-hooks when a session ends. Do not create time entries directly from the skill
-body.
+The CLI owns deterministic capture, the local consent ledger, exact observed
+turn intervals and durable delivery. The skill selects and configures it.
+Never measure time or create time/expense records from a model response.
 
-## Commands
+## Setup
 
-When the user asks to set up Keito tracking for the current repo, or invokes
-this skill directly with `/track-time-keito` or `/keito-time-track:keito-time-track`, run:
+Confirm which supported adapters the user wants: `claude-code`, `codex`, or both.
+Scripted installation always names targets. If the user already selected them,
+continue without asking again. For example, for both:
 
 ```bash
-if ! command -v keito >/dev/null 2>&1; then scripts/install-cli.sh; fi
-keito skill install --skip-skills-add
-scripts/setup-wizard.sh
+keito skill install --agent claude-code --agent codex
+scripts/setup-wizard.sh --agent claude-code --agent codex --install-worker
 ```
 
-If `keito auth status` reports unauthenticated, stop before setup and tell the
-user to run `keito auth login`. Do not ask for or print API keys.
+The native Rust CLI and its verified matching `keito-capture-guard` must be installed.
+Capture, installer and mapping setup have no production Python runtime dependency.
+The CLI must expose `keito capture --help`. If it does not, install a qualified
+CLI release before proceeding. `scripts/install-cli.sh` installs the public CLI;
+it does not establish capture support or harness qualification. Authentication
+belongs to `keito auth login`; never request or print API keys.
 
-When the user asks for tracking status, run:
+The explicit `--install-worker` option requests a local macOS background
+uploader; the picker previews it before confirmation. Without that option setup
+only approves local queuing, so do not claim automatic delivery. The CLI owns
+service setup and must report its actual running/verified state.
+
+The setup picker uses existing accessible clients, projects and project tasks.
+It delegates mapping publication and recovery to native `capture setup --client
+<client-id> --project <project-id> --task <task-id> --write-hint --confirm` in the
+canonical Git root; it never shells back into the CLI from an installer service.
+It previews metadata-only collection and requires explicit mapping consent on
+this device. A repository-carried `.keito/config.yml` is only a hint; it cannot
+approve capture, choose a billing rate or authorize historical import. Failed setup restores the previous hint. After an
+interruption, run setup recovery and inspect `keito capture status` before
+explicit reapproval; core consent may have committed even when the wrapper
+failed. Recovery must not replay that operation automatically.
+
+## Inspect and control
 
 ```bash
 scripts/status.sh
-```
-
-When the user asks to pause or resume tracking for the current session, run:
-
-```bash
+keito capture preview --session <exact-source-session-id> --json
+keito capture sync
 scripts/pause-resume.sh pause
 scripts/pause-resume.sh resume
-```
-
-When the user asks to disable tracking for this repository, run:
-
-```bash
 scripts/disable.sh
 ```
 
-When the user asks what was logged today, run:
+Pause, resume and disable target the approved current repository, including
+unsent work; they do not rewrite previously submitted accounting evidence.
+Use CLI status/preview for actionable holds and errors. Never open transcripts
+or raw hook inputs for diagnostics. Never manufacture a successful delivery from
+configured hook files or treat unknown usage as zero.
+
+For adapter removal, explicitly select only the unwanted target:
 
 ```bash
-keito --json time list --today --source agent
+installers/uninstall.sh --agent codex
 ```
 
-Summarise the returned entries by duration, project, task, and notes.
+Removal preserves unrelated/ambiguous commands and refuses to delete modified
+skill payloads. Immutable hidden adapter generations remain for safe rollback;
+installation never replaces an executable referenced by an existing hook. It does not delete capture evidence or restore previously disabled
+legacy plugins automatically.
 
-## Rules
+## Plugin qualification
 
-- Never read or expose Keito API keys. Authentication belongs to the Keito CLI.
-- Never write `.keito/config.yml` by hand. Use `scripts/setup-wizard.sh`.
-- Treat `.keito/config.yml` as repository-specific. Do not reuse a config from
-  another client or project.
-- Never create a time entry from the skill body. The session-end hook owns
-  duration measurement and writes exactly one entry per session.
-- If the Keito CLI is missing, run `scripts/install-cli.sh`.
-- If the Keito CLI is unauthenticated, tell the user to run `keito auth login`
-  or set `KEITO_API_KEY` and `KEITO_ACCOUNT_ID`.
+Claude plugin registrations do not snapshot the running executable version.
+They use `KEITO_HARNESS_VERSION` when explicitly provided, otherwise `unknown`.
+Unknown means unqualified: never report a plugin as ready or live-delivery
+verified from installed files. The direct installer records the selected
+observed version. The native guard/core pair is configured by managed direct
+installation; a plugin-only installation does not establish that pair and
+remains unqualified. All routes still need real trust/dispatch qualification.
+These scripts do not run a version-discovery subprocess on every hook.
+
+## Capture and privacy contract
+
+- `SessionStart` preserves session identity; `UserPromptSubmit` opens a turn;
+  `Stop` checkpoints it; interruption/failure/finalization retain incomplete
+  evidence. A session may have many completed turns.
+- Hooks invoke the paired native Rust guard/core locally, with the unchanged
+  one-second fail-open ceiling. A content-free durable prelaunch marker precedes
+  core startup; only exact durable acknowledgement, successful exit and pipe EOF
+  permit cleanup. The guard performs no network or SQLite work. Core SQLite
+  durability precedes acknowledgement; workers handle
+  network I/O and frozen retries separately.
+- Default capture never uploads prompts, assistant prose, transcripts, source
+  code, full local paths, branch names or Git diffs. The raw harness JSON is
+  transient stdin to the allowlisting CLI and is never logged by these scripts.
+- Observed agent duration is not human labour, CPU time, vendor expenditure or
+  permission to charge. New evidence remains nonbillable pending review.
+- A separately qualified numeric parser may read the exact active-session file
+  locally after current consent and baseline checks. It discards prompts, prose,
+  code and tool arguments; only allowlisted counters/identifiers/provenance can
+  persist. Paused/revoked terminal events do not read transcripts. No arbitrary
+  history scans, backfill, model summaries or transcript uploads are authorized.
+- Numeric usage and cost claims require separately qualified versioned evidence.
+  These adapters alone establish no automatic usage or actual-cost claim.
+- Installation cannot grant host trust, mapping consent, rate authority or live
+  delivery verification. Codex uses `features.hooks`; follow its normal trust
+  review and never bypass it. Changed hook hashes require renewed host review.
+- Legacy plugin/direct-hook duplicates need an explicit migration confirmation.
+  Do not silently run old financial hooks alongside the new implementation.

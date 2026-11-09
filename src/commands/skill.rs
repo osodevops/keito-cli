@@ -1,6 +1,8 @@
 use colored::Colorize;
+use dialoguer::MultiSelect;
 use serde::Serialize;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,7 +23,15 @@ struct SkillStatus {
     cli_path: Option<String>,
     npx_installed: bool,
     jq_installed: bool,
+    capture_runtime: String,
+    credentials_configured: bool,
     authenticated: bool,
+    authentication_state: String,
+    hook_trust: String,
+    delivery_verified: bool,
+    ready: bool,
+    capture: serde_json::Value,
+    worker: serde_json::Value,
     account_id: Option<String>,
     codex: AgentStatus,
     claude_code: AgentStatus,
@@ -33,6 +43,7 @@ struct AgentStatus {
     skill_path: Option<String>,
     hooks_configured: bool,
     hook_config_path: Option<String>,
+    guard_runtime: String,
 }
 
 #[derive(Debug)]
@@ -64,19 +75,24 @@ const BUNDLED_SKILL_FILES: &[BundledSkillFile] = &[
         executable: false,
     },
     BundledSkillFile {
-        path: "hooks/lib/config.sh",
-        contents: include_str!("../../skills/keito-time-track/hooks/lib/config.sh"),
+        path: "hooks/claude-plugin.json",
+        contents: include_str!("../../skills/keito-time-track/hooks/claude-plugin.json"),
         executable: false,
     },
     BundledSkillFile {
-        path: "hooks/lib/duration.sh",
-        contents: include_str!("../../skills/keito-time-track/hooks/lib/duration.sh"),
-        executable: false,
+        path: "hooks/dispatch.sh",
+        contents: include_str!("../../skills/keito-time-track/hooks/dispatch.sh"),
+        executable: true,
     },
     BundledSkillFile {
-        path: "hooks/lib/log.sh",
-        contents: include_str!("../../skills/keito-time-track/hooks/lib/log.sh"),
-        executable: false,
+        path: "hooks/interrupt.sh",
+        contents: include_str!("../../skills/keito-time-track/hooks/interrupt.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "hooks/prompt.sh",
+        contents: include_str!("../../skills/keito-time-track/hooks/prompt.sh"),
+        executable: true,
     },
     BundledSkillFile {
         path: "hooks/session-end.sh",
@@ -84,8 +100,18 @@ const BUNDLED_SKILL_FILES: &[BundledSkillFile] = &[
         executable: true,
     },
     BundledSkillFile {
+        path: "hooks/session-finalize.sh",
+        contents: include_str!("../../skills/keito-time-track/hooks/session-finalize.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
         path: "hooks/session-start.sh",
         contents: include_str!("../../skills/keito-time-track/hooks/session-start.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "hooks/stop.sh",
+        contents: include_str!("../../skills/keito-time-track/hooks/stop.sh"),
         executable: true,
     },
     BundledSkillFile {
@@ -96,6 +122,16 @@ const BUNDLED_SKILL_FILES: &[BundledSkillFile] = &[
     BundledSkillFile {
         path: "installers/install-codex.sh",
         contents: include_str!("../../skills/keito-time-track/installers/install-codex.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "installers/install.sh",
+        contents: include_str!("../../skills/keito-time-track/installers/install.sh"),
+        executable: true,
+    },
+    BundledSkillFile {
+        path: "installers/uninstall.sh",
+        contents: include_str!("../../skills/keito-time-track/installers/uninstall.sh"),
         executable: true,
     },
     BundledSkillFile {
@@ -153,18 +189,34 @@ pub async fn run(
             source,
             agent,
             skip_skills_add,
+            confirm_migration,
         } => {
             install(
                 global,
                 mode,
                 &source,
-                selected_agents(agent),
+                selected_agents(agent)?,
                 skip_skills_add,
+                confirm_migration,
             )
             .await
         }
-        SkillSubcommand::Status => status(global, mode, false).await,
-        SkillSubcommand::Doctor => status(global, mode, true).await,
+        SkillSubcommand::Uninstall { agent } => {
+            uninstall(selected_agents(agent)?, global, mode).await
+        }
+        SkillSubcommand::Runtime => {
+            let runtime = crate::capture_runtime_pair::current()?;
+            if !global.quiet {
+                println!(
+                    "{}",
+                    serde_json::to_string(&runtime)
+                        .map_err(|_| AppError::Config("Cannot render runtime identity".into()))?
+                );
+            }
+            Ok(())
+        }
+        SkillSubcommand::Status => status(global, mode, false, false).await,
+        SkillSubcommand::Doctor { live } => status(global, mode, true, live).await,
         SkillSubcommand::TeamInit { mode: team_mode } => team_init(team_mode, global, mode).await,
     }
 }
@@ -172,7 +224,15 @@ pub async fn run(
 pub async fn install_defaults(global: &GlobalFlags, mode: OutputMode) -> Result<(), AppError> {
     let source =
         std::env::var("KEITO_SKILL_SOURCE").unwrap_or_else(|_| BUNDLED_SKILL_SOURCE.into());
-    install(global, mode, &source, default_agents(), false).await
+    install(
+        global,
+        mode,
+        &source,
+        selected_agents(vec![])?,
+        false,
+        false,
+    )
+    .await
 }
 
 async fn install(
@@ -181,6 +241,7 @@ async fn install(
     source: &str,
     agents: Vec<SkillAgent>,
     skip_skills_add: bool,
+    confirm_migration: bool,
 ) -> Result<(), AppError> {
     let source = source.trim();
     let use_bundled = source.is_empty() || source == BUNDLED_SKILL_SOURCE;
@@ -190,28 +251,35 @@ async fn install(
             "npx is required for an external skill source. Install Node.js, use --source bundled, or run the manual skill installer.".into(),
         ));
     }
-    if find_in_path("jq").is_none() {
-        return Err(AppError::Config(
-            "jq is required by the Keito Skill hook installers and runtime scripts.".into(),
-        ));
-    }
-
+    // Qualification precedes every profile mutation, including external
+    // skills downloads. An arbitrary adjacent binary cannot qualify capture.
+    let runtime = crate::capture_runtime_pair::current()?;
+    let home =
+        dirs::home_dir().ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
     let bundled_skill = if !skip_skills_add && use_bundled {
         Some(materialize_bundled_skill()?)
     } else {
         None
     };
-
     for agent in &agents {
-        let show_child_output = !global.quiet && mode == OutputMode::Table;
-        if skip_skills_add {
-            run_hook_installer(*agent, show_child_output)?;
-        } else if let Some(skill) = bundled_skill.as_ref() {
-            run_bundled_hook_installer(*agent, show_child_output, &skill.skill_root)?;
-        } else {
-            run_skills_add(source, *agent, show_child_output)?;
-            run_hook_installer(*agent, show_child_output)?;
+        if !skip_skills_add && !use_bundled {
+            run_skills_add(source, *agent, !global.quiet && mode == OutputMode::Table)?;
         }
+        let root = if let Some(skill) = bundled_skill.as_ref() {
+            skill.skill_root.clone()
+        } else {
+            hook_installer_path(*agent)
+                .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
+                .ok_or_else(|| AppError::Config("Keito skill source is unavailable".into()))?
+        };
+        crate::skill_adapter::install(crate::skill_adapter::InstallOptions {
+            source_root: &root,
+            profile_home: &home,
+            agent: *agent,
+            runtime: &runtime,
+            confirm_migration,
+            harness_version: None,
+        })?;
     }
 
     if global.quiet {
@@ -235,8 +303,46 @@ async fn install(
     Ok(())
 }
 
-async fn status(global: &GlobalFlags, mode: OutputMode, doctor: bool) -> Result<(), AppError> {
-    let current = collect_status(global);
+async fn status(
+    global: &GlobalFlags,
+    mode: OutputMode,
+    doctor: bool,
+    live: bool,
+) -> Result<(), AppError> {
+    let mut current = collect_status(global);
+    if live {
+        let auth = ResolvedAuth::resolve(global)?;
+        let config = crate::config::AppConfig::load()?;
+        let client = crate::api::client::KeitorClient::new(&auth, &config.api_base_url())?;
+        match client.get_me().await {
+            Ok(me) if !me.is_personal_read_only_sync() => {
+                current.authenticated = true;
+                current.authentication_state = "VERIFIED".into();
+                let repository = &mut current.capture["current_repository"];
+                let matches = repository["approved"] == true
+                    && repository["mapping_current"] == true
+                    && repository["paused"] != true
+                    && repository["workspace_id"].as_str() == Some(auth.workspace_id.as_str())
+                    && repository["owner_id"].as_str() == Some(me.id.as_str())
+                    && repository["origin_hash"].as_str()
+                        == Some(
+                            crate::capture::hash(config.api_base_url().trim_end_matches('/'))
+                                .as_str(),
+                        );
+                repository["authentication_binding"] =
+                    serde_json::json!(if matches { "MATCHED" } else { "MISMATCH" });
+                current.delivery_verified =
+                    matches && repository["delivery_history_verified"] == true;
+                current.capture["delivery_verified"] = serde_json::json!(current.delivery_verified);
+            }
+            Ok(_) => {
+                current.authentication_state = "INCOMPATIBLE_CREDENTIAL".into();
+            }
+            Err(_) => {
+                current.authentication_state = "NEEDS_AUTH_OR_NETWORK".into();
+            }
+        }
+    }
 
     if global.quiet {
         return Ok(());
@@ -255,16 +361,41 @@ async fn status(global: &GlobalFlags, mode: OutputMode, doctor: bool) -> Result<
     Ok(())
 }
 
-fn selected_agents(agents: Vec<SkillAgent>) -> Vec<SkillAgent> {
-    if agents.is_empty() {
-        default_agents()
-    } else {
-        agents
+fn selected_agents(agents: Vec<SkillAgent>) -> Result<Vec<SkillAgent>, AppError> {
+    if !agents.is_empty() {
+        let mut selected = Vec::new();
+        for agent in agents {
+            if !selected.contains(&agent) {
+                selected.push(agent);
+            }
+        }
+        return Ok(selected);
     }
-}
-
-fn default_agents() -> Vec<SkillAgent> {
-    vec![SkillAgent::Codex, SkillAgent::ClaudeCode]
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(AppError::InvalidInput(
+            "Select explicit adapter targets: --agent claude-code and/or --agent codex".into(),
+        ));
+    }
+    let selected = MultiSelect::new()
+        .with_prompt("Install which coding-agent adapters?")
+        .items(["Claude Code", "Codex"])
+        .interact()
+        .map_err(|_| AppError::Config("Cannot read adapter target selection".into()))?;
+    if selected.is_empty() {
+        return Err(AppError::InvalidInput(
+            "No adapters selected; nothing installed".into(),
+        ));
+    }
+    Ok(selected
+        .into_iter()
+        .map(|i| {
+            if i == 0 {
+                SkillAgent::ClaudeCode
+            } else {
+                SkillAgent::Codex
+            }
+        })
+        .collect())
 }
 
 fn run_skills_add(source: &str, agent: SkillAgent, show_output: bool) -> Result<(), AppError> {
@@ -300,57 +431,6 @@ fn run_skills_add(source: &str, agent: SkillAgent, show_output: bool) -> Result<
     Ok(())
 }
 
-fn run_bundled_hook_installer(
-    agent: SkillAgent,
-    show_output: bool,
-    skill_root: &Path,
-) -> Result<(), AppError> {
-    let installer_name = match agent {
-        SkillAgent::Codex => "install-codex.sh",
-        SkillAgent::ClaudeCode => "install-claude-code.sh",
-    };
-    let script = skill_root.join("installers").join(installer_name);
-    run_installer_script(agent, show_output, &script)
-}
-
-fn run_hook_installer(agent: SkillAgent, show_output: bool) -> Result<(), AppError> {
-    let script = hook_installer_path(agent).ok_or_else(|| {
-        AppError::Config(format!(
-            "Keito Skill files were not found for {} after install",
-            agent.display_name()
-        ))
-    })?;
-
-    run_installer_script(agent, show_output, &script)
-}
-
-fn run_installer_script(
-    agent: SkillAgent,
-    show_output: bool,
-    script: &Path,
-) -> Result<(), AppError> {
-    let current_exe = std::env::current_exe()
-        .map_err(|e| AppError::Config(format!("Could not resolve current keito binary: {e}")))?;
-
-    let status = ProcessCommand::new("bash")
-        .arg(script)
-        .env("KEITO_CLI_BIN", current_exe)
-        .stdin(Stdio::null())
-        .stdout(child_stdio(show_output))
-        .stderr(child_stdio(show_output))
-        .status()
-        .map_err(|e| AppError::Config(format!("Failed to run hook installer: {e}")))?;
-
-    if !status.success() {
-        return Err(AppError::Config(format!(
-            "Hook installer failed for {}",
-            agent.display_name()
-        )));
-    }
-
-    Ok(())
-}
-
 fn materialize_bundled_skill() -> Result<MaterializedBundledSkill, AppError> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -359,6 +439,17 @@ fn materialize_bundled_skill() -> Result<MaterializedBundledSkill, AppError> {
     let temp_root =
         std::env::temp_dir().join(format!("keito-skill-{}-{unique}", std::process::id()));
     let skill_root = temp_root.join(SKILL_NAME);
+    let builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    let mut builder = builder;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&temp_root)
+        .map_err(|_| AppError::Config("Cannot create private bundled skill source".into()))?;
 
     for file in BUNDLED_SKILL_FILES {
         let path = skill_root.join(file.path);
@@ -436,6 +527,11 @@ fn hook_installer_path(agent: SkillAgent) -> Option<PathBuf> {
 
 fn collect_status(global: &GlobalFlags) -> SkillStatus {
     let auth = ResolvedAuth::resolve(global).ok();
+    let (capture, worker) = capture_diagnostics(global);
+    let delivery_verified = capture
+        .get("delivery_verified")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
     SkillStatus {
         cli_installed: true,
         cli_path: std::env::current_exe()
@@ -443,7 +539,20 @@ fn collect_status(global: &GlobalFlags) -> SkillStatus {
             .map(|path| path.display().to_string()),
         npx_installed: find_in_path("npx").is_some(),
         jq_installed: find_in_path("jq").is_some(),
-        authenticated: auth.is_some(),
+        capture_runtime: if crate::capture_runtime_pair::current().is_ok() {
+            "VERIFIED_RELEASE_PAIR"
+        } else {
+            "UNQUALIFIED_OR_STALE"
+        }
+        .into(),
+        credentials_configured: auth.is_some(),
+        authenticated: false,
+        authentication_state: "UNVERIFIED".into(),
+        hook_trust: "UNKNOWN_REVIEW_IN_HARNESS".into(),
+        delivery_verified,
+        ready: false,
+        capture,
+        worker,
         account_id: auth.map(|auth| auth.workspace_id),
         codex: agent_status(SkillAgent::Codex),
         claude_code: agent_status(SkillAgent::ClaudeCode),
@@ -463,14 +572,21 @@ fn agent_status(agent: SkillAgent) -> AgentStatus {
         SkillAgent::Codex => home.join(".codex/hooks.json"),
         SkillAgent::ClaudeCode => home.join(".claude/settings.json"),
     });
-    let hooks_configured = hook_config_path
-        .as_ref()
-        .is_some_and(|path| hook_configured(path));
+    let runtime = crate::capture_runtime_pair::current().ok();
+    let hooks_configured = home.as_ref().is_some_and(|home| {
+        crate::skill_adapter::inspect(home, agent, runtime.as_ref()).unwrap_or(false)
+    });
 
     AgentStatus {
         skill_installed: skill_path.is_some(),
         skill_path: skill_path.map(|path| path.display().to_string()),
         hooks_configured,
+        guard_runtime: if runtime.is_some() {
+            "VERIFIED_RELEASE_PAIR"
+        } else {
+            "UNQUALIFIED_OR_STALE"
+        }
+        .into(),
         hook_config_path: hook_config_path.map(|path| path.display().to_string()),
     }
 }
@@ -479,13 +595,17 @@ fn first_existing(paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find(|path| path.exists()).cloned()
 }
 
-fn hook_configured(path: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    contents.contains(SKILL_NAME)
-        && contents.contains("session-start.sh")
-        && contents.contains("session-end.sh")
+async fn uninstall(
+    agents: Vec<SkillAgent>,
+    global: &GlobalFlags,
+    mode: OutputMode,
+) -> Result<(), AppError> {
+    let home =
+        dirs::home_dir().ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
+    for agent in agents {
+        crate::skill_adapter::uninstall(&home, agent)?;
+    }
+    status(global, mode, false, false).await
 }
 
 fn find_in_path(binary: &str) -> Option<PathBuf> {
@@ -529,8 +649,34 @@ fn print_status(status: &SkillStatus, doctor: bool) {
         println!("CLI path: {path}");
     }
     println!("npx available: {}", yes_no(status.npx_installed));
-    println!("jq available: {}", yes_no(status.jq_installed));
-    println!("Authenticated: {}", yes_no(status.authenticated));
+    println!("Native capture runtime: {}", status.capture_runtime);
+    println!(
+        "Credentials configured: {}",
+        yes_no(status.credentials_configured)
+    );
+    println!("Live authentication: {}", status.authentication_state);
+    println!("Hook trust: {}", status.hook_trust);
+    println!(
+        "Capture delivery verified: {}",
+        yes_no(status.delivery_verified)
+    );
+    println!(
+        "Repository approval: {}",
+        status.capture["current_repository"]["approved"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    println!(
+        "Storage paused: {}",
+        status.capture["storage_paused"].as_bool().unwrap_or(true)
+    );
+    println!(
+        "Worker installed/loaded/running: {}/{}/{}",
+        status.worker["installed"].as_bool().unwrap_or(false),
+        status.worker["loaded"].as_bool().unwrap_or(false),
+        status.worker["running"].as_bool().unwrap_or(false)
+    );
+    println!("Ready: no (unknown trust/delivery is not ready)");
     if let Some(account_id) = &status.account_id {
         println!("Account ID: {account_id}");
     }
@@ -543,14 +689,14 @@ fn print_status(status: &SkillStatus, doctor: bool) {
         if !status.npx_installed {
             println!("- Install Node.js/npm so npx is available.");
         }
-        if !status.jq_installed {
-            println!("- Install jq.");
+        if status.capture_runtime != "VERIFIED_RELEASE_PAIR" {
+            println!("- Install the official paired Keito release for native capture.");
         }
         if !status.authenticated {
             println!("- Run keito auth login.");
         }
         if !status.codex.hooks_configured && !status.claude_code.hooks_configured {
-            println!("- Run keito skill install.");
+            println!("- Run keito skill install --agent <claude-code|codex>.");
         }
         if status.authenticated
             && (status.codex.hooks_configured || status.claude_code.hooks_configured)
@@ -656,8 +802,9 @@ run `/track-time-keito` from Codex or Claude Code to create the repo-local
 `.keito/config.yml` project/task mapping.
 
 Do not commit `.keito/config.yml`; it is specific to one Keito account,
-client, project, and task. The lifecycle hooks create one `source=agent` time
-entry when a tracked session ends, so do not create duplicate manual entries.
+client, project, and task. After explicit local approval, supported turn hooks create
+pending-review capture records. Do not create duplicate manual time entries for
+captured activity. Review the evidence before approving any client charge.
 ",
             claude: "\
 ## Keito Time Tracking
@@ -668,8 +815,9 @@ run `/track-time-keito` to create the repo-local `.keito/config.yml`
 project/task mapping.
 
 Do not commit `.keito/config.yml`; it is specific to one Keito account,
-client, project, and task. The lifecycle hooks create one `source=agent` time
-entry when a tracked session ends, so do not create duplicate manual entries.
+client, project, and task. After explicit local approval, supported turn hooks create
+pending-review capture records. Do not create duplicate manual time entries for
+captured activity. Review the evidence before approving any client charge.
 ",
         },
         SkillTeamMode::Required => TeamGuidance {
@@ -678,35 +826,41 @@ entry when a tracked session ends, so do not create duplicate manual entries.
 
 Keito agent time tracking is required before billable coding work in this
 repository. Before starting, verify `keito skill status --json`. If the skill
-or hooks are missing, stop and tell the user to run `keito skill install`.
+or hooks are missing, stop and tell the user to run `keito skill install --agent <claude-code|codex>`.
 
 If `.keito/config.yml` is missing for this worktree, stop and run
 `/track-time-keito` from Codex or Claude Code so the user can choose the Keito
 client, project, and task. Do not guess project or task IDs. Do not commit
 `.keito/config.yml`.
 
-The lifecycle hooks create one `source=agent` time entry when a tracked session
-ends. Do not create duplicate manual entries for the same coding session.
+The lifecycle hooks save minimized observed-turn evidence in a private local queue.
+A separately supervised worker sends canonical revisions for review; elapsed activity
+is not permission to bill. Verify local consent, worker and delivery with
+`keito capture status --json` and `keito capture worker-status --json`.
+Do not create duplicate manual entries for the same captured coding session.
 ",
             claude: "\
 ## Keito Time Tracking
 
 Keito agent time tracking is required before billable coding work in this
 repository. Before starting, verify `keito skill status --json`. If the skill
-or hooks are missing, stop and tell the user to run `keito skill install`.
+or hooks are missing, stop and tell the user to run `keito skill install --agent <claude-code|codex>`.
 
 If `.keito/config.yml` is missing for this worktree, stop and run
 `/track-time-keito` so the user can choose the Keito client, project, and task.
 Do not guess project or task IDs. Do not commit `.keito/config.yml`.
 
-The lifecycle hooks create one `source=agent` time entry when a tracked session
-ends. Do not create duplicate manual entries for the same coding session.
+The lifecycle hooks save minimized observed-turn evidence in a private local queue.
+A separately supervised worker sends canonical revisions for review; elapsed activity
+is not permission to bill. Verify local consent, worker and delivery with
+`keito capture status --json` and `keito capture worker-status --json`.
+Do not create duplicate manual entries for the same captured coding session.
 ",
         },
     }
 }
 
-fn git_repo_root() -> Result<PathBuf, AppError> {
+pub(crate) fn git_repo_root() -> Result<PathBuf, AppError> {
     let output = ProcessCommand::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .stdin(Stdio::null())
@@ -814,4 +968,126 @@ fn relative_display(path: &Path) -> String {
             }
         })
         .unwrap_or_else(|| path.display().to_string())
+}
+
+fn capture_diagnostics(global: &GlobalFlags) -> (serde_json::Value, serde_json::Value) {
+    if cfg!(not(unix)) {
+        // Doctor is available on this platform, but must not probe unsupported
+        // native storage/authority or imply repository approval and delivery.
+        return (
+            serde_json::json!({"supported":false,"storage_paused":true,"reason":"UNSUPPORTED_PLATFORM",
+                "current_repository":{"approved":false,"mapping_current":false,"paused":true,"reason":"UNSUPPORTED_PLATFORM"},
+                "delivery_verified":false,"historical_delivery_verified":null,
+                "usage":{"status":"UNAVAILABLE","reason":"UNSUPPORTED_PLATFORM"}}),
+            serde_json::json!({"installed":false,"loaded":false,"running":false,"stale":false,"state":"UNSUPPORTED_PLATFORM"}),
+        );
+    }
+    let default_worker = serde_json::json!({"installed":false,"loaded":false,"running":false,"stale":false,"state":"UNKNOWN"});
+    let directory = crate::capture_invocations::directory().ok();
+    let Some(directory) = directory else {
+        return (
+            serde_json::json!({"storage_paused":true,"reason":"STORAGE_UNAVAILABLE"}),
+            default_worker,
+        );
+    };
+    let Ok(mut store) = crate::capture::Store::open(&directory) else {
+        return (
+            serde_json::json!({"storage_paused":true,"reason":"STORAGE_UNAVAILABLE"}),
+            default_worker,
+        );
+    };
+    let repository = std::env::current_dir()
+        .ok()
+        .and_then(|path| crate::capture::Repository::resolve(&path).ok());
+    if let Some(repository) = &repository {
+        if store.observe_repository(repository).is_err() {
+            return (
+                serde_json::json!({"storage_paused":true,"reason":"CAPTURE_AUTHORITY_UNAVAILABLE"}),
+                default_worker,
+            );
+        }
+    }
+    let Ok(status) = store.status() else {
+        return (
+            serde_json::json!({"storage_paused":true,"reason":"STORAGE_UNAVAILABLE"}),
+            default_worker,
+        );
+    };
+    let mut capture =
+        serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({"storage_paused":true}));
+    capture["historical_delivery_verified"] = capture["delivery_verified"].clone();
+    capture["delivery_verified"] = serde_json::json!(false);
+    let auth = ResolvedAuth::resolve(global).ok();
+    let origin = crate::config::AppConfig::load()
+        .ok()
+        .map(|config| crate::capture::hash(config.api_base_url().trim_end_matches('/')));
+    let worker = if let Some(repository) = repository {
+        capture["current_repository"] = match store.binding(&repository.key) {
+            Ok(Some(binding)) => {
+                let local_auth_match = auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.workspace_id == binding.workspace_id)
+                    && origin.as_deref() == Some(binding.origin_hash.as_str());
+                serde_json::json!({"approved":!binding.revoked,"paused":binding.paused,"mapping_current":repository.matches_binding(&binding),
+                    "workspace_id":binding.workspace_id,"owner_id":binding.owner_id,"origin_hash":binding.origin_hash,
+                    "delivery_history_verified":store.binding_delivery_history(&binding.id).unwrap_or(false),
+                    "authentication_binding":if local_auth_match {"UNVERIFIED_OWNER"} else {"MISMATCH"}})
+            }
+            _ => serde_json::json!({"approved":false,"reason":"LOCAL_APPROVAL_REQUIRED"}),
+        };
+        crate::capture_supervisor::Supervisor::system()
+            .ok()
+            .and_then(|s| s.status(&repository.key, None).ok())
+            .and_then(|s| serde_json::to_value(s).ok())
+            .unwrap_or(default_worker)
+    } else {
+        capture["current_repository"] =
+            serde_json::json!({"approved":false,"reason":"REPOSITORY_UNAVAILABLE"});
+        default_worker
+    };
+    (capture, worker)
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    fn collect(root: &Path, relative: &Path, paths: &mut BTreeSet<String>) {
+        for item in fs::read_dir(root.join(relative)).unwrap() {
+            let item = item.unwrap();
+            let next = relative.join(item.file_name());
+            if item.file_name() == "__pycache__"
+                || item.path().extension().is_some_and(|ext| ext == "pyc")
+            {
+                continue;
+            }
+            if item.file_type().unwrap().is_dir() {
+                collect(root, &next, paths)
+            } else {
+                paths.insert(next.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    #[test]
+    fn materialized_bundle_is_complete_and_byte_identical_to_all_shipped_sources() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/keito-time-track");
+        let mut source_paths = BTreeSet::new();
+        collect(&source, Path::new(""), &mut source_paths);
+        let embedded: BTreeSet<_> = BUNDLED_SKILL_FILES
+            .iter()
+            .map(|f| f.path.to_owned())
+            .collect();
+        assert_eq!(
+            embedded, source_paths,
+            "A shipped adapter/test/manifest must never disappear from the binary bundle"
+        );
+        let materialized = materialize_bundled_skill().unwrap();
+        for path in source_paths {
+            assert_eq!(
+                fs::read(source.join(&path)).unwrap(),
+                fs::read(materialized.skill_root.join(&path)).unwrap(),
+                "{path}"
+            );
+        }
+    }
 }

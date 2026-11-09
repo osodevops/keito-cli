@@ -1,0 +1,837 @@
+use crate::api::client::KeitorClient;
+use crate::capture::{self, Binding, Clock, Repository, Store, MAX_EVENT_BYTES};
+use crate::cli::capture::{CaptureCommand, CaptureSubcommand, CaptureUsageSubcommand};
+use crate::cli::GlobalFlags;
+use crate::config::{AppConfig, ResolvedAuth};
+use crate::error::AppError;
+use crate::output::OutputMode;
+use serde_json::{json, Value};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+fn directory() -> Result<PathBuf, AppError> {
+    crate::capture_invocations::directory()
+}
+fn current_repo() -> Result<Repository, AppError> {
+    let cwd = std::env::current_dir()
+        .map_err(|_| AppError::Config("Cannot identify working directory".into()))?;
+    Repository::resolve(&cwd)
+}
+fn print(value: Value, quiet: bool) -> Result<(), AppError> {
+    if !quiet {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|_| AppError::Config("Cannot render capture state".into()))?
+        );
+    }
+    Ok(())
+}
+
+struct SetupOptions {
+    agent: Vec<crate::cli::capture::CaptureAgent>,
+    project: String,
+    task: String,
+    selected_client: Option<String>,
+    write_hint: bool,
+    confirm: bool,
+    install_worker: bool,
+}
+async fn setup(
+    options: SetupOptions,
+    global: &GlobalFlags,
+    mapping: &mut Option<crate::capture_mapping::MappingPublication>,
+) -> Result<(), AppError> {
+    let SetupOptions {
+        agent,
+        project,
+        task,
+        selected_client,
+        write_hint,
+        confirm,
+        install_worker,
+    } = options;
+    if !confirm {
+        return Err(AppError::InvalidInput(
+            "Explicit --confirm is required for metadata-only capture consent".into(),
+        ));
+    }
+    capture::identifier(&project)?;
+    capture::identifier(&task)?;
+    let auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
+    let config = AppConfig::load().map_err(sanitize_error)?;
+    let client = KeitorClient::new(&auth, &config.api_base_url())?;
+    let me = client.get_me().await.map_err(sanitize_error)?;
+    if me.is_personal_read_only_sync() {
+        return Err(AppError::Auth(
+            "Capture requires a full-access credential".into(),
+        ));
+    }
+    capture::identifier(&me.id)?;
+    let projects = client.list_projects().await.map_err(sanitize_error)?;
+    if !projects.iter().any(|p| {
+        p.id == project
+            && p.is_active
+            && selected_client
+                .as_ref()
+                .is_none_or(|id| p.client.as_ref().is_some_and(|c| &c.id == id))
+    }) {
+        return Err(AppError::NotFound(
+            "Project unavailable; choose an active accessible project".into(),
+        ));
+    }
+    let tasks = client
+        .list_tasks_for_project(Some(&project))
+        .await
+        .map_err(sanitize_error)?;
+    if !tasks.iter().any(|t| t.id == task && t.is_active) {
+        return Err(AppError::NotFound(
+            "Task unavailable on the selected project".into(),
+        ));
+    }
+    *mapping = if write_hint {
+        let root = crate::commands::skill::git_repo_root()?
+            .canonicalize()
+            .map_err(|_| AppError::Config("Cannot identify canonical Git root".into()))?;
+        Some(crate::capture_mapping::MappingPublication::begin(
+            &root,
+            &crate::capture_mapping::MappingIds {
+                workspace: &auth.workspace_id,
+                client: selected_client.as_deref().ok_or_else(|| {
+                    AppError::InvalidInput("Explicit client is required for --write-hint".into())
+                })?,
+                project: &project,
+                task: &task,
+            },
+        )?)
+    } else {
+        None
+    };
+    tokio::task::yield_now().await;
+    let repo = current_repo()?;
+    if repo.disabled {
+        return Err(AppError::Config(
+            "Repository hint disables capture; enable it before approving".into(),
+        ));
+    }
+    let mut store = Store::open(&directory()?)?;
+    if install_worker && config.api_key.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::Config("The supervised worker requires credentials saved by keito auth login; environment-only credentials are never copied to service settings".into()));
+    }
+    let approved = store.approve(Binding {
+        repository_key: repo.key,
+        remote_hash: repo.remote_hash,
+        hint_hash: repo.hint_hash,
+        id: String::new(),
+        version: 0,
+        workspace_id: auth.workspace_id,
+        owner_id: me.id,
+        origin_hash: capture::hash(config.api_base_url().trim_end_matches('/')),
+        project_id: project,
+        task_id: task,
+        agents: agent
+            .into_iter()
+            .map(|a| a.namespace().to_owned())
+            .collect(),
+        paused: false,
+        revoked: false,
+    })?;
+    let worker = if install_worker {
+        Some(install_worker_service(
+            &approved,
+            &origin_for_worker(&config),
+            &directory()?,
+        )?)
+    } else {
+        None
+    };
+    tokio::task::yield_now().await;
+    if let Some(mapping) = mapping.as_mut() {
+        mapping.commit()?;
+    }
+    print(
+        json!({"status":"approved","worker":worker,"policy":"METADATA_ONLY_OBSERVED_TURNS_V1","binding":approved,
+                "notice":"Only minimized timing metadata leaves this device. Captures require review before charging. Start capture worker for automatic delivery.","usage":"UNAVAILABLE"}),
+        global.quiet,
+    )
+}
+
+async fn setup_cancelled() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut termination) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! { _ = termination.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+pub async fn run(
+    cmd: CaptureCommand,
+    global: &GlobalFlags,
+    _mode: OutputMode,
+) -> Result<(), AppError> {
+    if cfg!(not(unix)) {
+        return Err(AppError::Config(
+            "Automatic capture is unsupported on this platform; manual time commands remain available".into(),
+        ));
+    }
+    match cmd.command {
+        CaptureSubcommand::Usage { command } => match command {
+            CaptureUsageSubcommand::Status { agent, .. } => {
+                let repository = current_repo()?;
+                let mut store = Store::open(&directory()?)?;
+                store.observe_repository(&repository)?;
+                print(
+                    store.numeric_status(&repository, agent.namespace())?,
+                    global.quiet,
+                )
+            }
+            CaptureUsageSubcommand::Disable { agent, .. } => {
+                let repository = current_repo()?;
+                let mut store = Store::open(&directory()?)?;
+                print(
+                    store.disable_numeric(&repository, agent.namespace())?,
+                    global.quiet,
+                )
+            }
+            CaptureUsageSubcommand::Enable {
+                agent,
+                profile_home,
+                harness_executable,
+                native_executable,
+                ..
+            } => {
+                #[cfg(unix)]
+                {
+                    let runtime = crate::capture_runtime_pair::current()?;
+                    let repository = current_repo()?;
+                    let capture_directory = directory()?;
+                    let mut store = Store::open(&capture_directory)?;
+                    let binding = store.numeric_binding(&repository, agent.namespace())?;
+                    let prepared = crate::capture_usage_profile::approve(
+                        crate::capture_usage_profile::ProfileOptions {
+                            directory: &capture_directory,
+                            binding: &binding,
+                            namespace: agent.namespace(),
+                            home: &profile_home,
+                            launcher: &harness_executable,
+                            native: native_executable.as_deref(),
+                            runtime: &runtime,
+                        },
+                    )?;
+                    print(
+                        store.enable_numeric(&repository, agent.namespace(), &prepared)?,
+                        global.quiet,
+                    )
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (agent, profile_home, harness_executable, native_executable);
+                    Err(AppError::Config("Automatic capture is unsupported on this platform; manual time commands remain available".into()))
+                }
+            }
+        },
+        CaptureSubcommand::Hook {
+            agent,
+            event,
+            harness_version,
+        } => {
+            // A malformed/unknown hook must never block coding or echo raw input.
+            let mut boundary_id = None;
+            let invocation_nonce = std::env::var("KEITO_CAPTURE_INVOCATION_NONCE").ok();
+            #[cfg(unix)]
+            let hook_runtime = invocation_nonce
+                .as_ref()
+                .map(|_| {
+                    crate::capture_runtime_pair::HookRuntime::current(
+                        &std::env::var("KEITO_CAPTURE_CORE_SHA256").unwrap_or_default(),
+                    )
+                })
+                .transpose()?;
+            let ack_fd = std::env::var("KEITO_CAPTURE_ACK_FD")
+                .ok()
+                .and_then(|fd| fd.parse::<i32>().ok())
+                .filter(|fd| crate::capture_invocations::protect_ack(*fd).is_ok());
+            let mut accepted_store = None;
+            let result = (|| {
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .take((MAX_EVENT_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| AppError::InvalidInput("Cannot read capture event".into()))?;
+                if bytes.len() > MAX_EVENT_BYTES {
+                    return Err(AppError::InvalidInput(
+                        "Capture input limit exceeded".into(),
+                    ));
+                }
+                let value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| AppError::InvalidInput("Malformed capture event".into()))?;
+                let source_id = value
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AppError::InvalidInput("Missing session identity".into()))?;
+                capture::identifier(source_id)?;
+                let turn_id = value
+                    .get(if agent.namespace() == "claude-code" {
+                        "prompt_id"
+                    } else {
+                        "turn_id"
+                    })
+                    .and_then(Value::as_str);
+                if let Some(turn) = turn_id {
+                    capture::identifier(turn)?;
+                }
+                boundary_id = Some(capture::hash(format!(
+                    "{}\0{}\0{}\0{:?}",
+                    agent.namespace(),
+                    source_id,
+                    turn_id.unwrap_or("no-turn"),
+                    event
+                )));
+                let cwd = value
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AppError::InvalidInput("Missing repository identity".into()))?;
+                let repo = Repository::resolve(Path::new(cwd))?;
+                let mut store = Store::open(&directory()?)?;
+                if let Some(nonce) = &invocation_nonce {
+                    store.hook_invocation(nonce)?;
+                }
+                let signal = capture::Signal {
+                    source: agent.namespace(),
+                    resumed: event == crate::cli::capture::CaptureEvent::SessionStart
+                        && value.get("source").and_then(Value::as_str) == Some("resume"),
+                    source_id,
+                    turn_id,
+                    version: &harness_version,
+                    event,
+                    clock: &Clock::now()?,
+                };
+                #[cfg(unix)]
+                store.event_hook(
+                    &repo,
+                    signal,
+                    value
+                        .get("transcript_path")
+                        .and_then(Value::as_str)
+                        .map(Path::new),
+                    hook_runtime.as_ref(),
+                )?;
+                #[cfg(not(unix))]
+                store.event(&repo, signal)?;
+                accepted_store = Some(store);
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let reason = match error {
+                    AppError::Config(ref message) if message.contains("queue limit") => {
+                        "QUEUE_LIMIT_REACHED"
+                    }
+                    AppError::Config(_) => "STORAGE_UNAVAILABLE",
+                    _ => "BOUNDARY_REFUSED",
+                };
+                let failure_identity = boundary_id
+                    .clone()
+                    .unwrap_or_else(|| capture::hash("UNIDENTIFIED_REFUSED_BOUNDARY"));
+                let saved = directory().ok().is_some_and(|directory| {
+                    capture::record_failure(&directory, &failure_identity, reason).is_ok()
+                });
+                if saved && boundary_id.is_some() {
+                    if let (Some(nonce), Some(fd)) = (&invocation_nonce, ack_fd) {
+                        if let Ok(mut store) = Store::open(&directory()?) {
+                            if store.hook_invocation(nonce).is_ok() {
+                                let _ = store.acknowledge_hook(fd);
+                            }
+                        }
+                    }
+                }
+                eprintln!(
+                    "Keito capture refused this boundary; no time was invented. {}",
+                    if saved {
+                        "A minimized failure marker was saved; inspect capture status and use capture recover --confirm."
+                    } else {
+                        "The boundary could not be saved; inspect local storage and capture status before resuming."
+                    }
+                );
+            } else if let (Some(store), Some(fd)) = (accepted_store, ack_fd) {
+                let _ = store.acknowledge_hook(fd);
+            }
+            Ok(())
+        }
+        CaptureSubcommand::Setup {
+            agent,
+            project,
+            task,
+            client: selected_client,
+            write_hint,
+            confirm,
+            install_worker,
+        } => {
+            let mut mapping: Option<crate::capture_mapping::MappingPublication> = None;
+            let result = tokio::select! {
+                biased;
+                _ = setup_cancelled() => Err(AppError::Config("Capture setup interrupted; inspect local approval before retrying".into())),
+                result = setup(SetupOptions {agent, project, task, selected_client, write_hint, confirm, install_worker}, global, &mut mapping) => result,
+            };
+            if result.is_err() {
+                if let Some(mapping) = mapping.as_mut() {
+                    mapping.rollback()?;
+                }
+            }
+            result
+        }
+        CaptureSubcommand::Status => {
+            let mut store = Store::open(&directory()?)?;
+            let repository = current_repo();
+            if let Ok(repository) = &repository {
+                store.observe_repository(repository)?;
+            }
+            let mut value = serde_json::to_value(store.status()?)
+                .map_err(|_| AppError::Config("Cannot render capture status".into()))?;
+            value["current_repository"] = match repository {
+                Ok(repo) => match store.binding(&repo.key)? {
+                    Some(b) => {
+                        json!({"approved":!b.revoked,"paused":b.paused,"mapping_current":repo.matches_binding(&b),"binding_id":b.id})
+                    }
+                    None => json!({"approved":false,"reason":"LOCAL_APPROVAL_REQUIRED"}),
+                },
+                Err(_) => json!({"approved":false,"reason":"REPOSITORY_UNAVAILABLE"}),
+            };
+            print(value, global.quiet)
+        }
+        CaptureSubcommand::Recover { confirm } => {
+            if !confirm {
+                return Err(AppError::InvalidInput(
+                    "Explicit confirmation is required before acknowledging refused boundaries"
+                        .into(),
+                ));
+            }
+            let mut store = Store::open(&directory()?)?;
+            store.recover(&Clock::now()?)?;
+            print(
+                json!({"status":"recovered","notice":"Unfinished intervals were marked incomplete. Potentially affected frozen complete revisions remain held for review; recovery does not release uncertain evidence."}),
+                global.quiet,
+            )
+        }
+        CaptureSubcommand::Preview { session } => {
+            let store = Store::open(&directory()?)?;
+            print(json!({"sessions":store.preview(&session)?}), global.quiet)
+        }
+        CaptureSubcommand::Sync => {
+            let result = sync(global).await?;
+            print(result, global.quiet)
+        }
+        CaptureSubcommand::Worker {
+            interval_seconds,
+            expected_runtime_hash,
+        } => {
+            // Foreground supervisor: launchd/systemd/the operator owns lifetime. A
+            // detached hook child is never the sole delivery/durability mechanism.
+            loop {
+                if let Some(expected) = &expected_runtime_hash {
+                    verify_runtime_hash(expected)?;
+                }
+                let _ = sync(global).await;
+                tokio::select! { _ = tokio::signal::ctrl_c() => break, _ = tokio::time::sleep(Duration::from_secs(interval_seconds)) => {} }
+            }
+            Ok(())
+        }
+        CaptureSubcommand::WorkerStatus { all } => {
+            if all {
+                let value = match crate::capture_supervisor::Supervisor::system() {
+                    Ok(supervisor) => json!({"workers":supervisor.list()?}),
+                    Err(_) => json!({"supported":false,"workers":[]}),
+                };
+                return print(value, global.quiet);
+            }
+            let value = match (
+                current_repo(),
+                crate::capture_supervisor::Supervisor::system(),
+            ) {
+                (Ok(repo), Ok(supervisor)) => {
+                    let executable = std::env::current_exe()
+                        .map_err(|_| AppError::Config("Cannot identify worker runtime".into()))?;
+                    let cwd = std::env::current_dir().map_err(|_| {
+                        AppError::Config("Cannot identify worker repository".into())
+                    })?;
+                    let mut store = Store::open(&directory()?)?;
+                    store.observe_repository(&repo)?;
+                    let binding = store.binding(&repo.key)?;
+                    let config = AppConfig::load().map_err(sanitize_error)?;
+                    let origin = config.api_base_url();
+                    let capture_home = directory()?;
+                    let expected =
+                        binding
+                            .as_ref()
+                            .map(|binding| crate::capture_supervisor::WorkerConfig {
+                                repository_key: &repo.key,
+                                repository_root: &cwd,
+                                executable: &executable,
+                                capture_home: &capture_home,
+                                workspace_id: &binding.workspace_id,
+                                api_origin: &origin,
+                            });
+                    serde_json::to_value(supervisor.status(&repo.key, expected.as_ref())?)
+                        .map_err(|_| AppError::Config("Cannot inspect worker service".into()))?
+                }
+                _ => {
+                    json!({"supported":cfg!(target_os="macos"),"installed":false,"running":false,"stale":false})
+                }
+            };
+            print(value, global.quiet)
+        }
+        CaptureSubcommand::WorkerUninstall { worker_id, .. } => {
+            let key = if let Some(id) = worker_id {
+                if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(AppError::InvalidInput("Invalid worker identity".into()));
+                }
+                id
+            } else {
+                current_repo()?.key
+            };
+            let supervisor = crate::capture_supervisor::Supervisor::system()?;
+            print(
+                serde_json::to_value(supervisor.uninstall(&key)?)
+                    .map_err(|_| AppError::Config("Cannot inspect worker service".into()))?,
+                global.quiet,
+            )
+        }
+        CaptureSubcommand::Pause { .. }
+        | CaptureSubcommand::Resume { .. }
+        | CaptureSubcommand::Disable { .. } => {
+            let action = match cmd.command {
+                CaptureSubcommand::Pause { .. } => "pause",
+                CaptureSubcommand::Resume { .. } => "resume",
+                _ => "disable",
+            };
+            let repo = current_repo()?;
+            let mut store = Store::open(&directory()?)?;
+            store.control(&repo, action, &Clock::now()?)?;
+            print(
+                json!({"status":action,"binding":store.binding(&repo.key)?}),
+                global.quiet,
+            )
+        }
+        CaptureSubcommand::DisableAll => {
+            let mut store = Store::open(&directory()?)?;
+            store.disable_all()?;
+            print(
+                json!({"status":"disabled_all","notice":"Unsent evidence retained; no further uploads are authorized"}),
+                global.quiet,
+            )
+        }
+    }
+}
+
+async fn sync(global: &GlobalFlags) -> Result<Value, AppError> {
+    let mut store = Store::open(&directory()?)?;
+    store.maintain(UtcClock::seconds())?;
+    let repo = current_repo()?;
+    store.observe_repository(&repo)?;
+    let Some(binding) = store.binding(&repo.key)? else {
+        return Ok(json!({"accepted":0,"held":0,"reason":"LOCAL_APPROVAL_REQUIRED"}));
+    };
+    if !repo.matches_binding(&binding) || binding.paused || binding.revoked {
+        return Ok(json!({"accepted":0,"held":1,"reason":"BINDING_REAPPROVAL_REQUIRED"}));
+    }
+    if !store.has_ready(&binding, UtcClock::seconds())? {
+        return Ok(json!({"accepted":0,"held":0,"pending":store.status()?.pending}));
+    }
+    let auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
+    let config = AppConfig::load().map_err(sanitize_error)?;
+    let origin = config.api_base_url();
+    if binding.workspace_id != auth.workspace_id
+        || binding.origin_hash != capture::hash(origin.trim_end_matches('/'))
+    {
+        return Ok(json!({"accepted":0,"held":1,"reason":"BINDING_REAPPROVAL_REQUIRED"}));
+    }
+    let client = KeitorClient::new(&auth, &origin)?;
+    let me = client.get_me().await.map_err(sanitize_error)?;
+    if binding.owner_id != me.id {
+        return Ok(json!({"accepted":0,"held":1,"reason":"BINDING_REAPPROVAL_REQUIRED"}));
+    }
+    let mut accepted = 0;
+    let mut held = 0;
+    let mut retryable = 0;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| AppError::Network("Cannot initialize capture transport".into()))?;
+    // A sync invocation has bounded work; queued revisions remain durable.
+    for _ in 0..100 {
+        let current_repository = current_repo()?;
+        store.observe_repository(&current_repository)?;
+        let current_auth = ResolvedAuth::resolve(global).map_err(sanitize_error)?;
+        let current_origin = AppConfig::load().map_err(sanitize_error)?.api_base_url();
+        if current_repository.key != binding.repository_key
+            || !current_repository.matches_binding(&binding)
+            || current_auth.workspace_id != auth.workspace_id
+            || current_auth.api_key != auth.api_key
+            || current_origin.trim_end_matches('/') != origin.trim_end_matches('/')
+        {
+            held += 1;
+            break;
+        }
+        let now = UtcClock::seconds();
+        let Some(row) = store.claim(&binding, now)? else {
+            break;
+        };
+        if store.status()?.storage_paused || store.invocations_pending()? {
+            break;
+        }
+        // Current consent was checked atomically at claim. The server rechecks
+        // authority before accepting every revision and replay.
+        let response = http
+            .post(format!(
+                "{}/api/v2/agent-sessions",
+                origin.trim_end_matches('/')
+            ))
+            .header("Authorization", format!("Bearer {}", auth.api_key))
+            .header("Keito-Account-Id", &auth.workspace_id)
+            .header("Content-Type", "application/json")
+            .header("Idempotency-Key", &row.hash)
+            .header("X-Keito-Client", "cli")
+            .header("X-Keito-Client-Version", env!("CARGO_PKG_VERSION"))
+            .body(row.body.clone())
+            .send()
+            .await;
+        match response {
+            Err(_) => {
+                store.finish(&row, "pending", "NETWORK_UNAVAILABLE", now, None)?;
+                retryable += 1;
+                break;
+            }
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|h| retry_after_delay(h, now));
+                if (200..300).contains(&status) {
+                    // Read bounded acknowledgements; never persist server prose.
+                    if response.content_length().is_some_and(|n| n > 64 * 1024) {
+                        store.finish(&row, "pending", "INVALID_ACKNOWLEDGEMENT", now, None)?;
+                        retryable += 1;
+                        break;
+                    }
+                    let acknowledgement = bounded_ack(response).await.and_then(|value| {
+                        serde_json::from_value::<AcknowledgementEnvelope>(value).ok()
+                    });
+                    if let Some(ack) = acknowledgement.filter(|a| a.agent_session.valid(&row)) {
+                        store.acknowledge(&row, &ack.agent_session.id, now)?;
+                        accepted += 1;
+                    } else {
+                        store.finish(&row, "pending", "INVALID_ACKNOWLEDGEMENT", now, None)?;
+                        retryable += 1;
+                        break;
+                    }
+                } else if status == 429 || status >= 500 {
+                    store.finish(
+                        &row,
+                        "pending",
+                        if status == 429 {
+                            "RATE_LIMITED"
+                        } else {
+                            "SERVER_UNAVAILABLE"
+                        },
+                        now,
+                        retry_after,
+                    )?;
+                    retryable += 1;
+                    break;
+                } else {
+                    let body = bounded_ack(response).await;
+                    let code = body.as_ref().and_then(safe_error_code);
+                    if status == 409 && matches!(code, Some("in_progress" | "projection_pending")) {
+                        store.finish(
+                            &row,
+                            "pending",
+                            if code == Some("in_progress") {
+                                "IN_PROGRESS"
+                            } else {
+                                "PROJECTION_PENDING"
+                            },
+                            now,
+                            retry_after,
+                        )?;
+                        retryable += 1;
+                        break;
+                    }
+                    let reason = match status {
+                        401 => "NEEDS_AUTH",
+                        403 => "FORBIDDEN_OR_DISABLED",
+                        404 => "MAPPING_OR_API_UNAVAILABLE",
+                        409 => "REVISION_CONFLICT",
+                        413 => "PAYLOAD_LIMIT",
+                        _ => "REQUEST_REJECTED",
+                    };
+                    let state = if matches!(status, 401 | 403 | 404) {
+                        "pending"
+                    } else {
+                        "held"
+                    };
+                    store.finish(&row, state, reason, now, retry_after.or(Some(60)))?;
+                    held += 1;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(
+        json!({"accepted":accepted,"held":held,"retryable":retryable,"pending":store.status()?.pending}),
+    )
+}
+struct UtcClock;
+impl UtcClock {
+    fn seconds() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+
+async fn bounded_ack(mut response: reqwest::Response) -> Option<Value> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len().checked_add(chunk.len())? > 64 * 1024 {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).ok()
+}
+
+fn origin_for_worker(config: &AppConfig) -> String {
+    config.api_base_url()
+}
+fn install_worker_service(
+    binding: &Binding,
+    origin: &str,
+    capture_home: &Path,
+) -> Result<crate::capture_supervisor::WorkerStatus, AppError> {
+    let supervisor = crate::capture_supervisor::Supervisor::system()?;
+    let cwd = std::env::current_dir()
+        .map_err(|_| AppError::Config("Cannot identify worker repository".into()))?;
+    let executable = std::env::current_exe()
+        .map_err(|_| AppError::Config("Cannot identify CLI runtime".into()))?;
+    let config = crate::capture_supervisor::WorkerConfig {
+        repository_key: &binding.repository_key,
+        repository_root: &cwd,
+        executable: &executable,
+        capture_home,
+        workspace_id: &binding.workspace_id,
+        api_origin: origin,
+    };
+    supervisor.install(&config)
+}
+
+fn sanitize_error(error: AppError) -> AppError {
+    match error {
+        AppError::Auth(_) => AppError::Auth(
+            "Capture preflight needs valid current credentials and workspace permission".into(),
+        ),
+        AppError::RateLimited {
+            retry_after_seconds,
+        } => AppError::RateLimited {
+            retry_after_seconds,
+        },
+        AppError::Network(_) => AppError::Network(
+            "Capture preflight network unavailable; frozen evidence retained".into(),
+        ),
+        AppError::NotFound(_) => AppError::NotFound(
+            "Capture mapping unavailable; review the selected project and task".into(),
+        ),
+        AppError::Conflict(_) => {
+            AppError::Conflict("Capture preflight conflicted; review current authority".into())
+        }
+        AppError::InvalidInput(_) => {
+            AppError::InvalidInput("Capture preflight rejected the request".into())
+        }
+        AppError::Config(_)=>AppError::Config("Capture configuration unavailable; repair local settings without printing their contents".into()),
+        _ => AppError::ServerError(
+            "Capture preflight unavailable; no response content retained".into(),
+        ),
+    }
+}
+
+fn verify_runtime_hash(expected: &str) -> Result<(), AppError> {
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AppError::InvalidInput(
+            "Invalid expected runtime digest".into(),
+        ));
+    }
+    let path = std::env::current_exe()
+        .map_err(|_| AppError::Config("Cannot verify worker runtime".into()))?;
+    let bytes =
+        std::fs::read(path).map_err(|_| AppError::Config("Cannot verify worker runtime".into()))?;
+    if capture::hash(bytes) != expected {
+        return Err(AppError::Config("Capture worker runtime changed; explicitly reinstall the reviewed worker before delivery".into()));
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct AcknowledgementEnvelope {
+    agent_session: Acknowledgement,
+}
+#[derive(serde::Deserialize)]
+struct Acknowledgement {
+    id: String,
+    revision: i64,
+    projection_state: String,
+    review_state: String,
+}
+impl Acknowledgement {
+    fn valid(&self, row: &capture::Queued) -> bool {
+        capture::identifier(&self.id).is_ok()
+            && self.revision == row.revision
+            && matches!(self.projection_state.as_str(), "PENDING" | "PROJECTED")
+            && matches!(
+                self.review_state.as_str(),
+                "PENDING" | "APPROVED" | "EXCLUDED" | "NEEDS_ATTENTION" | "NEEDS_MAPPING"
+            )
+            && row
+                .canonical_server_id
+                .as_deref()
+                .is_none_or(|id| id == self.id)
+    }
+}
+fn safe_error_code(body: &Value) -> Option<&str> {
+    body.get("reason")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            body.get("error")
+                .and_then(|v| v.get("code"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| body.get("code").and_then(Value::as_str))
+        .filter(|v| {
+            matches!(
+                *v,
+                "in_progress"
+                    | "projection_pending"
+                    | "revision_conflict"
+                    | "mapping_invalid"
+                    | "needs_auth"
+                    | "review_required"
+                    | "forbidden_payload"
+                    | "unsupported_schema"
+            )
+        })
+}
+fn retry_after_delay(header: &str, now: i64) -> Option<i64> {
+    header
+        .parse::<i64>()
+        .ok()
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc2822(header)
+                .ok()
+                .map(|date| date.timestamp().saturating_sub(now))
+        })
+        .map(|seconds| seconds.clamp(1, 3600))
+}

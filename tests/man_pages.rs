@@ -1,3 +1,4 @@
+#![cfg(feature = "dev-tools")]
 #![allow(deprecated)]
 
 use assert_cmd::Command;
@@ -7,6 +8,19 @@ use std::fs;
 const EXPECTED_PAGES: &[&str] = &[
     "keito.1",
     "keito-help.1",
+    "keito-capture.1",
+    "keito-capture-setup.1",
+    "keito-capture-worker.1",
+    "keito-capture-worker-status.1",
+    "keito-capture-worker-uninstall.1",
+    "keito-capture-status.1",
+    "keito-capture-preview.1",
+    "keito-capture-sync.1",
+    "keito-capture-hook.1",
+    "keito-capture-pause.1",
+    "keito-capture-resume.1",
+    "keito-capture-disable.1",
+    "keito-capture-disable-all.1",
     "keito-auth.1",
     "keito-auth-help.1",
     "keito-auth-login.1",
@@ -26,8 +40,10 @@ const EXPECTED_PAGES: &[&str] = &[
     "keito-skill.1",
     "keito-skill-help.1",
     "keito-skill-doctor.1",
+    "keito-skill-uninstall.1",
     "keito-skill-install.1",
     "keito-skill-status.1",
+    "keito-skill-runtime.1",
     "keito-skill-team-init.1",
     "keito-time.1",
     "keito-time-help.1",

@@ -7,7 +7,7 @@ uses the CLI for authentication and API writes, then installs Claude Code /
 Codex lifecycle hooks so local coding sessions can be logged automatically.
 
 EXAMPLES:
-  keito skill install
+  keito skill install --agent claude-code --agent codex
   keito skill install --agent codex
   keito skill team-init optional
   keito skill status --json
@@ -21,10 +21,11 @@ pub struct SkillCommand {
 pub enum SkillSubcommand {
     /// Install the Keito Skill and configure supported agent hooks
     #[command(long_about = "\
-Install the Keito Skill with the pinned open skills installer package, then run
-the installed hook installer for each selected agent.
+Install the bundled Keito Skill and selected lifecycle hooks with the native Rust
+installer and verified official CLI/guard release pair. External --source values
+use the pinned open skills installer to fetch the payload before native registration.
 
-By default this configures both Codex and Claude Code. The skill still needs
+Choose explicit --agent targets in scripts, or select targets interactively. The skill still needs
 per-repository setup after installation: cd into a client repo and run
 /track-time-keito to select its Keito client, project, and task.")]
     Install {
@@ -36,16 +37,33 @@ per-repository setup after installation: cd into a client repo and run
         #[arg(long, value_enum)]
         agent: Vec<SkillAgent>,
 
-        /// Skip the skills installer and only run hook installers if present
+        /// Reuse an existing skill payload for native hook installation
         #[arg(long)]
         skip_skills_add: bool,
+
+        /// Confirm migration of integration-owned legacy plugin/direct hooks
+        #[arg(long)]
+        confirm_migration: bool,
     },
+
+    /// Remove only selected integration-owned adapters, preserving unrelated configuration
+    Uninstall {
+        #[arg(long, value_enum, required = true)]
+        agent: Vec<SkillAgent>,
+    },
+
+    /// Verify the release-bound native runtime pair without changing local state
+    Runtime,
 
     /// Show install/auth/hook status for the Keito Skill
     Status,
 
     /// Run readiness checks and print next actions
-    Doctor,
+    Doctor {
+        /// Verify live authentication without submitting capture evidence
+        #[arg(long)]
+        live: bool,
+    },
 
     /// Add repo-level Keito tracking guidance for agent teammates
     #[command(long_about = "\

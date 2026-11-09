@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod capture;
 pub mod clients;
 pub mod projects;
 pub mod skill;
@@ -97,6 +98,8 @@ this value in Keito under Settings > API & Developers > Company ID."
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
+    /// Capture opted-in coding activity for review before charging
+    Capture(capture::CaptureCommand),
     /// Manage authentication (login, logout, status, whoami)
     Auth(auth::AuthCommand),
     /// Browse clients

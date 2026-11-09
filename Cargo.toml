@@ -1,7 +1,8 @@
 [package]
 name = "keito-cli"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
+default-run = "keito"
 description = "AI agent time tracking CLI for Keito: capture billable human and agent work for client billing, agency projects, and AI-native services"
 license = "MIT"
 repository = "https://github.com/osodevops/keito-cli"
@@ -19,23 +20,46 @@ name = "keito"
 path = "src/main.rs"
 
 [[bin]]
+name = "keito-capture-guard"
+path = "src/bin/keito-capture-guard.rs"
+
+[[bin]]
 name = "gen-man"
 path = "src/bin/gen-man.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "qualify-capture"
+path = "src/bin/qualify-capture.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "check-service-boundary"
+path = "src/bin/check-service-boundary.rs"
+required-features = ["dev-tools"]
+
+[features]
+dev-tools = []
 
 [dependencies]
+base64 = "0.22.1"
 clap = { version = "4", features = ["derive", "env", "string"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
-tabled = "0.21"
+tabled = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 thiserror = "2"
 colored = "3"
 dialoguer = "0.12"
 clap_mangen = "0.3"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+sha2 = "0.11.1"
+libc = "0.2.191"
+serde-saphyr = { version = "2.1.1", default-features = false, features = ["deserialize"] }
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -41,7 +41,7 @@ brew install osodevops/tap/keito
 
 ### GitHub Releases
 
-Download the latest binary from [Releases](https://github.com/osodevops/keito-cli/releases) for your platform (macOS, Linux, Windows).
+Download the latest archive from [Releases](https://github.com/osodevops/keito-cli/releases) for your platform (macOS, Linux, Windows). On macOS/Linux, keep `keito`, `keito-capture-guard`, and `capture-runtime-manifest.json` together. Verify the archive against `SHA256SUMS`, then run `keito skill runtime --json` to check the release-bound pair before installing capture. Windows supports manual CLI commands; native capture is unqualified.
 
 ### Build from Source
 
@@ -52,7 +52,7 @@ cargo build --release
 # binary at target/release/keito
 ```
 
-Requires Rust 1.75+.
+Requires a current stable Rust toolchain. Source and `cargo install keito-cli --bin keito --bin keito-capture-guard` builds support manual commands; native capture requires the official release pair whose finalized guard hash is embedded by the release workflow. No local manifest can substitute for that release anchor.
 
 ## Setup
 
@@ -118,20 +118,22 @@ Exit codes tell you exactly what happened — no need to parse error messages. S
 
 The Keito Agent Skill ships with this CLI. It brings Keito to the places where
 agents already work by installing lifecycle hooks for Claude Code and OpenAI
-Codex CLI, then recording one `source=agent` time entry when a tracked coding
-session ends.
+Codex CLI. The capture runtime records exact observed turn intervals in a
+private local queue and sends canonical pending-review evidence. An authorized
+reviewer must explicitly approve any client charge. See [capture setup and
+qualification](docs/capture.md); new capture availability depends on server eligibility.
 
 ### Requirements
 
 - Claude Code and/or Codex CLI
-- Git, Bash, and `jq`
+- Git, Bash, and the official paired `keito` / `keito-capture-guard` release
 - Keito credentials via `keito auth login` or `KEITO_API_KEY` +
   `KEITO_ACCOUNT_ID`
 - macOS/Linux: `./setup` can install the CLI through Homebrew or release
   tarballs if `keito` is not already on `PATH`
 - Windows: install the binary from
   [Releases](https://github.com/osodevops/keito-cli/releases) first, then run
-  the skill commands from Git Bash or WSL where `bash` and `jq` are available
+  manual timer commands; automatic capture and supervision require platform qualification
 
 ### Ask Your Agent to Install Keito
 
@@ -163,8 +165,8 @@ cd ~/.keito/keito-cli
 
 `./setup` installs the CLI if needed, installs the bundled `keito-time-track`
 skill, and configures hooks for Claude Code, Codex, or both. In an interactive
-terminal it asks which host to configure. In non-interactive runs it defaults
-to both.
+terminal it asks which host to configure. Non-interactive runs require an explicit
+`--host claude`, `--host codex`, or `--host both`.
 
 Target one host explicitly when needed:
 
@@ -178,7 +180,7 @@ If the CLI is already installed, this equivalent command uses the bundled skill
 without the source checkout:
 
 ```sh
-keito skill install
+keito skill install --agent claude-code --agent codex
 ```
 
 Choose one target when needed:
@@ -245,18 +247,26 @@ created by `/track-time-keito`.
 
 - `./setup` is the gstack-style source-checkout installer. It keeps a stable
   checkout at `~/.keito/keito-cli`, installs the CLI if needed, then calls
-  `keito skill install --source bundled`.
+  `keito skill install --source bundled --agent <target>`.
 - `keito skill install` materializes the bundled `keito-time-track` skill and
   copies it into agent home directories:
   `~/.claude/skills/keito-time-track` for Claude Code and
   `~/.codex/skills/keito-time-track` for Codex.
 - The hook installers merge lifecycle hooks into `~/.claude/settings.json` and
-  `~/.codex/hooks.json` using `jq`.
+  `~/.codex/hooks.json` using the native Rust installer. Trust remains a
+  separate harness decision; an installed adapter is not a verified delivery.
 - `/track-time-keito` verifies auth, asks for the Keito client/project/task for
   the current repo, and writes `.keito/config.yml`.
-- On agent session start, the hook records local session state. On session end,
-  the hook logs one Keito time entry with `source=agent` and metadata such as
-  repo path, branch, commit, and agent type.
+- Prompt/Stop hooks checkpoint each supported turn through the deterministic
+  CLI core. They discard prompts, assistant prose, transcripts, code and raw
+  local paths before persistence. A supervised worker sends frozen revisions;
+  retrying never increases their duration. Repository config is only a hint;
+  local consent is stored separately, and new captures remain nonbillable
+  pending review. Timing consent is metadata-only. Separate `capture usage
+  enable` consent can admit partial request observations from an approved native
+  harness and exact active source; provider expenditure remains unknown. See
+  [numeric usage consent](docs/capture.md#separate-numeric-usage-consent) for the
+  supported-version and qualification limits.
 
 ### Distribution Model
 
@@ -273,7 +283,7 @@ Audit-first external install remains available:
 
 ```sh
 npx --yes skills@1.5.6 add osodevops/keito-skill -g -a codex -a claude-code -s keito-time-track -y --copy
-keito skill install --skip-skills-add
+keito skill install --skip-skills-add --agent claude-code --agent codex
 ```
 
 ## Features
@@ -399,10 +409,25 @@ cargo test --all-targets
 ### Generate Man Pages
 
 ```sh
-cargo run --bin gen-man
+cargo run --features dev-tools --bin gen-man
 man ./man/keito.1
 ```
 
 ## License
 
 [MIT](LICENSE)
+
+### Protected macOS tests
+
+Prepare locked dependencies with `cargo fetch --locked`, then run macOS CLI tests
+with `KEITO_TEST_REAL_PROFILE_HOME="$HOME" tests/run-macos-isolated.sh`.
+CI performs this explicit preparation before the offline boundary, so cache hits
+are an optimization rather than a prerequisite.
+The runner proves one inherited kernel policy using owned native marker and alias
+executables plus an allowed control, then permits loopback fixtures while denying
+execution of the real service utility. Doctor and transport assertions remain active.
+Their test command builders require a source/hash-bound owned proof receipt and
+recheck denial with an inert marker before spawning the CLI; plain unprotected
+macOS test runs fail before a service observation can execute. No production
+supervisor override or test bypass flag is exposed. Profile access is limited to
+before/after hashes of the three configuration anchors.

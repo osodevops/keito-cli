@@ -66,10 +66,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --all-targets
+        run: cargo test --all-features --all-targets
 
       - name: Build release binary
         run: cargo build --release
@@ -81,7 +81,7 @@ jobs:
 
       - name: Verify generated man pages
         run: |
-          cargo run --bin gen-man -- /tmp/keito-man
+          cargo run --features dev-tools --bin gen-man -- /tmp/keito-man
           test -s /tmp/keito-man/keito.1
           test -s /tmp/keito-man/keito-auth-login.1
           test -s /tmp/keito-man/keito-time-stop.1
@@ -102,7 +102,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: x86_64-pc-windows-msvc
@@ -131,20 +131,44 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-release-build-
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      # The companion is finalized first. Any future signing/notarization must
+      # finish here, before its bytes are anchored in the main executable.
+      - name: Build final native guard
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin keito-capture-guard
+
+      - name: Build release-bound core and manifest
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then suffix=".exe"; fi
+          release_dir="target/${{ matrix.target }}/release"
+          guard_hash=$(sha256sum "$release_dir/keito-capture-guard$suffix" | awk '{print $1}')
+          KEITO_RELEASE_GUARD_SHA256="$guard_hash" cargo build --locked --release --target ${{ matrix.target }} --bin keito
+          core_hash=$(sha256sum "$release_dir/keito$suffix" | awk '{print $1}')
+          printf '{"manifest_contract":1,"version":"%s","target":"%s","guard_contract":1,"files":{"keito%s":"%s","keito-capture-guard%s":"%s"}}\n' \
+            "${RELEASE_TAG#v}" "${{ matrix.target }}" "$suffix" "$core_hash" "$suffix" "$guard_hash" > "$release_dir/capture-runtime-manifest.json"
 
       - name: Package Unix
         if: runner.os != 'Windows'
         run: |
           cd "target/${{ matrix.target }}/release"
-          tar czf "${GITHUB_WORKSPACE}/keito-${{ matrix.target }}.tar.gz" keito
+          tar czf "${GITHUB_WORKSPACE}/keito-${{ matrix.target }}.tar.gz" keito keito-capture-guard capture-runtime-manifest.json
 
       - name: Package Windows
         if: runner.os == 'Windows'
         run: |
           cd "target/${{ matrix.target }}/release"
-          7z a "${GITHUB_WORKSPACE}/keito-${{ matrix.target }}.zip" keito.exe
+          7z a "${GITHUB_WORKSPACE}/keito-${{ matrix.target }}.zip" keito.exe keito-capture-guard.exe capture-runtime-manifest.json
+
+      - name: Qualify fresh packaged Unix pair
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          qualification_root=$(mktemp -d)
+          qualification_root=$(cd "$qualification_root" && pwd -P)
+          mkdir "$qualification_root/extracted"
+          tar -xzf "keito-${{ matrix.target }}.tar.gz" -C "$qualification_root/extracted"
+          KEITO_TEST_REAL_PROFILE_HOME="$HOME" scripts/qualify-capture-artifact.sh "$qualification_root/extracted" "$qualification_root"
 
       - name: Upload packaged asset
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -181,6 +205,9 @@ jobs:
             echo "::error::CHANGELOG.md has no release notes for ${VERSION}."
             exit 1
           fi
+
+      - name: Checksum release archives
+        run: cd dist && sha256sum keito-*.tar.gz keito-*.zip > SHA256SUMS
 
       - name: Publish GitHub release
         env:
@@ -258,11 +285,12 @@ jobs:
             end
 
             def install
-              bin.install "keito"
+              bin.install "keito", "keito-capture-guard", "capture-runtime-manifest.json"
             end
 
             test do
               assert_match "keito #{version}", shell_output("#{bin}/keito --version")
+              assert_match '"guard_contract":1', shell_output("#{bin}/keito skill runtime --json")
             end
           end
           FORMULA

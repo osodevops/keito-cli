@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "scope": "Developer-QA protocol component; process cleanup integration remains open",
+  "component_commit": "6c5d1b0b6e2cd6f14091095a87a1da5a6dcfa17f",
+  "prior_component": "b2ac4ae2dd43640239009957b33b66da013dbd6e",
+  "published_base": "76acc97771d2f98a05914216330469c3ba23ffe8",
+  "parent_first_red": {
+    "original_r13_python": "2pass/8fail",
+    "original_r13_rust": "2pass/4fail",
+    "original_unchanged_r17_reviewer_cases": "1pass/3fail",
+    "expanded_r17": "31methods; failures9 including subtests; errors1 from unnormalized shutdown OSError"
+  },
+  "parent_current_python": {
+    "main": 34,
+    "preserved_reviewer_cases": 4
+  },
+  "reused_rust_checks": {
+    "source_commit": "b2ac4ae2dd43640239009957b33b66da013dbd6e",
+    "rust_units_passed": 18,
+    "unrelated_filtered": 153,
+    "default_all_targets_check": "PASS",
+    "all_feature_all_targets_clippy_warnings_denied": "PASS",
+    "relevant_rust_source_and_vector_blobs_unchanged_at_reviewed_commit": true,
+    "exact_new_head_full_ci_claim": false
+  },
+  "independent_review": {
+    "id": "protocol-r18-independent-source-and-socket-only",
+    "verdict": "APPROVE",
+    "scope": "Developer-QA protocol component ONLY",
+    "blocking_findings": [],
+    "first_attempt_tests": {
+      "checked_in_main": 34,
+      "preserved_r17_cases": 4,
+      "new_independent_methods": 10
+    },
+    "retries": 0,
+    "report_sha256": "108495c5228a1306fbf3079d2accb0be6646a11a353e52e20fd678ad6ba06fd1",
+    "verdict_sha256": "37ab57ba50e0f125661a774361dfe0e3ef6bc1945cf4ed2597b3ca1ffbbae40b"
+  },
+  "reviewer_packaging_limit": "First own-file mode assertion found0644 files inside0700 directory; only own evidence permissions corrected to0600, bytes/assertions/results unchanged, no test reruns.",
+  "first_failures_retained": true,
+  "execution_scope": "Finite Unix sockets and fake managers only; no in-suite child actors, threads, signals, profiles or provider requests.",
+  "installed_python_runtime": false,
+  "production_behavior_changed_by_protocol_component": false,
+  "CLIProxyCLI_changed": false,
+  "whole_process_cleanup_qualified": false,
+  "real_harness_numeric_p0b_qualified": false,
+  "release_qualified": false,
+  "open_gates": [
+    "cooperative controlled source owners and actual old-runner/native/guardian/core integration",
+    "GroupLease/opaque Git/sysctl/BOTH version probes/Python tools",
+    "actual direct waits, reserved-group absence, terminal EOF and cancellation before wait",
+    "actual nested LIVE start/result receipt faults",
+    "default release FIRST/p95 and full source-pair/broader CI",
+    "BOTH actual Claude2.1.319/Codex0.167.0 current Mac FULL numeric P0-B",
+    "provider/auth budget, clean install, image/manifest/runtime/worker/browser",
+    "canonical API/PostgreSQL/financial invariants",
+    "two rehearsals, guarded release and pilot availability"
+  ]
+}
