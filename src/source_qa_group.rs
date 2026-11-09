@@ -139,6 +139,9 @@ impl Progress {
 /// must not authorize the keeper's next query/signal step.
 enum Receive {
     Frame(String),
+    // A whole rejected line was consumed; its known boundary permits bounded
+    // failure-only draining. This is NOT evidence of transport quiescence.
+    Rejected(&'static str),
     Quiescent,
     Eof,
     BudgetYield,
@@ -204,13 +207,16 @@ impl<S: Read + Write> Channel<S> {
             if let Some(end) = self.pending.iter().position(|v| *v == b'\n') {
                 let line: Vec<_> = self.pending.drain(..=end).collect();
                 if line.len() > MAX_FRAME || !line.is_ascii() {
-                    return Err(refused("GROUP_FRAME"));
+                    return Ok(Receive::Rejected("GROUP_FRAME"));
                 }
-                let text = std::str::from_utf8(&line[..line.len() - 1])
-                    .map_err(|_| refused("GROUP_FRAME"))?;
-                let (nonce, body) = text.split_once('|').ok_or_else(|| refused("GROUP_FRAME"))?;
+                let Ok(text) = std::str::from_utf8(&line[..line.len() - 1]) else {
+                    return Ok(Receive::Rejected("GROUP_FRAME"));
+                };
+                let Some((nonce, body)) = text.split_once('|') else {
+                    return Ok(Receive::Rejected("GROUP_FRAME"));
+                };
                 if nonce != self.nonce || body.contains('\r') {
-                    return Err(refused("GROUP_NONCE"));
+                    return Ok(Receive::Rejected("GROUP_NONCE"));
                 }
                 return Ok(Receive::Frame(body.to_owned()));
             }
@@ -234,7 +240,11 @@ impl<S: Read + Write> Channel<S> {
                     self.pending.extend_from_slice(&bytes[..n]);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(Receive::Quiescent)
+                    return Ok(if self.pending.is_empty() {
+                        Receive::Quiescent
+                    } else {
+                        Receive::BudgetYield
+                    })
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => return Err(refused("GROUP_READ")),
@@ -247,6 +257,7 @@ impl<S: Read + Write> Channel<S> {
     fn receive(&mut self) -> io::Result<Option<String>> {
         match self.receive_event()? {
             Receive::Frame(body) => Ok(Some(body)),
+            Receive::Rejected(reason) => Err(refused(reason)),
             Receive::Quiescent | Receive::Eof | Receive::BudgetYield => Ok(None),
         }
     }
@@ -885,6 +896,7 @@ struct KeeperSession<G> {
     gone: bool,
     released: bool,
     abandoned: bool,
+    authority_stopped: bool,
     first_fault: Option<&'static str>,
 }
 impl<G: GroupOps> KeeperSession<G> {
@@ -900,6 +912,7 @@ impl<G: GroupOps> KeeperSession<G> {
             gone: false,
             released: false,
             abandoned: false,
+            authority_stopped: false,
             first_fault: None,
         }
     }
@@ -910,7 +923,25 @@ impl<G: GroupOps> KeeperSession<G> {
             self.end = self.end.min(at.saturating_add(CLEANUP_NS));
         }
     }
+    fn check_authority(&self) -> io::Result<()> {
+        if self.authority_stopped {
+            return Err(refused(
+                self.first_fault.unwrap_or("KEEPER_AUTHORITY_STOPPED"),
+            ));
+        }
+        Ok(())
+    }
+    fn stop_authority(&mut self, reason: &'static str, at: u64) {
+        self.fail(reason, at);
+        if !self.authority_stopped {
+            self.authority_stopped = true;
+            // Logical disable only: do not query/signal a group when a possibly
+            // unread stricter bound is unavailable. FAILED/unknown, not GONE.
+            self.group.disable();
+        }
+    }
     fn control(&mut self, body: &str, at: u64) -> io::Result<()> {
+        self.check_authority()?;
         if at >= self.end {
             return Err(refused("KEEPER_CLEANUP_DEADLINE"));
         }
@@ -932,6 +963,7 @@ impl<G: GroupOps> KeeperSession<G> {
         }
     }
     fn check_time(&self, clock: &mut impl FnMut() -> io::Result<u64>) -> io::Result<u64> {
+        self.check_authority()?;
         let at = clock()?;
         if at >= self.end {
             return Err(refused("KEEPER_CLEANUP_DEADLINE"));
@@ -952,6 +984,7 @@ impl<G: GroupOps> KeeperSession<G> {
         Ok(())
     }
     fn step(&mut self, clock: &mut impl FnMut() -> io::Result<u64>) -> io::Result<bool> {
+        self.check_authority()?;
         if self.abandoned {
             return Err(refused("KEEPER_SELF_GROUP_UNPROVEN"));
         }
@@ -1002,6 +1035,7 @@ fn keeper_turn<G: GroupOps, S: Read + Write>(
     sid: u64,
     clock: &mut impl FnMut() -> io::Result<u64>,
 ) -> io::Result<Turn> {
+    session.check_authority()?;
     let at = clock()?;
     if at >= session.end {
         return Err(refused("KEEPER_CLEANUP_DEADLINE"));
@@ -1029,15 +1063,17 @@ fn keeper_turn<G: GroupOps, S: Read + Write>(
             // Failure remains irreversible. Only canonical CLEAN can tighten
             // its bound; no PARK/RELEASE/GONE/proof path is reopened.
             Ok(Receive::Frame(_)) => (),
+            Ok(Receive::Rejected(_)) => session.fail("KEEPER_CHANNEL", clock()?),
             Ok(Receive::BudgetYield) => return Ok(Turn::Again),
             Ok(Receive::Quiescent | Receive::Eof) => {
                 drained = true;
                 break;
             }
             Err(_) => {
-                session.fail("KEEPER_CHANNEL", clock()?);
-                drained = true;
-                break;
+                // No known frame boundary/drain fact: stop authority rather
+                // than act under an end that may have been superseded unread.
+                session.stop_authority("KEEPER_CHANNEL", clock()?);
+                return Err(refused(session.first_fault.unwrap()));
             }
         }
     }
