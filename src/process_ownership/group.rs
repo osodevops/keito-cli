@@ -400,6 +400,11 @@ impl Settlement {
             policy,
         }
     }
+    fn cap_failed_observation(&mut self, at: Option<u64>, requested: u64) {
+        // No usable clock means no newly granted observation interval.
+        let end = at.map(|at| self.policy.observation_end(at, requested)).unwrap_or(0);
+        self.progress.shorten(end);
+    }
     fn begin(&mut self, deadline_ns: u64, at: u64, channel: &mut Channel) -> io::Result<()> {
         if let Some(first) = self.progress.first_fault {
             return Err(refused(first));
@@ -827,13 +832,15 @@ impl GroupLease {
         if let Some(child) = &mut self.workload {
             child.stdin.take();
         }
-        let result = now().and_then(|at| self.settlement.begin(deadline_ns, at, &mut self.channel));
+        let clock = now();
+        let at = clock.as_ref().ok().copied();
+        let result = clock.and_then(|at| self.settlement.begin(deadline_ns, at, &mut self.channel));
         let result = self.checked(result);
         if result.is_err() {
             // Scope's common failed-observation bound still applies when a
             // poisoned/sending-failed lease cannot form a clean wire proof.
             // This is local failure retention only, never a clean bound ACK.
-            self.settlement.progress.shorten(deadline_ns);
+            self.settlement.cap_failed_observation(at, deadline_ns);
         }
         result
     }
@@ -2895,6 +2902,35 @@ mod short_policy_tests {
             CleanupPolicy::Legacy.setup_end(0, 3_000_000_000),
             1_200_000_000
         );
+    }
+    #[test]
+    fn faulted_parent_caps_retention_to_short_end_without_clearing_first_fault() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        let mut channel=Channel::new(left,"a".repeat(32)).unwrap();
+        let mut state=Settlement::with_policy(550_000_000,CleanupPolicy::HookShort);
+        state.progress.fail("ORIGINAL");
+        assert!(state.begin(550_000_000,100_000_000,&mut channel).is_err());
+        state.cap_failed_observation(Some(100_000_000),550_000_000);
+        assert_eq!(state.progress.deadline_ns,150_000_000);
+        state.cap_failed_observation(Some(110_000_000),500_000_000);
+        assert_eq!(state.progress.deadline_ns,150_000_000);
+        state.cap_failed_observation(None,500_000_000);
+        assert_eq!(state.progress.deadline_ns,0);
+        assert_eq!(state.progress.first_fault,Some("ORIGINAL"));
+    }
+    #[test]
+    fn failed_control_send_keeps_failed_observation_within_same_short_policy() {
+        let (left, right) = UnixStream::pair().unwrap();
+        left.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut channel=Channel::new(left,"a".repeat(32)).unwrap();
+        let mut state=Settlement::with_policy(550_000_000,CleanupPolicy::HookShort);
+        assert!(state.begin(550_000_000,100_000_000,&mut channel).is_err());
+        state.progress.fail("SEND_FAILED");
+        state.cap_failed_observation(Some(100_000_000),550_000_000);
+        assert_eq!(state.progress.deadline_ns,150_000_000);
+        assert!(!state.cleanup_sent);
+        assert_eq!(state.progress.first_fault,Some("SEND_FAILED"));
+        drop(right);
     }
     #[test]
     fn keeper_policy_tag_is_closed_not_a_caller_supplied_allowance() {
