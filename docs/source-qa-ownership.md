@@ -3,7 +3,10 @@
 The `dev-tools` Rust protocol and matching Python QA protocol carry only bounded
 cancellation and process-ledger metadata. They grant no capture, profile, usage,
 authentication or runtime-pair authority. Neither module is installed in the
-21-file Rust/thin-shell skill payload; default Rust builds exclude the module.
+21-file Rust/thin-shell skill payload. The developer API now reexports the single
+Unix implementation in `process_ownership`; that shared implementation compiles
+in default library builds. Product call sites and the guard still need wiring.
+Compilation alone is not default-artifact ownership or runtime acceptance.
 
 The protocol requires a valid terminal followed by EOF. A nonce, identity, schema,
 state, I/O, forwarding or budget fault permanently fails that endpoint and its
@@ -31,6 +34,14 @@ This is a component repair. It is not yet connected to the process-owning runner
 native fixtures, guardian or core. The Python `SourceOwner` requires explicit
 manager cleanup APIs; the existing `OwnedChildren` does not yet implement them.
 Do not attach it to the old runner or infer cleanup from `manager.active == None`.
+
+The Python owner now latches ordinary operation exceptions before cleanup and
+terminal emission. Manager begin/poll/schema errors retain pending collection
+within the same end; collected facts after a callback fault are cached separately
+from clean proof. Failed close/finalization cannot replace the original operation
+exception. Seven retained regressions plus the existing protocol/socket tests
+pass (45 total); independent review is pending. This does not implement the real
+multi-slot process manager or establish actual nested LIVE receipt acceptance.
 
 The remaining integration must preserve the guardian's actual `setsid`, imageFD,
 ACK and timing boundaries; give controlled source processes cooperative owners;

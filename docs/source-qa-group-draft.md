@@ -1,8 +1,11 @@
 # Reserved group implementation draft
 
 This developer component is not connected to product hooks, the guard, the core,
-native fixtures or Python tools. Default builds exclude it. The keeper example
-is never installed. Its state/socket checks are not process acceptance.
+native fixtures or Python tools. Its state machines now live in the shared
+`process_ownership` Unix library module, with developer compatibility reexports.
+Default library builds compile that shared source; real product call sites and
+guard roles are not wired yet. The keeper example is never installed. Its
+state/socket checks are not process acceptance.
 
 The lease is only for an opaque command in the current session. A guardian core
 still calls `setsid()` and must instead be a cooperative source owner whose own
