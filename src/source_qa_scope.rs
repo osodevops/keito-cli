@@ -181,11 +181,19 @@ impl<E: Edge> Registry<E> {
 
 /// Group-only observations. This is deliberately not a whole-Scope proof.
 #[derive(Clone, Debug)]
+pub struct RegisteredGroupReport {
+    pub slot: usize,
+    pub facts: GroupReport,
+    pub group_proof: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct RegistryReport {
     pub first_fault: Option<ProtocolError>,
     pub secondary_faults: Vec<ProtocolError>,
     pub admission_closed: bool,
     pub retained_slots: usize,
+    pub groups: Vec<RegisteredGroupReport>,
     pub cleanup_end: Option<u64>,
     pub all_group_proofs: bool,
     pub all_direct_waits_known: bool,
@@ -261,11 +269,15 @@ impl GroupRegistry {
     }
     pub fn report(&self) -> RegistryReport {
         let owner = self.inner.owner.borrow();
+        let groups: Vec<_> = self.inner.slots.iter().enumerate().map(|(slot, edge)|
+            RegisteredGroupReport { slot, facts: edge.lease.report(), group_proof: edge.proof }).collect();
+        let all_group_proofs = groups.iter().all(|g| g.group_proof);
+        let all_direct_waits_known = groups.iter().all(|g| g.facts.keeper_status.is_some()
+            && (!g.facts.workload_spawned || g.facts.workload_status.is_some()));
         RegistryReport { first_fault: owner.first_fault, admission_closed: owner.admission_closed,
             secondary_faults: self.inner.secondary_faults.clone(),
             retained_slots: self.inner.slots.len(), cleanup_end: self.inner.cleanup_end,
-            all_group_proofs: self.inner.slots.iter().all(Edge::proof),
-            all_direct_waits_known: self.inner.slots.iter().all(Edge::waits_known),
+            groups, all_group_proofs, all_direct_waits_known,
             finish_called: self.inner.finished, output_eof_proven: false }
     }
     pub fn finish(&mut self) -> RegistryReport {

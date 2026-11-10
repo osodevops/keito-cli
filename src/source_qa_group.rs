@@ -299,6 +299,10 @@ impl Lifetime {
 /// Returned even on failure by report(); waits do not rehabilitate clean proof.
 #[derive(Clone, Debug)]
 pub struct GroupReport {
+    /// Known direct handles only; these numbers are metadata, never authority
+    /// for a caller to query or signal a cached PID/group.
+    pub keeper_pid: u32,
+    pub workload_pid: Option<u32>,
     pub first_fault: Option<&'static str>,
     pub secondary_faults: Vec<&'static str>,
     pub workload_spawned: bool,
@@ -784,6 +788,8 @@ impl GroupLease {
     }
     pub fn report(&self) -> GroupReport {
         GroupReport {
+            keeper_pid: self.keeper.id(),
+            workload_pid: self.workload.as_ref().map(Child::id),
             first_fault: self.settlement.progress.first_fault,
             secondary_faults: self.settlement.progress.secondary_faults.clone(),
             workload_spawned: self.workload.is_some(),
