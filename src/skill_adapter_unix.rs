@@ -127,7 +127,8 @@ fn valid_runtime(value: &Value) -> bool {
         v.get(*k)
             .and_then(Value::as_str)
             .is_some_and(|s| identifier(s, 128))
-    }) && v.get("guard_contract").and_then(Value::as_u64) == Some(crate::capture_runtime_pair::GUARD_CONTRACT as u64)
+    }) && v.get("guard_contract").and_then(Value::as_u64)
+        == Some(crate::capture_runtime_pair::GUARD_CONTRACT as u64)
 }
 fn validate_receipt(dir: &Dir) -> Result<Receipt, AppError> {
     let receipt: Receipt =
@@ -363,7 +364,9 @@ fn owned(hook: &Value, dest: &Path, agent: &str) -> Option<bool> {
     let modern = argv.first().is_some_and(|s| s == "exec");
     if modern {
         argv.remove(0);
-        if argv.first().map(String::as_str) != Some("/usr/bin/env") { return None; }
+        if argv.first().map(String::as_str) != Some("/usr/bin/env") {
+            return None;
+        }
     }
     if argv
         .first()
@@ -389,9 +392,21 @@ fn owned(hook: &Value, dest: &Path, agent: &str) -> Option<bool> {
         }
         argv.remove(0);
     }
-    if modern && (environment.len() != 3
-        || !["KEITO_CLI_BIN", "KEITO_CAPTURE_GUARD_BIN"].iter().all(|k| environment.get(*k).is_some_and(|s| Path::new(s).is_absolute()))
-        || !environment.get("KEITO_CAPTURE_CORE_SHA256").is_some_and(|s| hex(s, 64))) { return None; }
+    if modern
+        && (environment.len() != 3
+            || !["KEITO_CLI_BIN", "KEITO_CAPTURE_GUARD_BIN"]
+                .iter()
+                .all(|k| {
+                    environment
+                        .get(*k)
+                        .is_some_and(|s| Path::new(s).is_absolute())
+                })
+            || !environment
+                .get("KEITO_CAPTURE_CORE_SHA256")
+                .is_some_and(|s| hex(s, 64)))
+    {
+        return None;
+    }
     if argv
         .first()
         .is_some_and(|s| matches!(s.as_str(), "bash" | "/bin/bash" | "/usr/bin/bash"))
@@ -619,14 +634,20 @@ pub fn install(options: InstallOptions<'_>) -> Result<InstallOutcome, AppError> 
     };
     install_versioned(options, version)
 }
-pub(crate) fn install_with_runner(options: InstallOptions<'_>, runner: &mut impl crate::process_ownership::probes::LeafRunner) -> Result<InstallOutcome, AppError> {
+pub(crate) fn install_with_runner(
+    options: InstallOptions<'_>,
+    runner: &mut impl crate::process_ownership::probes::LeafRunner,
+) -> Result<InstallOutcome, AppError> {
     let version = match options.harness_version {
         Some(version) => version.to_owned(),
         None => detect_version(options.agent, runner)?,
     };
     install_versioned(options, version)
 }
-fn install_versioned(options: InstallOptions<'_>, version: String) -> Result<InstallOutcome, AppError> {
+fn install_versioned(
+    options: InstallOptions<'_>,
+    version: String,
+) -> Result<InstallOutcome, AppError> {
     if !identifier(&version, 64) {
         return Err(AppError::InvalidInput("Harness version is incompatible with the capture identifier contract; review and qualify the exact version without truncating it.".into()));
     }
@@ -1052,7 +1073,9 @@ pub fn inspect(
 fn invokes_adapter(words: &[String], dest: &Path, host: &Path) -> bool {
     let mut argv = words;
     if argv.first().is_some_and(|s| s == "exec") {
-        if argv.get(1).map(String::as_str) != Some("/usr/bin/env") { return false; }
+        if argv.get(1).map(String::as_str) != Some("/usr/bin/env") {
+            return false;
+        }
         argv = &argv[1..];
     }
     if argv

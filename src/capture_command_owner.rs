@@ -40,13 +40,26 @@ pub(crate) struct CommandOwner<'a> {
     image: Image<'a>,
     end: u64,
 }
-enum ScopeRef<'a> { Owned(Scope), Borrowed(&'a mut Scope) }
+enum ScopeRef<'a> {
+    Owned(Scope),
+    Borrowed(&'a mut Scope),
+}
 impl std::ops::Deref for ScopeRef<'_> {
     type Target = Scope;
-    fn deref(&self) -> &Scope { match self { Self::Owned(s) => s, Self::Borrowed(s) => s } }
+    fn deref(&self) -> &Scope {
+        match self {
+            Self::Owned(s) => s,
+            Self::Borrowed(s) => s,
+        }
+    }
 }
 impl std::ops::DerefMut for ScopeRef<'_> {
-    fn deref_mut(&mut self) -> &mut Scope { match self { Self::Owned(s) => s, Self::Borrowed(s) => s } }
+    fn deref_mut(&mut self) -> &mut Scope {
+        match self {
+            Self::Owned(s) => s,
+            Self::Borrowed(s) => s,
+        }
+    }
 }
 impl CommandOwner<'static> {
     pub(crate) fn standalone() -> Result<Self, AppError> {
@@ -79,8 +92,13 @@ impl<'a> CommandOwner<'a> {
         let end = scope.hard_end().min(at.saturating_add(STANDALONE_NS));
         scope.tighten_end(end);
         let identity = capture_runtime_pair::current()?;
-        let image = VerifiedKeeperImage::open(&identity.guard_path, &identity.guard_sha256).map_err(|_| refused())?;
-        Ok(Self { scope: ScopeRef::Borrowed(scope), image: Image::Owned(image), end })
+        let image = VerifiedKeeperImage::open(&identity.guard_path, &identity.guard_sha256)
+            .map_err(|_| refused())?;
+        Ok(Self {
+            scope: ScopeRef::Borrowed(scope),
+            image: Image::Owned(image),
+            end,
+        })
     }
     pub(crate) fn for_hook(
         runtime: &'a capture_runtime_pair::HookRuntime,
@@ -93,7 +111,9 @@ impl<'a> CommandOwner<'a> {
             .ok()
             .filter(|n| n.to_string() == raw && *n > at)
             .ok_or_else(refused)?;
-        let end = inherited.min(at.saturating_add(HOOK_NS)).min(scope.hard_end());
+        let end = inherited
+            .min(at.saturating_add(HOOK_NS))
+            .min(scope.hard_end());
         scope.tighten_end(end);
         Ok(Self {
             scope: ScopeRef::Borrowed(scope),

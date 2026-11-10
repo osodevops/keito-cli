@@ -37,11 +37,17 @@ fn main() {
     #[cfg(unix)]
     if let Some(scope) = entry_scope.as_mut() {
         let resources = scope.finish().clean;
-        if !scope.publish_terminal(resources && result.is_ok() && parser_exit.unwrap_or(0) == 0) && result.is_ok() {
-            result = Err(AppError::Config("Command ownership did not settle; collection remains paused".into()));
+        if !scope.publish_terminal(resources && result.is_ok() && parser_exit.unwrap_or(0) == 0)
+            && result.is_ok()
+        {
+            result = Err(AppError::Config(
+                "Command ownership did not settle; collection remains paused".into(),
+            ));
         }
     }
-    if let Some(code) = parser_exit { std::process::exit(code); }
+    if let Some(code) = parser_exit {
+        std::process::exit(code);
+    }
     if let Err(e) = result {
         let json_mode = std::env::args().any(|a| a == "--json") || !std::io::stdout().is_terminal();
         if json_mode {
@@ -54,7 +60,10 @@ fn main() {
     }
 }
 
-async fn run(cli: Cli, #[cfg(unix)] scope: Option<&mut keito_cli::process_ownership::scope::Scope>) -> Result<(), AppError> {
+async fn run(
+    cli: Cli,
+    #[cfg(unix)] scope: Option<&mut keito_cli::process_ownership::scope::Scope>,
+) -> Result<(), AppError> {
     let output_mode = if cli.json || !std::io::stdout().is_terminal() {
         output::OutputMode::Json
     } else {
@@ -64,19 +73,27 @@ async fn run(cli: Cli, #[cfg(unix)] scope: Option<&mut keito_cli::process_owners
     match cli.command {
         cli::Command::Capture(cmd) => {
             #[cfg(unix)]
-            { commands::capture::run_with_scope(cmd, &cli.global, output_mode, scope).await }
+            {
+                commands::capture::run_with_scope(cmd, &cli.global, output_mode, scope).await
+            }
             #[cfg(not(unix))]
-            { commands::capture::run(cmd, &cli.global, output_mode).await }
-        },
+            {
+                commands::capture::run(cmd, &cli.global, output_mode).await
+            }
+        }
         cli::Command::Auth(cmd) => commands::auth::run(cmd, &cli.global, output_mode).await,
         cli::Command::Clients(cmd) => commands::clients::run(cmd, &cli.global, output_mode).await,
         cli::Command::Time(cmd) => commands::time::run(cmd, &cli.global, output_mode).await,
         cli::Command::Projects(cmd) => commands::projects::run(cmd, &cli.global, output_mode).await,
         cli::Command::Skill(cmd) => {
             #[cfg(unix)]
-            { commands::skill::run_with_scope(cmd, &cli.global, output_mode, scope).await }
+            {
+                commands::skill::run_with_scope(cmd, &cli.global, output_mode, scope).await
+            }
             #[cfg(not(unix))]
-            { commands::skill::run(cmd, &cli.global, output_mode).await }
-        },
+            {
+                commands::skill::run(cmd, &cli.global, output_mode).await
+            }
+        }
     }
 }

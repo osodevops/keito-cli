@@ -19,10 +19,19 @@ pub fn run_fixture_opaque(
     plan: crate::process_ownership::io::IoPlan,
     core: &Path,
 ) -> io::Result<crate::process_ownership::scope::CommandResult> {
-    let anchor = option_env!("KEITO_RELEASE_GUARD_SHA256").ok_or_else(|| io::Error::other("FIXTURE_PAIR_ANCHOR"))?;
-    let runtime = crate::capture_runtime_pair::verify(core, anchor, env!("CARGO_PKG_VERSION"), env!("KEITO_BUILD_TARGET"))
-        .map_err(|_| io::Error::other("FIXTURE_PAIR_ANCHOR"))?;
-    let image = crate::process_ownership::image::VerifiedKeeperImage::open(&runtime.guard_path, &runtime.guard_sha256)?;
+    let anchor = option_env!("KEITO_RELEASE_GUARD_SHA256")
+        .ok_or_else(|| io::Error::other("FIXTURE_PAIR_ANCHOR"))?;
+    let runtime = crate::capture_runtime_pair::verify(
+        core,
+        anchor,
+        env!("CARGO_PKG_VERSION"),
+        env!("KEITO_BUILD_TARGET"),
+    )
+    .map_err(|_| io::Error::other("FIXTURE_PAIR_ANCHOR"))?;
+    let image = crate::process_ownership::image::VerifiedKeeperImage::open(
+        &runtime.guard_path,
+        &runtime.guard_sha256,
+    )?;
     scope.run_verified(command, plan, &image)
 }
 

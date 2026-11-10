@@ -354,7 +354,10 @@ mod unix {
         }
         sync(state)
     }
-    pub fn run(args: &[std::ffi::OsString], scope: &mut crate::process_ownership::scope::Scope) -> Result<(), ()> {
+    pub fn run(
+        args: &[std::ffi::OsString],
+        scope: &mut crate::process_ownership::scope::Scope,
+    ) -> Result<(), ()> {
         let started = Instant::now();
         // Share a CLOCK_MONOTONIC absolute bound with core leaf commands. This
         // reserves work inside the existing guard budget, never after it.
@@ -444,7 +447,9 @@ mod unix {
         sync(&flags)?;
         unlock(&publication);
         let initial = marker.metadata().map_err(|_| ())?;
-        if crate::process_ownership::signals::pending() || started.elapsed() >= Duration::from_millis(600) {
+        if crate::process_ownership::signals::pending()
+            || started.elapsed() >= Duration::from_millis(600)
+        {
             return Ok(());
         }
         // Even a clock refusal must leave the already durable pending marker.
@@ -457,7 +462,11 @@ mod unix {
         let original = executable(&core, &expected)?;
         let core_fd = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
         if !(5..=1024).contains(&core_fd) {
-            if core_fd >= 0 { unsafe { libc::close(core_fd); } }
+            if core_fd >= 0 {
+                unsafe {
+                    libc::close(core_fd);
+                }
+            }
             return Err(());
         }
         let core_file = unsafe { File::from_raw_fd(core_fd) };
@@ -591,7 +600,8 @@ mod unix {
             if scope.slot_complete(&child) && eof {
                 break;
             }
-            if scope.failed() || crate::process_ownership::signals::pending()
+            if scope.failed()
+                || crate::process_ownership::signals::pending()
                 || started.elapsed() >= Duration::from_millis(600)
             {
                 break;
@@ -599,10 +609,14 @@ mod unix {
             std::thread::sleep(Duration::from_millis(1));
         }
         if !scope.slot_complete(&child) || !eof || bytes != ACK {
-            scope.begin_cancel(crate::process_ownership::protocol::ProtocolError("GUARD_CORE_INCOMPLETE"), scope.hard_end());
+            scope.begin_cancel(
+                crate::process_ownership::protocol::ProtocolError("GUARD_CORE_INCOMPLETE"),
+                scope.hard_end(),
+            );
         }
         let resources_clean = scope.finish().clean;
-        if resources_clean && status.is_some_and(|s| s.success())
+        if resources_clean
+            && status.is_some_and(|s| s.success())
             && eof
             && bytes == ACK
             && !crate::process_ownership::signals::pending()
@@ -637,9 +651,17 @@ mod unix {
     }
 }
 #[cfg(unix)]
-pub fn run(args: &[std::ffi::OsString], scope: &mut crate::process_ownership::scope::Scope) -> Result<(), ()> {
+pub fn run(
+    args: &[std::ffi::OsString],
+    scope: &mut crate::process_ownership::scope::Scope,
+) -> Result<(), ()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    { unix::run(args, scope) }
+    {
+        unix::run(args, scope)
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    { let _ = (args, scope); Err(()) }
+    {
+        let _ = (args, scope);
+        Err(())
+    }
 }

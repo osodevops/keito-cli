@@ -303,8 +303,11 @@ impl Endpoint {
         value: &str,
     ) -> Result<bool> {
         let fields: Vec<_> = value.split('|').collect();
-        if fields.len() != 5 || !matches!(fields[0], "REGISTER" | "WAITED")
-            || !nonce_valid(fields[3]) || value.len() + 34 > MAX_FRAME {
+        if fields.len() != 5
+            || !matches!(fields[0], "REGISTER" | "WAITED")
+            || !nonce_valid(fields[3])
+            || value.len() + 34 > MAX_FRAME
+        {
             return Err(ProtocolError("METADATA_SCHEMA"));
         }
         let key = (pid(fields[1])?, pid(fields[2])?, fields[3].to_owned());
@@ -318,7 +321,9 @@ impl Endpoint {
             Ok(true)
         } else {
             wait_status(fields[4])?;
-            let waited = registrations.get_mut(&key).filter(|w| !**w)
+            let waited = registrations
+                .get_mut(&key)
+                .filter(|w| !**w)
                 .ok_or(ProtocolError("UNMATCHED_WAIT"))?;
             *waited = true;
             Ok(false)

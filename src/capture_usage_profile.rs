@@ -589,7 +589,10 @@ pub(crate) fn approve(options: ProfileOptions<'_>) -> Result<PreparedProfile, Ap
     let result = approve_with_runner(options, &mut owner);
     owner.finish(result)
 }
-pub(crate) fn approve_with_runner(options: ProfileOptions<'_>, runner: &mut impl crate::process_ownership::probes::LeafRunner) -> Result<PreparedProfile, AppError> {
+pub(crate) fn approve_with_runner(
+    options: ProfileOptions<'_>,
+    runner: &mut impl crate::process_ownership::probes::LeafRunner,
+) -> Result<PreparedProfile, AppError> {
     let (agent, host, source, version) = match options.namespace {
         "claude-code" => (SkillAgent::ClaudeCode, ".claude", "projects", "2.1.319"),
         "codex" => (SkillAgent::Codex, ".codex", "sessions", "0.167.0"),

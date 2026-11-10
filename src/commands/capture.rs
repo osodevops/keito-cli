@@ -20,11 +20,14 @@ fn current_repo() -> Result<Repository, AppError> {
     Repository::resolve(&cwd)
 }
 #[cfg(unix)]
-fn current_repo_scoped(scope: &mut Option<&mut crate::process_ownership::scope::Scope>) -> Result<Repository, AppError> {
+fn current_repo_scoped(
+    scope: &mut Option<&mut crate::process_ownership::scope::Scope>,
+) -> Result<Repository, AppError> {
     match scope.as_deref_mut() {
         Some(scope) => {
             let mut owner = crate::capture_command_owner::CommandOwner::with_scope(scope)?;
-            let cwd = std::env::current_dir().map_err(|_| AppError::Config("Cannot identify working directory".into()))?;
+            let cwd = std::env::current_dir()
+                .map_err(|_| AppError::Config("Cannot identify working directory".into()))?;
             Repository::resolve_with(&cwd, &mut owner)
         }
         None => current_repo(),
@@ -188,19 +191,27 @@ pub async fn run(
     _mode: OutputMode,
 ) -> Result<(), AppError> {
     #[cfg(unix)]
-    { run_inner(cmd, global, _mode, None).await }
+    {
+        run_inner(cmd, global, _mode, None).await
+    }
     #[cfg(not(unix))]
-    { run_inner(cmd, global, _mode).await }
+    {
+        run_inner(cmd, global, _mode).await
+    }
 }
 #[cfg(unix)]
 pub async fn run_with_scope(
-    cmd: CaptureCommand, global: &GlobalFlags, mode: OutputMode,
+    cmd: CaptureCommand,
+    global: &GlobalFlags,
+    mode: OutputMode,
     scope: Option<&mut crate::process_ownership::scope::Scope>,
 ) -> Result<(), AppError> {
     run_inner(cmd, global, mode, scope).await
 }
 async fn run_inner(
-    cmd: CaptureCommand, global: &GlobalFlags, _mode: OutputMode,
+    cmd: CaptureCommand,
+    global: &GlobalFlags,
+    _mode: OutputMode,
     #[cfg(unix)] mut entry_scope: Option<&mut crate::process_ownership::scope::Scope>,
 ) -> Result<(), AppError> {
     if cfg!(not(unix)) {
@@ -248,16 +259,17 @@ async fn run_inner(
                     let mut store = Store::open(&capture_directory)?;
                     let binding = store.numeric_binding(&repository, agent.namespace())?;
                     let options = crate::capture_usage_profile::ProfileOptions {
-                            directory: &capture_directory,
-                            binding: &binding,
-                            namespace: agent.namespace(),
-                            home: &profile_home,
-                            launcher: &harness_executable,
-                            native: native_executable.as_deref(),
-                            runtime: &runtime,
-                        };
+                        directory: &capture_directory,
+                        binding: &binding,
+                        namespace: agent.namespace(),
+                        home: &profile_home,
+                        launcher: &harness_executable,
+                        native: native_executable.as_deref(),
+                        runtime: &runtime,
+                    };
                     let prepared = if let Some(scope) = entry_scope.as_deref_mut() {
-                        let mut owner = crate::capture_command_owner::CommandOwner::with_scope(scope)?;
+                        let mut owner =
+                            crate::capture_command_owner::CommandOwner::with_scope(scope)?;
                         crate::capture_usage_profile::approve_with_runner(options, &mut owner)?
                     } else {
                         crate::capture_usage_profile::approve(options)?
@@ -293,7 +305,9 @@ async fn run_inner(
                 .transpose()?;
             #[cfg(unix)]
             let mut command_owner = match (hook_runtime.as_ref(), entry_scope) {
-                (Some(runtime), Some(scope)) => Some(crate::capture_command_owner::CommandOwner::for_hook(runtime, scope)?),
+                (Some(runtime), Some(scope)) => Some(
+                    crate::capture_command_owner::CommandOwner::for_hook(runtime, scope)?,
+                ),
                 _ => None,
             };
             let ack_fd = std::env::var("KEITO_CAPTURE_ACK_FD")

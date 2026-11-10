@@ -131,11 +131,20 @@ impl VerifiedKeeperImage {
         let mut total = 0u64;
         loop {
             let count = file.read(&mut part)?;
-            if count == 0 { break; }
-            total = total.checked_add(count as u64).filter(|n| *n <= MAX_IMAGE).ok_or_else(refused)?;
+            if count == 0 {
+                break;
+            }
+            total = total
+                .checked_add(count as u64)
+                .filter(|n| *n <= MAX_IMAGE)
+                .ok_or_else(refused)?;
             digest.update(&part[..count]);
         }
-        let expected: String = digest.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let expected: String = digest
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         Self::open(&path, &expected)
     }
     pub(crate) fn open(path: &Path, expected: &str) -> io::Result<Self> {

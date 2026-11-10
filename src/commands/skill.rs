@@ -185,17 +185,29 @@ pub async fn run(
     mode: OutputMode,
 ) -> Result<(), AppError> {
     #[cfg(unix)]
-    { run_with_scope(cmd, global, mode, None).await }
+    {
+        run_with_scope(cmd, global, mode, None).await
+    }
     #[cfg(not(unix))]
-    { run_inner(cmd, global, mode).await }
+    {
+        run_inner(cmd, global, mode).await
+    }
 }
 #[cfg(unix)]
-pub async fn run_with_scope(cmd: SkillCommand, global: &GlobalFlags, mode: OutputMode,
-    scope: Option<&mut crate::process_ownership::scope::Scope>) -> Result<(), AppError> {
+pub async fn run_with_scope(
+    cmd: SkillCommand,
+    global: &GlobalFlags,
+    mode: OutputMode,
+    scope: Option<&mut crate::process_ownership::scope::Scope>,
+) -> Result<(), AppError> {
     run_inner(cmd, global, mode, scope).await
 }
-async fn run_inner(cmd: SkillCommand, global: &GlobalFlags, mode: OutputMode,
-    #[cfg(unix)] scope: Option<&mut crate::process_ownership::scope::Scope>) -> Result<(), AppError> {
+async fn run_inner(
+    cmd: SkillCommand,
+    global: &GlobalFlags,
+    mode: OutputMode,
+    #[cfg(unix)] scope: Option<&mut crate::process_ownership::scope::Scope>,
+) -> Result<(), AppError> {
     match cmd.command {
         SkillSubcommand::Install {
             source,
@@ -210,7 +222,8 @@ async fn run_inner(cmd: SkillCommand, global: &GlobalFlags, mode: OutputMode,
                 selected_agents(agent)?,
                 skip_skills_add,
                 confirm_migration,
-                #[cfg(unix)] scope,
+                #[cfg(unix)]
+                scope,
             )
             .await
         }
@@ -244,7 +257,8 @@ pub async fn install_defaults(global: &GlobalFlags, mode: OutputMode) -> Result<
         selected_agents(vec![])?,
         false,
         false,
-        #[cfg(unix)] None,
+        #[cfg(unix)]
+        None,
     )
     .await
 }

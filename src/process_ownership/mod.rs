@@ -4,8 +4,8 @@
 //! Product call sites, cooperative core and bounded I/O wiring remain pending. Merely
 //! compiling this module in a default artifact is not runtime qualification.
 //! This code grants no capture, profile, billing or authentication authority.
-pub mod group;
 mod attachment;
+pub mod group;
 pub(crate) mod image;
 pub mod io;
 pub(crate) mod probes;

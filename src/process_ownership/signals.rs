@@ -1,6 +1,9 @@
 //! Entry-thread cancellation. Handlers only latch an atomic; they never own a
 //! process handle or perform cleanup. No implicit thread-local owner exists.
-use std::{io, sync::atomic::{AtomicBool, Ordering}};
+use std::{
+    io,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 extern "C" fn interrupted(_: libc::c_int) {
@@ -52,7 +55,9 @@ impl AdmissionMask {
 }
 impl Drop for AdmissionMask {
     fn drop(&mut self) {
-        if unsafe { libc::sigprocmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut()) } != 0 {
+        if unsafe { libc::sigprocmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut()) }
+            != 0
+        {
             INTERRUPTED.store(true, Ordering::Relaxed);
         }
     }
