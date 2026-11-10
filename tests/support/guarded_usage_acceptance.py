@@ -149,63 +149,65 @@ def dispatch(case, namespace, session, source, event, turn, *, program_override=
 
 
 def main():
+    global OWNER
     failures = []
     for namespace, version, filename in [("codex", "0.167.0", "codex-inert-source-only"),
                                           ("claude-code", "2.1.319", "claude-inert-source-only")]:
-        case, database = make_case(namespace)
-        session = str(uuid.uuid4())
-        if namespace == "codex":
-            source = case / "home/.codex/sessions/2026/11/08" / ("rollout-synthetic-" + session + ".jsonl")
-            meta = {"type": "session_meta", "payload": {"id": session, "session_id": session, "cli_version": version}}
-            context = lambda turn: {"type": "turn_context", "payload": {"turn_id": turn, "model": "gpt-6.1-sol"}}
-            response = lambda identity, turn, usage: {"type": "token_usage_record", "payload": {
-                "thread_id": session, "session_id": session, "turn_id": turn, "root_turn_id": turn,
-                "response_id": identity, "usage": usage}}
-            old_id, new_id = "resp_before_consent", "resp_after_consent"
-            initial = [meta, context("old_turn"), response(old_id, "old_turn", None)]
-            final = [meta, context("old_turn"), response(old_id, "old_turn", {"input_tokens": "PRIVATE_OLD_COUNTER_CANARY"}),
-                     context("turn_synthetic"), response(new_id, "turn_synthetic", {
-                         "input_tokens": 101, "cached_input_tokens": 80, "cache_write_input_tokens": 0,
-                         "output_tokens": 5, "reasoning_output_tokens": 2})]
-        else:
-            source = case / "home/.claude/projects/synthetic" / (session + ".jsonl")
-            response = lambda identity, usage: {"type": "assistant", "sessionId": session, "message": {
-                "id": identity, "model": "claude-opus-5-5", "stop_reason": "end_turn", "usage": usage,
-                "content": [{"text": "PRIVATE_NORMAL_SOURCE_CANARY"}]}}
-            old_id, new_id = "msg_before_consent", "msg_after_consent"
-            initial = [response(old_id, {"input_tokens": "PRIVATE_OLD_COUNTER_CANARY"})]
-            final = initial + [response(new_id, {"input_tokens": 2, "cache_read_input_tokens": None,
-                                                 "cache_creation_input_tokens": 2280, "output_tokens": 5})]
-        write_source(source, initial)
-        before_enable = source.read_bytes()
-        result = cli(case, ["capture", "usage", "enable", "--repo", "--agent", namespace,
-                            "--profile-home", str(case / "home"), "--harness-executable", str(NATIVES / filename),
-                            "--native-executable", str(NATIVES / filename), "--confirm", "--json"])
-        observe({"namespace": namespace, "case": "explicit-normal-enable", "exit": result.returncode,
-                 "stdout_bytes": len(result.stdout), "source_bytes_unchanged": source.read_bytes() == before_enable})
-        assert result.returncode == 0, "normal numeric consent publication failed before factory acceptance"
-        enabled = json.loads(result.stdout)
-        assert enabled["enabled"] is True and enabled["status"] == "UNAVAILABLE"
-        policy = json.loads(database.execute("SELECT data FROM usage_consents WHERE namespace=?", (namespace,)).fetchone()[0])
-        assert policy["enabled"] and policy["epoch"] > 0 and str(case) not in json.dumps(policy)
-        profiles = list((case / "home/capture/profiles").glob("*.json"))
-        assert len(profiles) == 1 and profiles[0].stat().st_mode & 0o777 == 0o600
-        assert str(source) not in profiles[0].read_text(), "functional record retained an exact transcript path"
-        dispatch(case, namespace, session, source, "prompt", "turn_synthetic")
-        write_source(source, final)
-        dispatch(case, namespace, session, source, "stop", "turn_synthetic")
-        bodies = [json.loads(row[0]) for row in database.execute("SELECT body FROM outbox ORDER BY revision")]
-        observed_ids = [record["source_record_id"] for body in bodies for record in body["usage"].get("records", [])]
-        statuses = [body["usage"]["status"] for body in bodies]
-        observe({"namespace": namespace, "case": "normal-numeric-acceptance", "status": statuses,
-                 "request_ids": observed_ids, "expected_request_ids": [new_id],
-                 "timing_segments_preserved": bool(bodies) and bool(bodies[0]["segments"])})
-        assert bodies and bodies[0]["segments"], "normal numeric path discarded legitimate timing"
-        for raw, in database.execute("SELECT data FROM sessions UNION ALL SELECT body FROM outbox"):
-            assert "PRIVATE_" not in raw and str(case) not in raw
-        if observed_ids != [new_id] or "PARTIAL" not in statuses:
-            failures.append(namespace + ": normal guarded route did not capture the new request delta")
-        database.close()
+        with SourceOwner() as OWNER:
+            case, database = make_case(namespace)
+            session = str(uuid.uuid4())
+            if namespace == "codex":
+                source = case / "home/.codex/sessions/2026/11/08" / ("rollout-synthetic-" + session + ".jsonl")
+                meta = {"type": "session_meta", "payload": {"id": session, "session_id": session, "cli_version": version}}
+                context = lambda turn: {"type": "turn_context", "payload": {"turn_id": turn, "model": "gpt-6.1-sol"}}
+                response = lambda identity, turn, usage: {"type": "token_usage_record", "payload": {
+                    "thread_id": session, "session_id": session, "turn_id": turn, "root_turn_id": turn,
+                    "response_id": identity, "usage": usage}}
+                old_id, new_id = "resp_before_consent", "resp_after_consent"
+                initial = [meta, context("old_turn"), response(old_id, "old_turn", None)]
+                final = [meta, context("old_turn"), response(old_id, "old_turn", {"input_tokens": "PRIVATE_OLD_COUNTER_CANARY"}),
+                         context("turn_synthetic"), response(new_id, "turn_synthetic", {
+                             "input_tokens": 101, "cached_input_tokens": 80, "cache_write_input_tokens": 0,
+                             "output_tokens": 5, "reasoning_output_tokens": 2})]
+            else:
+                source = case / "home/.claude/projects/synthetic" / (session + ".jsonl")
+                response = lambda identity, usage: {"type": "assistant", "sessionId": session, "message": {
+                    "id": identity, "model": "claude-opus-5-5", "stop_reason": "end_turn", "usage": usage,
+                    "content": [{"text": "PRIVATE_NORMAL_SOURCE_CANARY"}]}}
+                old_id, new_id = "msg_before_consent", "msg_after_consent"
+                initial = [response(old_id, {"input_tokens": "PRIVATE_OLD_COUNTER_CANARY"})]
+                final = initial + [response(new_id, {"input_tokens": 2, "cache_read_input_tokens": None,
+                                                     "cache_creation_input_tokens": 2280, "output_tokens": 5})]
+            write_source(source, initial)
+            before_enable = source.read_bytes()
+            result = cli(case, ["capture", "usage", "enable", "--repo", "--agent", namespace,
+                                "--profile-home", str(case / "home"), "--harness-executable", str(NATIVES / filename),
+                                "--native-executable", str(NATIVES / filename), "--confirm", "--json"])
+            observe({"namespace": namespace, "case": "explicit-normal-enable", "exit": result.returncode,
+                     "stdout_bytes": len(result.stdout), "source_bytes_unchanged": source.read_bytes() == before_enable})
+            assert result.returncode == 0, "normal numeric consent publication failed before factory acceptance"
+            enabled = json.loads(result.stdout)
+            assert enabled["enabled"] is True and enabled["status"] == "UNAVAILABLE"
+            policy = json.loads(database.execute("SELECT data FROM usage_consents WHERE namespace=?", (namespace,)).fetchone()[0])
+            assert policy["enabled"] and policy["epoch"] > 0 and str(case) not in json.dumps(policy)
+            profiles = list((case / "home/capture/profiles").glob("*.json"))
+            assert len(profiles) == 1 and profiles[0].stat().st_mode & 0o777 == 0o600
+            assert str(source) not in profiles[0].read_text(), "functional record retained an exact transcript path"
+            dispatch(case, namespace, session, source, "prompt", "turn_synthetic")
+            write_source(source, final)
+            dispatch(case, namespace, session, source, "stop", "turn_synthetic")
+            bodies = [json.loads(row[0]) for row in database.execute("SELECT body FROM outbox ORDER BY revision")]
+            observed_ids = [record["source_record_id"] for body in bodies for record in body["usage"].get("records", [])]
+            statuses = [body["usage"]["status"] for body in bodies]
+            observe({"namespace": namespace, "case": "normal-numeric-acceptance", "status": statuses,
+                     "request_ids": observed_ids, "expected_request_ids": [new_id],
+                     "timing_segments_preserved": bool(bodies) and bool(bodies[0]["segments"])})
+            assert bodies and bodies[0]["segments"], "normal numeric path discarded legitimate timing"
+            for raw, in database.execute("SELECT data FROM sessions UNION ALL SELECT body FROM outbox"):
+                assert "PRIVATE_" not in raw and str(case) not in raw
+            if observed_ids != [new_id] or "PARTIAL" not in statuses:
+                failures.append(namespace + ": normal guarded route did not capture the new request delta")
+            database.close()
 
     assert not failures, "; ".join(failures)
     print(json.dumps({"source_fixture_only": True, "both_namespaces_numeric_normal_route": True,
@@ -213,5 +215,4 @@ def main():
 
 
 if __name__ == "__main__":
-    with SourceOwner() as OWNER:
-        main()
+    main()

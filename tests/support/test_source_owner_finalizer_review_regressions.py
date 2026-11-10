@@ -10,6 +10,8 @@ import source_qa_protocol as p
 from source_qa_children import Cancelled
 
 class Parent:
+    cancel_deadline_ns = None
+    def receive(self, parent=False, failure_only=False): return False
     def __init__(self, send_error=None, close_error=None):
         self.tags=[]; self.closed=False; self.send_error=send_error; self.close_error=close_error
     def send(self, tag):
@@ -94,12 +96,12 @@ class ReviewCases(unittest.TestCase):
                     if has_original: self.assertFalse(owner.__exit__(OSError,original,None))
                     else:
                         with self.assertRaises(p.ProtocolError) as error: owner.__exit__(None,None,None)
-                        self.assertEqual(str(error.exception),'OWNER_FINALIZATION_FAILED')
+                        self.assertEqual(str(error.exception),'OWNER_CLOCK')
                     self.assertIs(p.CURRENT,previous)
                 self.assertEqual(parent.tags,['FAILED']); self.assertTrue(parent.closed)
                 self.assertEqual(owner.managers,[manager]); self.assertFalse(owner._finished_managers)
                 self.assertTrue(owner._closed); self.assertTrue(owner.unsettled)
-                self.assertEqual(owner.first_fault,'OWNER_OPERATION_FAILED' if has_original else 'OWNER_FINALIZATION_FAILED')
+                self.assertEqual(owner.first_fault,'OWNER_OPERATION_FAILED' if has_original else 'OWNER_CLOCK')
 
     def test_terminal_and_close_baseexceptions_keep_first_reason(self):
         for original in (None,OSError('PRIVATE_OPERATION'),p.ProtocolError('ORIGINAL')):

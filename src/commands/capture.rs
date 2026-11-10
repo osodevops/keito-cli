@@ -607,9 +607,22 @@ async fn run_inner(
                 CaptureSubcommand::Resume { .. } => "resume",
                 _ => "disable",
             };
+            #[cfg(unix)]
+            let repo = current_repo_scoped(&mut entry_scope)?;
+            #[cfg(not(unix))]
             let repo = current_repo()?;
+            #[cfg(unix)]
+            let clock = match entry_scope.as_deref_mut() {
+                Some(scope) => {
+                    let mut owner = crate::capture_command_owner::CommandOwner::with_scope(scope)?;
+                    Clock::now_with(&mut owner)?
+                }
+                None => Clock::now()?,
+            };
+            #[cfg(not(unix))]
+            let clock = Clock::now()?;
             let mut store = Store::open(&directory()?)?;
-            store.control(&repo, action, &Clock::now()?)?;
+            store.control(&repo, action, &clock)?;
             print(
                 json!({"status":action,"binding":store.binding(&repo.key)?}),
                 global.quiet,

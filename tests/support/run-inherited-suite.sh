@@ -9,14 +9,17 @@ shift 3
 export KEITO_TEST_SERVICE_BOUNDARY_RECEIPT="$root/service-boundary-receipt.json"
 "$cargo_bin" test --locked --all-features --all-targets "$@"
 if [ "$#" -eq 0 ]; then
+  mkdir -m 700 "$root/finite-manager-tmp"
+  export TMPDIR="$root/finite-manager-tmp"
   # Finite protocol and bootstrap fake/metadata tests; isolated startup.
   python3 -I -S -B tests/support/test_source_qa_protocol.py
   python3 -I -S -B tests/support/test_source_qa_protocol_review_regressions.py
   python3 -I -S -B tests/support/test_source_owner_finalizer.py
   python3 -I -S -B tests/support/test_source_owner_finalizer_review_regressions.py
+  python3 -I -S -B tests/support/test_runtime_children_finite.py
   python3 -I -S -B tests/support/test_source_qa_build_owner.py
   # Developer-only owned pair QA inherits this same proved policy; never nest it.
   PYTHONDONTWRITEBYTECODE=1 python3 tests/support/test_source_qa_contract.py "$root"
   PYTHONDONTWRITEBYTECODE=1 python3 tests/support/run_guarded_usage_qa.py \
-    "$root" "$cargo_bin" "$(command -v rustc)"
+    "$root" "$cargo_bin" "${KEITO_TEST_RUSTC_BIN:?Canonical toolchain rustc must be prepared before the boundary}"
 fi

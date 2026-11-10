@@ -6,7 +6,10 @@ profile=${KEITO_TEST_REAL_PROFILE_HOME:?Set the original profile for digest-only
 original_home=${HOME:?}
 cargo_home=${CARGO_HOME:-$original_home/.cargo}
 rustup_home=${RUSTUP_HOME:-$original_home/.rustup}
-cargo_bin=$(command -v cargo)
+cargo_bin=${KEITO_TEST_CARGO_BIN:-}
+rustc_bin=${KEITO_TEST_RUSTC_BIN:-}
+if [ -z "$cargo_bin" ]; then cargo_bin=$(rustup which cargo); fi
+if [ -z "$rustc_bin" ]; then rustc_bin=$(rustup which rustc); fi
 cargo_jobs=${CARGO_BUILD_JOBS:-2}
 test_threads=${RUST_TEST_THREADS:-1}
 case "$cargo_jobs:$test_threads" in *[!0-9:]*|:*|*:) echo 'Concurrency bounds must be positive integers' >&2; exit 2;; esac
@@ -57,5 +60,6 @@ env -i HOME="$root/home" CODEX_HOME="$root/home/.codex" CLAUDE_CONFIG_DIR="$root
   GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null PATH="$PATH" \
   CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" CARGO_TARGET_DIR="$repo/target" \
   CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS="$cargo_jobs" RUST_TEST_THREADS="$test_threads" RUSTFLAGS="${RUSTFLAGS:-}" RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}" \
+  KEITO_TEST_RUSTC_BIN="$rustc_bin" \
   /usr/bin/sandbox-exec -f "$root/boundary.sb" /bin/bash "$repo/tests/support/run-inherited-suite.sh" \
   "$root/owned-checker" "$root" "$cargo_bin" "$@"

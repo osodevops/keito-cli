@@ -182,6 +182,7 @@ class OwnedChildren:
         self.io_reserved = 0
         self.first_error = None
         self.entered = False
+        self.hard_end = None
 
     @property
     def active(self):
@@ -209,11 +210,19 @@ class OwnedChildren:
         if self.entered:
             raise ChildFailure("runtime manager reused")
         self.entered = True
-        if self.owns_owner:
-            self.owner.__enter__()
-        self.owner.register_manager(self)
-        for signum in (signal.SIGTERM, signal.SIGINT):
-            self.handlers[signum] = signal.signal(signum, self._cancel)
+        try:
+            if self.owns_owner:
+                self.owner.__enter__()
+            self.owner.register_manager(self)
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                self.handlers[signum] = signal.signal(signum, self._cancel)
+        except BaseException as error:
+            self._fail(error, "RUNTIME_ENTER")
+            for signum, handler in self.handlers.items():
+                signal.signal(signum, handler)
+            if self.owns_owner:
+                self.owner.__exit__(type(error), error, error.__traceback__)
+            raise
         return self
 
     def __exit__(self, kind, exception, traceback):
@@ -244,13 +253,17 @@ class OwnedChildren:
                 or threading.active_count() != 1):
             raise ChildFailure("invalid cooperative runtime operation")
         self.owner.check()
-        at = time.monotonic_ns()
+        at = self.owner.now()
+        self.owner.limit_end(at + 4_000_000_000)
         end = at + int(timeout * 1_000_000_000)
         if self.owner.deadline_ns is not None:
             end = min(end, self.owner.deadline_ns)
         end = min(end, at + 4_000_000_000)
+        if self.hard_end is not None:
+            end = min(end, self.hard_end)
         if end <= at:
             raise ChildFailure("expired cooperative operation")
+        self.hard_end = end
         charge = len(input_bytes) + capture_limit
         if self.owner.runtime_io_reserved + charge > 4 * 1024 * 1024:
             raise ChildFailure("runtime buffer budget")
@@ -263,6 +276,8 @@ class OwnedChildren:
                 "stderr_count": 0, "stdout_eof": False, "stderr_eof": False,
                 "cancel_sent": False, "waited_published": False, "collected": False,
                 "accepted": None, "retrieved": False, "first_fault": None}
+        slot.update({"stdin_configured": False, "stdout_configured": False, "stderr_configured": False,
+                     "control_closed": False, "cancel_end": None})
         # Reserve history and buffers before Popen. Slot remains even on error.
         self.slots.append(slot)
         self.io_reserved += charge
@@ -287,22 +302,27 @@ class OwnedChildren:
                     placeholder = 4
             source_fd = child_end.fileno()
             def attach():
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                 os.dup2(source_fd, 4, inheritable=True)
                 if source_fd != 4:
                     os.close(source_fd)
             self.spawning = True
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM))
             try:
+                self.owner.check()
+                if self.pending_cancel is not None or self.owner.now() >= end:
+                    raise Cancelled(self.pending_cancel or signal.SIGTERM)
                 child = subprocess.Popen(arguments, cwd=self.cwd, env=env,
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                          close_fds=True, pass_fds=tuple(sorted({4, source_fd})), preexec_fn=attach)
                 slot["child"] = child  # BEFORE flags, endpoint identity or receipt.
             finally:
                 self.spawning = False
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             endpoint.expected_pid = child.pid
             if self.pending_cancel is not None:
                 raise Cancelled(self.pending_cancel)
-            for pipe in (child.stdin, child.stdout, child.stderr):
-                os.set_blocking(pipe.fileno(), False)
+            self._configure_pipes(slot)
             self.owner.check()
             self.owner.forward([f"REGISTER|{os.getpid()}|{child.pid}|{nonce}|0"])
             # Ordinary exclusive receipt, after actual returned-handle retention.
@@ -318,15 +338,49 @@ class OwnedChildren:
             if placeholder is not None:
                 os.close(placeholder)
 
+    def _configure_pipes(self, slot):
+        for name in ("stdin", "stdout", "stderr"):
+            try:
+                os.set_blocking(getattr(slot["child"], name).fileno(), False)
+                slot[name + "_configured"] = True
+            except BaseException as error:
+                self._fail(error, "RUNTIME_PIPE_FLAGS")
+                slot["first_fault"] = slot["first_fault"] or "RUNTIME_PIPE_FLAGS"
+        if slot["first_fault"]:
+            raise self.first_error
+
+    def _close_input(self, slot):
+        child = slot["child"]
+        if child is not None and child.stdin is not None:
+            try:
+                child.stdin.close()
+                child.stdin = None
+            except BaseException as error:
+                slot["first_fault"] = slot["first_fault"] or "RUNTIME_INPUT_CLOSE"
+                self._fail(error, "RUNTIME_INPUT_CLOSE")
+
+    def _close_control(self, slot):
+        if not slot.get("control_closed", False):
+            try:
+                slot["endpoint"].close()
+                slot["control_closed"] = True
+            except BaseException as error:
+                self._fail(error, "RUNTIME_CONTROL_CLOSE")
+
     def _poll_slot(self, slot, accepting):
         from source_qa_protocol import ProtocolError
         child = slot["child"]
         if child is None:
+            self._close_control(slot)
             slot["collected"] = True
             return
         endpoint = slot["endpoint"]
         try:
-            endpoint.receive(parent=False)
+            if endpoint.first_fault:
+                self._fail(ProtocolError(endpoint.first_fault), "RUNTIME_ENDPOINT")
+                endpoint.drain_failed()
+            else:
+                endpoint.receive(parent=False)
         except ProtocolError as error:
             slot["first_fault"] = slot["first_fault"] or str(error)
             self._fail(error, "RUNTIME_ENDPOINT")
@@ -338,8 +392,8 @@ class OwnedChildren:
                 self._fail(error, "RUNTIME_FORWARD")
         if child.stdin is not None:
             if self.cleanup_end is not None or slot["offset"] == len(slot["input"]):
-                child.stdin.close(); child.stdin = None
-            else:
+                self._close_input(slot)
+            elif slot.get("stdin_configured", False):
                 try:
                     count = os.write(child.stdin.fileno(), memoryview(slot["input"])[slot["offset"]:slot["offset"] + 4096])
                     if count <= 0:
@@ -350,10 +404,10 @@ class OwnedChildren:
                 except OSError as error:
                     slot["first_fault"] = slot["first_fault"] or "RUNTIME_INPUT_WRITE"
                     self._fail(error, "RUNTIME_INPUT_WRITE")
-                    child.stdin.close(); child.stdin = None
+                    self._close_input(slot)
         for name in ("stdout", "stderr"):
             pipe = getattr(child, name)
-            if pipe is None:
+            if pipe is None or not slot.get(name + "_configured", False):
                 continue
             for _ in range(8):
                 try:
@@ -387,49 +441,64 @@ class OwnedChildren:
             except BaseException as error:
                 self._fail(error, "RUNTIME_WAIT_RECEIPT")
         slot["collected"] = (status is not None and slot["stdout_eof"] and slot["stderr_eof"]
-                             and child.stdin is None and (endpoint.eof or endpoint.first_fault is not None))
+                             and child.stdin is None and endpoint.eof)
+        at = self.owner.now()
         if (accepting and slot["accepted"] is None and slot["collected"] and endpoint.settled
                 and slot["first_fault"] is None and self.owner.first_fault is None
-                and time.monotonic_ns() < slot["end"]):
-            slot["accepted"] = time.monotonic_ns()
+                and at < slot["end"]):
+            slot["accepted"] = at
+        if slot["collected"]:
+            self._close_control(slot)
+            if not slot.get("control_closed", False): slot["collected"] = False
 
     def poll(self):
         try:
             self.owner.check()
         except BaseException as error:
             self._fail(error, "RUNTIME_PARENT_OR_SIGNAL")
+        if self.owner.first_fault:
+            self.begin_cleanup(self.hard_end if self.hard_end is not None else self.owner.now())
         for slot in self.slots:
             if not slot["collected"]:
-                self._poll_slot(slot, True)
+                try: self._poll_slot(slot, self.owner.first_fault is None)
+                except BaseException as error: self._fail(error, "RUNTIME_SLOT_POLL")
+                if self.owner.first_fault:
+                    self.begin_cleanup(self.hard_end if self.hard_end is not None else slot["end"])
             if slot["accepted"] is None and time.monotonic_ns() >= slot["end"]:
                 self._fail(subprocess.TimeoutExpired(slot["label"], 0), "RUNTIME_DEADLINE")
         if self.owner.first_fault:
-            self.begin_cleanup(time.monotonic_ns() + 4_000_000_000)
+            self.begin_cleanup(self.hard_end if self.hard_end is not None else self.owner.now())
         return all(slot["accepted"] is not None for slot in self.slots)
 
     def begin_cleanup(self, end):
-        self.cleanup_end = min(self.cleanup_end or end, end, time.monotonic_ns() + 4_000_000_000)
+        bounds = [end]
+        if self.cleanup_end is not None: bounds.append(self.cleanup_end)
+        if self.hard_end is not None: bounds.append(self.hard_end)
+        bounds.extend(slot["end"] for slot in self.slots if slot["accepted"] is None)
         if self.owner.deadline_ns is not None:
-            self.cleanup_end = min(self.cleanup_end, self.owner.deadline_ns)
+            bounds.append(self.owner.deadline_ns)
+        self.cleanup_end = min(bounds)
         # Broadcast ALL cancellation/close intents before any wait or drain.
         for slot in self.slots:
             if slot["child"] is None or slot["accepted"] is not None:
                 continue
             child = slot["child"]
-            if child.stdin is not None:
-                child.stdin.close(); child.stdin = None
-            if not slot["cancel_sent"] and not slot["endpoint"].settled:
+            self._close_input(slot)
+            if (not slot["endpoint"].settled and (slot.get("cancel_end") is None or self.cleanup_end < slot["cancel_end"])):
                 slot["cancel_sent"] = True
+                slot["cancel_end"] = self.cleanup_end
                 try:
-                    slot["endpoint"].send("CANCEL", deadline_ns=max(1, self.cleanup_end))
+                    slot["endpoint"].cancel_tighter(max(1, self.cleanup_end))
                 except BaseException as error:
                     self._fail(error, "RUNTIME_CANCEL_WRITE")
 
     def poll_cleanup(self, end):
-        self.cleanup_end = min(self.cleanup_end or end, end)
+        self.owner.pump_parent()
+        self.begin_cleanup(end)
         for slot in self.slots:
             if not slot["collected"]:
-                self._poll_slot(slot, False)
+                try: self._poll_slot(slot, False)
+                except BaseException as error: self._fail(error, "RUNTIME_SLOT_COLLECTION")
         return all(slot["collected"] for slot in self.slots)
 
     def complete(self, slot):

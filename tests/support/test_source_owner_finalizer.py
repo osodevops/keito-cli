@@ -15,6 +15,8 @@ from source_qa_children import Cancelled
 
 
 class Parent:
+    cancel_deadline_ns = None
+    def receive(self, parent=False, failure_only=False): return False
     def __init__(self, close_error=False):
         self.sent = []
         self.closed = False

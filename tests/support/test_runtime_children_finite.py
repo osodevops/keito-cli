@@ -16,6 +16,8 @@ class Pipe:
     def __init__(self, fd): self.fd, self.closed = fd, False
     def fileno(self): return self.fd
     def close(self): self.closed = True
+    def cancel_tighter(self, end): self.send("CANCEL", deadline_ns=end)
+    def drain_failed(self): return self.eof
 
 
 class Child:
@@ -58,6 +60,9 @@ class RuntimeManagerTests(unittest.TestCase):
         self.a = slot("a", 101, self.trace, self.end)
         self.b = slot("b", 102, self.trace, self.end)
         self.manager.slots = [self.a, self.b]
+        for value in self.manager.slots:
+            value.update({"stdin_configured": True, "stdout_configured": True, "stderr_configured": True,
+                          "control_closed": False, "cancel_end": None})
         self.owner.forward([f"REGISTER|{os.getpid()}|101|{'a'*32}|0",
                             f"REGISTER|{os.getpid()}|102|{'b'*32}|0"])
 
@@ -155,7 +160,9 @@ class RuntimeManagerTests(unittest.TestCase):
         self.a["child"].returncode = 0
         with patch("os.read", return_value=b""):
             self.manager._poll_slot(self.a, False)
-        self.assertTrue(self.a["collected"])
+        # Contract correction AO-04: wait/pipe EOF are retained, but a failed
+        # endpoint is no longer substituted for physical control EOF.
+        self.assertFalse(self.a["collected"])
         self.assertTrue(self.a["stdout_eof"] and self.a["stderr_eof"])
         self.assertIsNone(self.a["accepted"])
         self.assertEqual(self.owner.first_fault, "RUNTIME_ENDPOINT")

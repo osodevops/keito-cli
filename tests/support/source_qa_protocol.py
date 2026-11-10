@@ -124,6 +124,7 @@ class Endpoint:
         self.registrations = {}
         self._parent_role = None
         self._sent_live = self._sent_terminal = self._sent_cancel = False
+        self._sent_cancel_end = None
         self._failed_attempted = False
         self._sent_ledger = MetadataLedger(os.getpid(), self.budget)
         self._sent_registrations = self._sent_ledger.records
@@ -183,6 +184,7 @@ class Endpoint:
             self._sent_cancel = True
             if type(deadline_ns) is not int or not 1 <= deadline_ns <= 18446744073709551615:
                 self.fail("CANCEL_DEADLINE")
+            self._sent_cancel_end = deadline_ns
             self._send("CANCEL|{}|{}".format(os.getpid(), deadline_ns))
             return
         else:
@@ -193,6 +195,16 @@ class Endpoint:
                 self.channel.shutdown(socket.SHUT_WR)
             except OSError:
                 self.fail("SHUTDOWN_FAILED")
+
+    def cancel_tighter(self, end):
+        self._check()
+        if type(end) is not int or not 1 <= end <= 18446744073709551615 or self._sent_terminal or self._sent_live:
+            self.fail("CANCEL_DEADLINE")
+        if self._sent_cancel_end is None:
+            return self.send("CANCEL", deadline_ns=end)
+        if end < self._sent_cancel_end:
+            self._sent_cancel_end = end
+            self._send("CANCEL|{}|{}".format(os.getpid(), end))
 
     def metadata(self, value):
         self._check()
@@ -260,8 +272,11 @@ class Endpoint:
         else:
             self.fail("CHILD_STATE")
 
-    def receive(self, parent=False):
-        self._check()
+    def receive(self, parent=False, failure_only=False):
+        if not failure_only:
+            self._check()
+        elif not parent:
+            return self.drain_failed()
         if self._parent_role is None:
             self._parent_role = parent
         if self._parent_role != parent:
@@ -310,6 +325,26 @@ class Endpoint:
         except ProtocolError as error:
             self.fail(str(error))
         return self.cancelled
+
+    def drain_failed(self):
+        """Failure-only bounded discard: read-zero alone establishes EOF.
+
+        It cannot parse a terminal, settle, erase a fault or reopen admission.
+        """
+        self.pending.clear()
+        for _ in range(MAX_READS):
+            if self.eof:
+                break
+            try:
+                block = self.channel.recv(MAX_FRAME)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            if not block:
+                self.eof = True
+                break
+        return self.eof
 
     def close(self):
         self.channel.close()
@@ -374,6 +409,7 @@ class SourceOwner:
         return self
 
     def check(self):
+        self.pump_parent()
         if self.first_fault:
             raise ProtocolError(self.first_fault)
         if self.budget.first_fault or self.budget.owner_fault:
@@ -382,19 +418,38 @@ class SourceOwner:
         if self.admission_closed and not self.cancelled:
             self.fail("OWNER_ADMISSION_CLOSED")
             raise ProtocolError(self.first_fault)
-        try:
-            if self.parent:
-                self.cancelled |= self.parent.receive(parent=True)
-                if self.parent.cancel_deadline_ns is not None:
-                    received = self.parent.cancel_deadline_ns
-                    self.deadline_ns = min(self.deadline_ns or received, received)
-        except ProtocolError as error:
-            self.fail(str(error))
-            raise
         if self.cancelled:
             self.admission_closed = True
             from source_qa_children import Cancelled
             raise Cancelled(signal.SIGTERM)
+
+    def now(self):
+        try:
+            return time.monotonic_ns()
+        except BaseException:
+            self.deadline_ns = 0
+            self.fail("OWNER_CLOCK")
+            return 0
+
+    def limit_end(self, end):
+        self.deadline_ns = end if self.deadline_ns is None else min(self.deadline_ns, end)
+
+    def pump_parent(self):
+        if self.parent:
+            try:
+                if self.first_fault is None:
+                    self.cancelled |= self.parent.receive(parent=True)
+                else:
+                    self.cancelled |= self.parent.receive(parent=True, failure_only=True)
+            except ProtocolError as error:
+                self.fail(str(error))
+                if self.budget.first_fault:
+                    self.limit_end(0)
+            if self.parent.cancel_deadline_ns is not None:
+                self.limit_end(self.parent.cancel_deadline_ns)
+        at = self.now()
+        if self.deadline_ns is not None and at >= self.deadline_ns:
+            self.fail("OWNER_DEADLINE")
 
     def forward(self, events):
         try:
@@ -433,8 +488,9 @@ class SourceOwner:
         self.admission_closed = True
         if self.budget.first_fault or self.budget.owner_fault:
             self.fail(self.budget.first_fault or self.budget.owner_fault)
-        deadline = time.monotonic_ns() + 4_000_000_000
-        self.deadline_ns = min(self.deadline_ns or deadline, deadline)
+        self.pump_parent()
+        deadline = self.now() + 4_000_000_000
+        self.limit_end(deadline)
         if len(self.managers) > MAX_REGISTRATIONS:
             self.fail("MANAGER_LIMIT")
             raise ProtocolError(self.first_fault)
@@ -453,6 +509,13 @@ class SourceOwner:
                 self._failed_managers.add(identity)
                 self.fail("MANAGER_CLEANUP_BEGIN")
         while pending:
+            previous_end = self.deadline_ns
+            self.pump_parent()
+            if self.deadline_ns < previous_end:
+                for manager in pending:
+                    try: manager.begin_cleanup(self.deadline_ns)
+                    except BaseException:
+                        self._failed_managers.add(id(manager)); self.fail("MANAGER_CLEANUP_BEGIN")
             if time.monotonic_ns() >= self.deadline_ns:
                 self.fail("MANAGER_CLEANUP_DEADLINE")
                 break
@@ -490,6 +553,7 @@ class SourceOwner:
                 time.sleep(0.001)
         if not self._forward_ledger.complete():
             self.fail("UNWAITED_FORWARD_REGISTRATION")
+        self.pump_parent()
 
     def __exit__(self, exception_type, exception, traceback):
         global CURRENT
@@ -506,6 +570,7 @@ class SourceOwner:
                 self.fail("OWNER_FINALIZATION_FAILED")
             if self.parent:
                 try:
+                    self.pump_parent()
                     self.parent.send("FAILED" if self.unsettled else "SETTLED")
                 except BaseException:
                     self.fail("TERMINAL_WRITE")

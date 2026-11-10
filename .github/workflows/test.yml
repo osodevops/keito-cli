@@ -87,6 +87,11 @@ jobs:
         run: |
           qa_root=$(mktemp -d /tmp/keito-source-usage.XXXXXX)
           chmod 700 "$qa_root"
+          mkdir -m 700 "$qa_root/finite-tmp"
+          export TMPDIR="$qa_root/finite-tmp"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          cargo_bin=$(rustup which cargo)
+          rustc_bin=$(rustup which rustc)
           python3 -I -S -B tests/support/test_source_qa_protocol.py
           python3 -I -S -B tests/support/test_source_qa_protocol_review_regressions.py
           python3 -I -S -B tests/support/test_source_owner_finalizer.py
@@ -97,7 +102,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 tests/support/source_qa_manifest.py collect "$PWD" "$qa_root"
           qa_result=0
           PYTHONDONTWRITEBYTECODE=1 python3 tests/support/run_guarded_usage_qa.py \
-            "$qa_root" "$(command -v cargo)" "$(command -v rustc)" || qa_result=$?
+            "$qa_root" "$cargo_bin" "$rustc_bin" || qa_result=$?
           complete_result=0
           PYTHONDONTWRITEBYTECODE=1 python3 tests/support/source_qa_manifest.py verify-complete \
             "$PWD" "$qa_root" || complete_result=$?
