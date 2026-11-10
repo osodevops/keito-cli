@@ -327,6 +327,10 @@ class SourceOwner:
         self.budget = Budget()
         self._forward_ledger = MetadataLedger(os.getpid(), self.budget)
         self._finished_managers = set()
+        # Resource collection after a callback fault is not clean proof. Keep
+        # both the manager object and this separate terminal fact permanently.
+        self._failed_managers = set()
+        self._collected_failed_managers = set()
         self._closed = False
 
     def fail(self, reason):
@@ -422,12 +426,16 @@ class SourceOwner:
         # Broadcast before waiting. active==None or direct wait is not proof.
         pending = []
         for manager in self.managers:
-            if id(manager) in self._finished_managers:
+            identity = id(manager)
+            if identity in self._finished_managers or identity in self._collected_failed_managers:
                 continue
+            # Retain before invoking begin: an exception cannot erase the next
+            # opportunity to collect this manager's already-owned resources.
+            pending.append(manager)
             try:
                 manager.begin_cleanup(self.deadline_ns)
-                pending.append(manager)
             except BaseException:
+                self._failed_managers.add(identity)
                 self.fail("MANAGER_CLEANUP_BEGIN")
         while pending:
             if time.monotonic_ns() >= self.deadline_ns:
@@ -447,11 +455,18 @@ class SourceOwner:
                     elif result is False:
                         remaining.append(manager)
                     elif result is True:
-                        self._finished_managers.add(id(manager))
+                        if id(manager) in self._failed_managers:
+                            self._collected_failed_managers.add(id(manager))
+                        else:
+                            self._finished_managers.add(id(manager))
                     else:
+                        self._failed_managers.add(id(manager))
                         self.fail("MANAGER_PROOF_SCHEMA")
+                        remaining.append(manager)
                 except BaseException:
+                    self._failed_managers.add(id(manager))
                     self.fail("MANAGER_CLEANUP_POLL")
+                    remaining.append(manager)
             pending = remaining
             if pending and time.monotonic_ns() >= self.deadline_ns:
                 self.fail("MANAGER_CLEANUP_DEADLINE")
@@ -463,21 +478,31 @@ class SourceOwner:
 
     def __exit__(self, exception_type, exception, traceback):
         global CURRENT
-        terminal_error = None
+        # Any abnormal operation must be latched BEFORE resource finalization
+        # or terminal emission; do not persist arbitrary exception text.
         if isinstance(exception, ProtocolError):
             self.fail(str(exception))
+        elif exception is not None:
+            self.fail("OWNER_OPERATION_FAILED")
         try:
-            self.finish_managers()
+            try:
+                self.finish_managers()
+            except BaseException:
+                self.fail("OWNER_FINALIZATION_FAILED")
             if self.parent:
                 try:
                     self.parent.send("FAILED" if self.unsettled else "SETTLED")
-                except (ProtocolError, OSError) as error:
+                except BaseException:
                     self.fail("TERMINAL_WRITE")
-                    terminal_error = error
         finally:
             self._closed = True
-            if self.parent:
-                self.parent.close()
-            CURRENT = self.previous
-        if exception is None and (self.first_fault or terminal_error):
-            raise ProtocolError(self.first_fault or "TERMINAL_WRITE")
+            try:
+                if self.parent:
+                    self.parent.close()
+            except BaseException:
+                self.fail("OWNER_CLOSE_FAILED")
+            finally:
+                CURRENT = self.previous
+        if exception is None and self.first_fault:
+            raise ProtocolError(self.first_fault)
+        return False  # Preserve the original operation exception/traceback.
