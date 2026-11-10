@@ -38,6 +38,15 @@ impl CleanupPolicy {
     fn setup_ns(self) -> u64 {
         match self { Self::Legacy => CLEANUP_NS, Self::HookShort => 20_000_000 }
     }
+    fn keeper_tag(tag: Option<&str>) -> io::Result<Self> {
+        match tag { None => Ok(Self::Legacy), Some("hook-short-v1") => Ok(Self::HookShort), _ => Err(refused("KEEPER_POLICY")) }
+    }
+    fn setup_end(self, at: u64, hard_end: u64) -> u64 {
+        at.saturating_add(self.setup_ns()).min(hard_end.saturating_sub(self.reserve_ns()))
+    }
+    fn observation_end(self, at: u64, inherited_end: u64) -> u64 {
+        at.saturating_add(self.reserve_ns()).min(inherited_end)
+    }
 }
 
 fn refused(reason: &'static str) -> io::Error {
@@ -303,17 +312,17 @@ impl Lifetime {
     fn new(at: u64, hard_end: u64) -> io::Result<Self> {
         Self::with_policy(at, hard_end, CleanupPolicy::Legacy)
     }
-    fn with_policy(at: u64, hard_end: u64, _policy: CleanupPolicy) -> io::Result<Self> {
+    fn with_policy(at: u64, hard_end: u64, policy: CleanupPolicy) -> io::Result<Self> {
         let remaining = hard_end
             .checked_sub(at)
             .ok_or_else(|| refused("GROUP_LIFETIME"))?;
-        if remaining <= CLEANUP_NS || remaining > MAX_LIFETIME_NS {
+        if remaining <= policy.reserve_ns() || remaining > MAX_LIFETIME_NS {
             return Err(refused("GROUP_LIFETIME"));
         }
         Ok(Self {
-            operation_end: hard_end - CLEANUP_NS,
+            operation_end: hard_end - policy.reserve_ns(),
             hard_end,
-            policy: CleanupPolicy::Legacy,
+            policy,
         })
     }
 }
@@ -366,7 +375,7 @@ impl Settlement {
     fn new(hard_end: u64) -> Self {
         Self::with_policy(hard_end, CleanupPolicy::Legacy)
     }
-    fn with_policy(hard_end: u64, _policy: CleanupPolicy) -> Self {
+    fn with_policy(hard_end: u64, policy: CleanupPolicy) -> Self {
         Self {
             progress: Progress::new(hard_end),
             workload_status: None,
@@ -375,7 +384,7 @@ impl Settlement {
             release_sent: false,
             group_absent: false,
             expected_ready: None,
-            policy: CleanupPolicy::Legacy,
+            policy,
         }
     }
     fn begin(&mut self, deadline_ns: u64, at: u64, channel: &mut Channel) -> io::Result<()> {
@@ -392,7 +401,7 @@ impl Settlement {
             };
         }
         let end = deadline_ns
-            .min(at.saturating_add(CLEANUP_NS))
+            .min(at.saturating_add(self.policy.reserve_ns()))
             .min(self.progress.deadline_ns);
         if !self.cleanup_sent || end < self.progress.deadline_ns {
             channel.send(&format!("CLEAN|{end}"))?;
@@ -563,12 +572,23 @@ impl GroupLease {
         keeper_image: &Path,
         lifetime_deadline_ns: u64,
     ) -> io::Result<Self> {
+        Self::spawn_keeper_with_policy(owner, run_root, keeper_image, lifetime_deadline_ns, CleanupPolicy::Legacy)
+    }
+    /// Explicit short policy for same-session leaves. Product image authority,
+    /// cooperative core and I/O wiring remain separate prerequisites.
+    pub fn spawn_keeper_with_policy(
+        owner: SharedOwner,
+        run_root: &Path,
+        keeper_image: &Path,
+        lifetime_deadline_ns: u64,
+        policy: CleanupPolicy,
+    ) -> io::Result<Self> {
         owner
             .borrow()
             .check_admission()
             .map_err(|_| refused("GROUP_ADMISSION"))?;
         let current = now()?;
-        if Lifetime::new(current, lifetime_deadline_ns).is_err() {
+        if Lifetime::with_policy(current, lifetime_deadline_ns, policy).is_err() {
             return Err(refused("GROUP_LIFETIME"));
         }
         for path in [run_root, keeper_image] {
@@ -621,6 +641,9 @@ impl GroupLease {
                 sid.to_string(),
                 lifetime_deadline_ns.to_string(),
             ]);
+        if policy == CleanupPolicy::HookShort {
+            command.arg("hook-short-v1");
+        }
         // Core Foundation may initialize before this helper's main. Supply
         // synthetic UID/zero encoding metadata instead of consulting the
         // operator's encoding file. No auth/profile value is inherited.
@@ -640,7 +663,11 @@ impl GroupLease {
         let keeper = command.spawn()?;
         let keeper_pid = keeper.id() as libc::pid_t;
         // The real handle is owned before any fallible read or publication.
-        let mut settlement = Settlement::new(lifetime_deadline_ns);
+        let mut settlement = if policy == CleanupPolicy::Legacy {
+            Settlement::new(lifetime_deadline_ns)
+        } else {
+            Settlement::with_policy(lifetime_deadline_ns, policy)
+        };
         settlement.expected_ready = Some(format!("READY|{keeper_pid}|{keeper_pid}|{sid}"));
         let lease = Self {
             keeper,
@@ -696,12 +723,7 @@ impl GroupLease {
             if self.settlement.progress.phase != Phase::AwaitReady {
                 return Err(refused("GROUP_STATE"));
             }
-            let deadline = now()?.saturating_add(CLEANUP_NS).min(
-                self.settlement
-                    .progress
-                    .deadline_ns
-                    .saturating_sub(CLEANUP_NS),
-            );
+            let deadline = self.settlement.policy.setup_end(now()?, self.settlement.progress.deadline_ns);
             let body = self.channel.wait_frame(deadline)?;
             if body != format!("READY|{}|{}|{}", self.keeper_pid, self.keeper_pid, self.sid) {
                 return Err(refused("GROUP_READY"));
@@ -727,7 +749,7 @@ impl GroupLease {
                     .settlement
                     .progress
                     .deadline_ns
-                    .saturating_sub(CLEANUP_NS)
+                    .saturating_sub(self.settlement.policy.reserve_ns())
             {
                 return Err(refused("GROUP_DEADLINE"));
             }
@@ -748,14 +770,7 @@ impl GroupLease {
                 .advance(Phase::Ready, Phase::Joined)?;
             self.check_admission()?;
             self.channel.send("PARK")?;
-            let response = self.channel.wait_frame(
-                now()?.saturating_add(CLEANUP_NS).min(
-                    self.settlement
-                        .progress
-                        .deadline_ns
-                        .saturating_sub(CLEANUP_NS),
-                ),
-            )?;
+            let response = self.channel.wait_frame(self.settlement.policy.setup_end(now()?, self.settlement.progress.deadline_ns))?;
             if response
                 != format!(
                     "PARKED|{}|{}|{}",
@@ -846,10 +861,7 @@ impl Drop for GroupLease {
         // proof deadline passed. Explicit owner must retain report/unknowns.
         self.settlement
             .collect(&mut self.keeper, self.workload.as_mut());
-        let deadline = now()
-            .unwrap_or(0)
-            .saturating_add(CLEANUP_NS)
-            .min(self.settlement.progress.deadline_ns);
+        let deadline = self.settlement.policy.observation_end(now().unwrap_or(0), self.settlement.progress.deadline_ns);
         while now().unwrap_or(deadline) < deadline {
             self.settlement
                 .collect(&mut self.keeper, self.workload.as_mut());
@@ -970,7 +982,7 @@ impl<G: GroupOps> KeeperSession<G> {
         self.first_fault.get_or_insert(reason);
         if !self.cleaning && !self.gone {
             self.cleaning = true;
-            self.end = self.end.min(at.saturating_add(CLEANUP_NS));
+            self.end = self.end.min(at.saturating_add(self.lifetime.policy.reserve_ns()));
         }
     }
     fn check_authority(&self) -> io::Result<()> {
@@ -1003,7 +1015,7 @@ impl<G: GroupOps> KeeperSession<G> {
             self.end = self
                 .end
                 .min(number(end)?)
-                .min(at.saturating_add(CLEANUP_NS));
+                .min(at.saturating_add(self.lifetime.policy.reserve_ns()));
             self.cleaning = true;
             Ok(())
         } else if body == "RELEASE" && self.gone && self.first_fault.is_none() {
@@ -1066,7 +1078,7 @@ impl<G: GroupOps> KeeperSession<G> {
             }
         } else {
             let at = self.check_time(clock)?;
-            self.term_end = Some(at.saturating_add(TERM_NS));
+            self.term_end = Some(at.saturating_add(self.lifetime.policy.term_ns()));
             self.group.signal(libc::SIGTERM)?;
         }
         Ok(false)
@@ -1181,7 +1193,7 @@ pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io
                 .ok_or_else(|| refused("KEEPER_ARG"))
         })
         .collect::<io::Result<_>>()?;
-    if values.len() != 6 || !nonce_valid(&values[1]) {
+    if !matches!(values.len(), 6 | 7) || !nonce_valid(&values[1]) {
         return Err(refused("KEEPER_ARGS"));
     }
     let fd = number(&values[0])?;
@@ -1189,6 +1201,13 @@ pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io
     let park = number(&values[3])?;
     let sid = number(&values[4])?;
     let deadline = number(&values[5])?;
+    let policy = CleanupPolicy::keeper_tag(values.get(6).map(String::as_str))?;
+    let admitted_at = now()?;
+    let lifetime = if policy == CleanupPolicy::Legacy {
+        Lifetime::new(admitted_at, deadline)?
+    } else {
+        Lifetime::with_policy(admitted_at, deadline, policy)?
+    };
     if !(4..=1024).contains(&fd)
         || parent != unsafe { libc::getppid() } as u64
         || park == 0
@@ -1196,8 +1215,6 @@ pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io
         || sid != unsafe { libc::getsid(0) } as u64
         || unsafe { libc::getpid() } != unsafe { libc::getpgrp() }
         || unsafe { libc::getpid() } as u64 == sid
-        || deadline <= now()?
-        || deadline - now()? > MAX_LIFETIME_NS
     {
         return Err(refused("KEEPER_IDENTITY"));
     }
@@ -1218,7 +1235,6 @@ pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io
     }
     let stream = unsafe { UnixStream::from_raw_fd(fd as i32) };
     let mut channel = Channel::new(stream, values[1].clone())?;
-    let lifetime = Lifetime::new(now()?, deadline)?;
     let group = KeeperGroup {
         pid: unsafe { libc::getpid() },
         park: park as libc::pid_t,
@@ -2808,6 +2824,24 @@ mod short_policy_tests {
         assert!(s.step(&mut ||Ok(550_000_000)).is_err());
         assert_eq!(s.group.actions,before);
         assert_eq!(s.first_fault,Some("KEEPER_LIFETIME"));
+    }
+    #[test]
+    fn short_handshake_and_failed_drop_never_restart_the_inherited_budget() {
+        let p=CleanupPolicy::HookShort;
+        assert_eq!(p.setup_end(100_000_000,550_000_000),120_000_000);
+        assert_eq!(p.setup_end(490_000_000,550_000_000),500_000_000);
+        assert_eq!(p.observation_end(100_000_000,140_000_000),140_000_000);
+        assert_eq!(p.observation_end(200_000_000,140_000_000),140_000_000);
+        assert_eq!(p.observation_end(u64::MAX-1,u64::MAX),u64::MAX);
+        assert_eq!(CleanupPolicy::Legacy.setup_end(0,3_000_000_000),1_200_000_000);
+    }
+    #[test]
+    fn keeper_policy_tag_is_closed_not_a_caller_supplied_allowance() {
+        assert_eq!(CleanupPolicy::keeper_tag(None).unwrap(),CleanupPolicy::Legacy);
+        assert_eq!(CleanupPolicy::keeper_tag(Some("hook-short-v1")).unwrap(),CleanupPolicy::HookShort);
+        for invalid in ["", "legacy", "hook-short-v2", "5000000000", "hook-short-v1\n"] {
+            assert_eq!(CleanupPolicy::keeper_tag(Some(invalid)).unwrap_err().to_string(),"KEEPER_POLICY");
+        }
     }
     #[test]
     fn legacy_policy_values_and_admission_remain_unchanged() {
