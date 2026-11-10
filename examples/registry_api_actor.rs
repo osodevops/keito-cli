@@ -654,6 +654,8 @@ mod unix {
             run.registry.await_ready(&a).map_err(|_| "READY_0")?;
             run.start(&root, &image, &a, 0)?;
             run.ready(start + 400_000_000)?;
+            let live = run.facts();
+            run.event("SLOT_ZERO_LIVE_BEFORE_SECOND_ADMISSION", live)?;
             let b = run.spawn(&root, &keeper, 1);
             if scenario == "api-publication-fault" {
                 if b.as_ref()
@@ -669,7 +671,7 @@ mod unix {
                 run.ready(start + 400_000_000)?;
             }
             let live = run.facts();
-            run.event("LIVE_BEFORE_CASE_ACTION", live)?;
+            run.event("AFTER_SECOND_ADMISSION", live)?;
             if scenario == "api-edge-fault" {
                 let mut refused = Command::new(&image);
                 refused
@@ -752,7 +754,9 @@ mod unix {
                 if report.first_fault.is_some()
                     || !report.all_group_proofs
                     || report.groups.iter().any(|g| {
-                        !g.facts.keeper_status.is_some_and(|s| s.success()) || !g.facts.terminal_eof
+                        !g.facts.keeper_status.is_some_and(|s| s.success())
+                            || !g.facts.workload_status.is_some_and(|s| s.success())
+                            || !g.facts.terminal_eof
                     })
                 {
                     return Err("CLEAN_UNPROVEN");
