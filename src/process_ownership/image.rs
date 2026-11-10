@@ -54,9 +54,8 @@ impl VerifiedKeeperImage {
         if fd < 0 { return Err(refused()); }
         let mut file = unsafe { File::from_raw_fd(fd) };
         let before = file.metadata().map_err(|_| refused())?;
-        // Migration baseline retains the old QA-only mode restriction. The
-        // official-image acceptance test requires a distinct product policy.
-        if !before.is_file() || before.mode() & 0o777 != 0o700 || before.nlink() != 1
+        // Separate product policy; the legacy QA constructor still requires700.
+        if !before.is_file() || before.mode() & 0o111 == 0 || before.mode() & 0o022 != 0 || before.nlink() != 1
             || (before.uid() != 0 && before.uid() != unsafe { libc::geteuid() }) || before.len() > MAX_IMAGE {
             return Err(refused());
         }
@@ -219,5 +218,16 @@ mod tests {
         assert_eq!(bootstrap_fd("5",4).unwrap(),5);
         for raw in ["0","3","4","05","+5"," 5","1025","-1",""] {assert!(bootstrap_fd(raw,4).is_err());}
         assert!(bootstrap_fd("5",5).is_err());
+    }
+    #[test]
+    fn r40_image_parent_replaced_with_symlink_is_not_a_live_managed_path() {
+        let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();
+        let managed=root.join("managed");fs::create_dir(&managed).unwrap();
+        let path=managed.join("keito-capture-guard");fs::write(&path,b"inert; never execute").unwrap();
+        fs::set_permissions(&path,fs::Permissions::from_mode(0o700)).unwrap();
+        let hash:String=Sha256::digest(fs::read(&path).unwrap()).iter().map(|b|format!("{b:02x}")).collect();
+        let image=VerifiedKeeperImage::open(&path,&hash).unwrap();
+        let old=root.join("old");fs::rename(&managed,&old).unwrap();symlink(&old,&managed).unwrap();
+        assert!(image.check_current().is_err());
     }
 }
