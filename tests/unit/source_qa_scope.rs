@@ -194,3 +194,31 @@ fn prior_owner_cause_survives_all_cleanup_faults_and_secondary_codes_are_bounded
     assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("ORIGINAL_RECEIPT")));
     assert_eq!(r.secondary_faults, [ProtocolError("SCOPE_BEGIN"), ProtocolError("SCOPE_POLL"), ProtocolError("LATER_CLEANUP")]);
 }
+
+#[test]
+fn expired_admission_is_irreversible_and_broadcasts_to_retained_slots() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    r.slots.push(edge(&trace, 0));
+    let mut created = false;
+    assert!(r.admit(r.hard_end, |_| { created = true; Ok(edge(&trace, 1)) }, |_, _| Ok(())).is_err());
+    assert!(!created);
+    assert!(r.owner.borrow().admission_closed);
+    assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("SCOPE_ADMISSION")));
+    assert_eq!(trace.borrow().calls[0].0, "begin");
+}
+
+#[test]
+fn sealed_finished_bound_is_not_silently_shortened_or_rebroadcast() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    let mut first = edge(&trace, 0); first.waited = true; first.proof = true;
+    r.slots.push(first);
+    r.begin(10, 500);
+    assert!(r.finish_at(100));
+    let before = trace.borrow().calls.clone();
+    r.begin(110, 200);
+    assert_eq!(trace.borrow().calls, before);
+    assert_eq!(r.cleanup_end, Some(500));
+    assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("SCOPE_BOUND_SEALED")));
+}

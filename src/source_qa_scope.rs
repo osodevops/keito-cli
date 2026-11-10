@@ -98,6 +98,8 @@ impl<E: Edge> Registry<E> {
             return Err(io::Error::other(error.0));
         }
         if self.finished || self.cleanup_end.is_some() || at >= self.hard_end {
+            self.poison("SCOPE_ADMISSION");
+            self.begin(at, self.hard_end);
             return Err(io::Error::other("SCOPE_ADMISSION"));
         }
         if self.slots.len() >= MAX_REGISTRATIONS || self.slots.try_reserve(1).is_err() {
@@ -133,7 +135,12 @@ impl<E: Edge> Registry<E> {
     }
     fn begin(&mut self, at: u64, requested: u64) {
         self.owner.borrow_mut().admission_closed = true;
-        if self.finished { return; }
+        if self.finished {
+            if requested < self.cleanup_end.unwrap_or(self.hard_end) {
+                self.poison("SCOPE_BOUND_SEALED");
+            }
+            return;
+        }
         let end = requested.min(self.hard_end).min(at.saturating_add(CLEANUP_NS))
             .min(self.cleanup_end.unwrap_or(u64::MAX));
         if self.cleanup_end == Some(end) { return; }
@@ -246,6 +253,9 @@ impl GroupRegistry {
         }
     }
     pub fn poll_cleanup(&mut self) -> RegistryReport {
+        if self.inner.cleanup_end.is_none() {
+            self.begin_cleanup(self.inner.hard_end);
+        }
         self.inner.poll();
         self.report()
     }
