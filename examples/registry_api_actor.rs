@@ -68,6 +68,7 @@ mod unix {
             "ARGS"
             | "PRIVATE_ENV"
             | "ENV_KEYS"
+            | "ENV_KEYS_CF_TEXT_ENCODING"
             | "POLICY_PREREQUISITE"
             | "PATH"
             | "MODE"
@@ -240,6 +241,23 @@ mod unix {
             .and_then(|()| sink.flush())
             .map_err(|_| "FACT_OUTPUT")
     }
+    // Classification only: admission remains exactly ten keys. The caller has
+    // already validated every required key/value; no unknown name/value emits.
+    fn environment_key_refusal(keys: impl Iterator<Item = std::ffi::OsString>) -> Option<&'static str> {
+        let mut count = 0usize;
+        let mut cf_text_encoding = false;
+        for key in keys {
+            count = count.saturating_add(1);
+            cf_text_encoding |= key == std::ffi::OsStr::new("__CF_USER_TEXT_ENCODING");
+        }
+        if count == 10 {
+            None
+        } else if count == 11 && cf_text_encoding {
+            Some("ENV_KEYS_CF_TEXT_ENCODING")
+        } else {
+            Some("ENV_KEYS")
+        }
+    }
     fn private_role(root: &Path) -> R<()> {
         if std::env::var("KEITO_ACTOR_POLICY_CONFIRMED").as_deref()
             != Ok("source-registry-api-only")
@@ -276,8 +294,8 @@ mod unix {
                 return Err("PRIVATE_ENV");
             }
         }
-        if std::env::vars_os().count() != 10 {
-            return Err("ENV_KEYS");
+        if let Some(reason) = environment_key_refusal(std::env::vars_os().map(|(key, _)| key)) {
+            return Err(reason);
         }
         Ok(())
     }
@@ -930,6 +948,20 @@ mod unix {
                     ["resource_admission_may_have_started"],
                 true
             );
+        }
+
+        #[test]
+        fn known_platform_key_is_named_but_still_refused_and_unknown_keys_stay_opaque() {
+            let ten: Vec<_> = (0..10).map(|i| std::ffi::OsString::from(format!("SYNTHETIC_{i}"))).collect();
+            assert_eq!(environment_key_refusal(ten.clone().into_iter()), None);
+            let mut known = ten.clone();
+            known.push("__CF_USER_TEXT_ENCODING".into());
+            assert_eq!(environment_key_refusal(known.clone().into_iter()), Some("ENV_KEYS_CF_TEXT_ENCODING"));
+            let mut unknown = ten;
+            unknown.push("UNPRINTED_EXTRA_NAME".into());
+            assert_eq!(environment_key_refusal(unknown.into_iter()), Some("ENV_KEYS"));
+            known.push("ANOTHER_UNPRINTED_NAME".into());
+            assert_eq!(environment_key_refusal(known.into_iter()), Some("ENV_KEYS"));
         }
     }
 }
