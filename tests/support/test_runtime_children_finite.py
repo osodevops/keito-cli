@@ -2,13 +2,14 @@
 import os
 from pathlib import Path
 import sys
+import signal
 import tempfile
 import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from source_qa_children import OwnedChildren
+from source_qa_children import OwnedChildren, Cancelled
 from source_qa_protocol import SourceOwner, ProtocolError
 
 
@@ -130,6 +131,38 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(attempted, [100, 101, 102])
             for name, fd in [("stdin",100),("stdout",101),("stderr",102)]:
                 self.assertEqual(value[name + "_configured"], fd != failed)
+
+    def test_review_latched_cancel_during_preparation_never_calls_popen(self):
+        owner = SourceOwner()
+        manager = OwnedChildren(self.root, {}, self.root, owner)
+        manager.entered = True
+        def during_preparation(fd):
+            manager._cancel(signal.SIGTERM, None)
+            return object()
+        with patch("os.fstat", side_effect=during_preparation), patch("signal.pthread_sigmask", return_value=set()), patch("subprocess.Popen") as popen:
+            with self.assertRaises((ProtocolError, Cancelled)):
+                manager.start("cancelled", ["never-execute"], 1)
+        popen.assert_not_called()
+        self.assertEqual(owner.first_fault, "RUNTIME_SIGNAL")
+        self.assertEqual(len(manager.slots), 1)
+        self.assertIsNone(manager.slots[0]["child"])
+        manager.poll_cleanup(manager.hard_end)
+
+    def test_review_failed_enter_restores_current_and_partial_handlers(self):
+        import source_qa_protocol as protocol
+        previous = protocol.CURRENT
+        manager = OwnedChildren(self.root, {}, self.root)
+        calls = []
+        old = object()
+        def install(signum, handler):
+            calls.append((signum, handler))
+            if len(calls) == 2: raise OSError("inert-signal-setup")
+            return old
+        with patch("signal.signal", side_effect=install), self.assertRaises(OSError):
+            manager.__enter__()
+        self.assertIs(protocol.CURRENT, previous)
+        self.assertEqual(calls[-1], (signal.SIGTERM, old))
+        self.assertEqual(len(calls), 3)
 
     def test_review_cached_owner_cannot_finish_clean_at_deadline(self):
         owner = SourceOwner()
