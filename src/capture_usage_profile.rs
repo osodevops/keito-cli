@@ -541,6 +541,11 @@ fn observed_version(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(target_os = "macos")]
+    command.env(
+        "__CF_USER_TEXT_ENCODING",
+        format!("0x{:X}:0:0", unsafe { libc::getuid() }),
+    );
     unsafe {
         command.pre_exec(move || {
             let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
