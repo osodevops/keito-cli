@@ -358,3 +358,34 @@ fn sealed_finished_bound_is_not_silently_shortened_or_rebroadcast() {
         Some(ProtocolError("SCOPE_BOUND_SEALED"))
     );
 }
+
+#[test]
+fn ordinary_publisher_unwind_keeps_the_inserted_slot_for_explicit_failure_cleanup() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = r.admit(1, |_| Ok(edge(&trace, 0)), |_, _| panic!("synthetic publisher"));
+    }));
+    assert!(result.is_err());
+    assert_eq!(r.slots.len(), 1);
+    r.poison("PUBLISHER_UNWIND");
+    r.begin(2, 500);
+    r.poll();
+    assert_eq!(trace.borrow().calls, [("begin", 0, 500), ("poll", 0, 0)]);
+    assert_eq!(r.slots.len(), 1);
+    assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("PUBLISHER_UNWIND")));
+    // This finite seam tests retention across unwind, not actual public Drop
+    // or a process-cleanup proof. The latter requires the real API OS actor.
+}
+
+#[test]
+fn distinct_secondary_faults_stop_at_eight_without_replacing_the_original() {
+    let mut r = registry();
+    r.poison("ORIGINAL");
+    let reasons = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"];
+    for reason in reasons { r.poison(reason); }
+    assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("ORIGINAL")));
+    assert_eq!(r.secondary_faults, reasons[..8].iter().copied().map(ProtocolError).collect::<Vec<_>>());
+    r.poison("A");
+    assert_eq!(r.secondary_faults.len(), 8);
+}
