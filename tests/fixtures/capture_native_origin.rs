@@ -10,7 +10,7 @@ use keito_cli::process_ownership::{
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     time::{Duration, Instant},
@@ -76,6 +76,42 @@ fn complete(scope: &mut Scope, slot: &SlotId) -> io::Result<ExitStatus> {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+// Developer-only failure diagnosis. Never serialize argv, environment, command
+// output or arbitrary io::Error text; keep the original operation error primary.
+fn failure_receipt(arguments: &[std::ffi::OsString], scope: &Scope, finality: bool) -> io::Result<()> {
+    let mode = arguments.first().and_then(|s| s.to_str()).ok_or_else(error)?;
+    let offset = match mode {
+        "--chain" => 2,
+        "--cli" | "--run" | "--git-init" => 1,
+        _ => return Err(error()),
+    };
+    let fields = arguments.get(offset..offset + 3).ok_or_else(error)?;
+    let root = Path::new(&fields[0]);
+    let case = Path::new(&fields[1]);
+    let home = case.join("home");
+    let capture = home.join("capture");
+    isolation::checked(root, case, Some(&home), Some(&capture), Some(Path::new(&fields[2])))
+        .map_err(|_| error())?;
+    let report = scope.report();
+    let slots: Vec<_> = report.slots.iter().map(|slot| serde_json::json!({
+        "slot": slot.slot, "status": slot.status.and_then(|status| status.code()),
+        "waits_known": slot.waits_known, "group_absent": slot.group_absent,
+        "terminal_eof": slot.terminal_eof, "io_required": slot.io_required,
+        "stdin_closed": slot.io.stdin_closed, "stdout_eof": slot.io.stdout_eof,
+        "stderr_eof": slot.io.stderr_eof, "accepted_at": slot.accepted_at,
+        "completion_end": slot.completion_end, "first_fault": slot.first_fault,
+    })).collect();
+    let value = serde_json::json!({"source_fixture_diagnosis_only": true,
+        "late_final_facts": finality, "first_fault": report.first_fault.map(|fault| fault.0),
+        "hard_end_ns": scope.hard_end(), "finish_called": report.finish_called,
+        "all_resources": report.all_resources, "clean": report.clean, "slots": slots});
+    let name = if finality { "native-owner-FINAL.json" } else { "native-owner-FIRST.json" };
+    let mut output = OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW).open(case.join(name))?;
+    serde_json::to_writer(&mut output, &value)?;
+    output.write_all(b"\n")?;
+    output.sync_all()
 }
 fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i32> {
     let mode = arguments
@@ -224,12 +260,16 @@ pub(super) fn run(version: &'static str) -> i32 {
         execute(&mut scope, &arguments)
     };
     if result.is_err() {
+        let _ = failure_receipt(&arguments, &scope, false);
         scope.begin_cancel(
             ProtocolError("FIXTURE_OPERATION_OR_RECEIPT"),
             scope.hard_end(),
         );
     }
     let clean = scope.finish().clean && result.as_ref().is_ok_and(|code| *code == 0);
+    if result.is_err() {
+        let _ = failure_receipt(&arguments, &scope, true);
+    }
     if !scope.publish_terminal(clean) {
         return 1;
     }
