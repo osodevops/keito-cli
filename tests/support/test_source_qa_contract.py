@@ -13,7 +13,7 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import source_qa_manifest as inventory
-from source_qa_children import Cancelled, OwnedChildren
+from source_qa_children import Cancelled, LegacyDirectChildren as OwnedChildren
 
 BASE = None
 

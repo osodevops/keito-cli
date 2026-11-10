@@ -38,6 +38,16 @@ name = "check-service-boundary"
 path = "src/bin/check-service-boundary.rs"
 required-features = ["dev-tools"]
 
+[[bin]]
+name = "codex-inert-source-only"
+path = "tests/fixtures/codex_native_origin.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "claude-inert-source-only"
+path = "tests/fixtures/claude_native_origin.rs"
+required-features = ["dev-tools"]
+
 [features]
 dev-tools = []
 

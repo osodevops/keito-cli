@@ -10,6 +10,22 @@ use std::{io, path::Path, process::Command, rc::Rc};
 
 const CLEANUP_NS: u64 = 1_800_000_000;
 
+/// Developer fixture gateway to the SAME product opaque runner. The caller
+/// cannot supply a hash/manifest as authority: the final guard anchor must be
+/// compiled into this Cargo-linked fixture. This grants no capture consent.
+pub fn run_fixture_opaque(
+    scope: &mut crate::process_ownership::scope::Scope,
+    command: Command,
+    plan: crate::process_ownership::io::IoPlan,
+    core: &Path,
+) -> io::Result<crate::process_ownership::scope::CommandResult> {
+    let anchor = option_env!("KEITO_RELEASE_GUARD_SHA256").ok_or_else(|| io::Error::other("FIXTURE_PAIR_ANCHOR"))?;
+    let runtime = crate::capture_runtime_pair::verify(core, anchor, env!("CARGO_PKG_VERSION"), env!("KEITO_BUILD_TARGET"))
+        .map_err(|_| io::Error::other("FIXTURE_PAIR_ANCHOR"))?;
+    let image = crate::process_ownership::image::VerifiedKeeperImage::open(&runtime.guard_path, &runtime.guard_sha256)?;
+    scope.run_verified(command, plan, &image)
+}
+
 fn now() -> io::Result<u64> {
     let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, value.as_mut_ptr()) } != 0 {

@@ -233,7 +233,7 @@ struct CooperativeEdge {
 impl Edge for CooperativeEdge {
     fn begin(&mut self, end: u64) -> io::Result<()> {
         if let Some(pipes) = &mut self.pipes { pipes.cancel_input(); }
-        if !self.cancel_sent && !self.endpoint.is_settled() {
+        if !self.cancel_sent && self.status.is_none() && !self.endpoint.is_settled() {
             self.cancel_sent = true;
             // V1's cancellation grammar requires a positive absolute end.
             // Zero is an already-expired local end, never a fresh allowance.
