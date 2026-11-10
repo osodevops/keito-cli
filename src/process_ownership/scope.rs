@@ -179,9 +179,8 @@ impl<E: Edge> Core<E> {
     fn request_complete(&mut self, id: &SlotId, at: u64) -> io::Result<()> {
         let index = self.index(id)?;
         if self.slots[index].completion_end.is_some() { return Ok(()); }
-        // Migration baseline: inherited batch completion closes the owner.
-        // The acceptance test below requires slot-local completion instead.
-        self.owner.borrow_mut().admission_closed = true;
+        // Completing this slot must leave its containing owner open. Global
+        // cancellation/final finish use cancel(), never this local transition.
         let end = self.hard_end.min(at.saturating_add(RESERVE_NS));
         self.slots[index].completion_end = Some(end);
         let result = self.slots[index].edge.begin(end);
@@ -221,16 +220,19 @@ impl<E: Edge> Core<E> {
             if self.slots[index].accepted_at.is_some() { continue; }
             if self.slots[index].edge.poll().is_err() {
                 self.poison(self.slots[index].edge.facts().first_fault.unwrap_or("SCOPE_POLL"));
-                let at = clock().unwrap_or(0);
-                self.cancel(None, at, if at == 0 { 0 } else { self.hard_end });
+                match clock() {
+                    Ok(at) => self.cancel(None, at, self.hard_end),
+                    Err(_) => self.cancel(Some("SCOPE_CLOCK"), 0, 0),
+                }
             }
             let facts = self.slots[index].edge.facts();
             if facts.status.is_some() && self.slots[index].completion_end.is_none() {
-                let at = clock().unwrap_or(0);
-                if at == 0 { self.cancel(Some("SCOPE_CLOCK"), 0, 0); }
-                else {
-                    let id = SlotId { index, scope: self.identity.clone() };
-                    if self.request_complete(&id, at).is_err() { self.cancel(None, at, self.hard_end); }
+                match clock() {
+                    Err(_) => self.cancel(Some("SCOPE_CLOCK"), 0, 0),
+                    Ok(at) => {
+                        let id = SlotId { index, scope: self.identity.clone() };
+                        if self.request_complete(&id, at).is_err() { self.cancel(None, at, self.hard_end); }
+                    }
                 }
             }
             if facts.resources_complete() {
@@ -243,6 +245,26 @@ impl<E: Edge> Core<E> {
         }
     }
     fn all_resources(&self) -> bool { self.slots.iter().all(|s| s.accepted_at.is_some()) }
+    fn finish_at(&mut self, at: u64) -> bool {
+        if self.finished { return true; }
+        if at >= self.cancel_end.unwrap_or(0) {
+            self.poison("SCOPE_CLEANUP_DEADLINE"); self.finished = true;
+        } else if self.all_resources() { self.finished = true; }
+        self.finished
+    }
+    fn take_result(&mut self, id: &SlotId) -> io::Result<CommandResult> {
+        let index = self.index(id)?;
+        let fault = self.owner.borrow().first_fault;
+        if let Some(reason) = fault { return Err(error(reason.0)); }
+        let slot = &self.slots[index];
+        let status = slot.edge.facts().status;
+        if slot.accepted_at.is_none() || slot.output_taken || status.is_none() {
+            self.poison("SCOPE_RESULT"); return Err(error("SCOPE_RESULT"));
+        }
+        let slot = &mut self.slots[index];
+        slot.output_taken = true;
+        Ok(CommandResult { status: status.unwrap(), output: slot.edge.take_output() })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -274,28 +296,56 @@ impl Scope {
     /// QA-owned700 image constructor only. A sealed official-pair image entry
     /// point is still required before wiring installed product call sites.
     pub fn start_owned_opaque(&mut self, mut command: Command, plan: IoPlan, root: &Path, image: &Path) -> io::Result<SlotId> {
-        let at = now()?;
+        let at = match now() {
+            Ok(at) => at,
+            Err(_) => { self.core.cancel(Some("SCOPE_CLOCK"), 0, 0); return Err(error("SCOPE_CLOCK")); }
+        };
         let capacity = plan.capacity();
-        let pipes = plan.prepare()?;
+        let pipes = match plan.prepare() {
+            Ok(pipes) => pipes,
+            Err(_) => {
+                self.core.cancel(Some("SCOPE_IO_PREPARE"), at, self.core.hard_end);
+                return Err(error("SCOPE_IO_PREPARE"));
+            }
+        };
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let hard_end = self.core.hard_end;
         let result = self.core.admit(at, capacity, |owner| {
             let lease = GroupLease::spawn_keeper_with_policy(owner, root, image, hard_end, CleanupPolicy::HookShort)?;
             Ok(GroupEdge { lease, command: Some(command), pipes, stage: Stage::Ready, proof: false, first_fault: None })
         });
-        if result.is_err() { self.core.cancel(None, now().unwrap_or(0), hard_end); }
+        if result.is_err() {
+            if self.core.owner.borrow().first_fault.is_none() { self.core.poison("SCOPE_ADMISSION"); }
+            match now() {
+                Ok(at) => self.core.cancel(None, at, hard_end),
+                Err(_) => self.core.cancel(Some("SCOPE_CLOCK"), 0, 0),
+            }
+        }
         result
     }
     pub fn poll(&mut self) -> ScopeReport { self.core.poll(&mut now); self.report() }
-    pub fn request_complete(&mut self, id: &SlotId) -> io::Result<()> { self.core.request_complete(id, now()?) }
+    pub fn request_complete(&mut self, id: &SlotId) -> io::Result<()> {
+        let result = match now() {
+            Ok(at) => self.core.request_complete(id, at),
+            Err(_) => { self.core.cancel(Some("SCOPE_CLOCK"), 0, 0); return Err(error("SCOPE_CLOCK")); }
+        };
+        if result.is_err() {
+            match now() {
+                Ok(at) => self.core.cancel(None, at, self.core.hard_end),
+                Err(_) => self.core.cancel(Some("SCOPE_CLOCK"), 0, 0),
+            }
+        }
+        result
+    }
     pub fn take_result(&mut self, id: &SlotId) -> io::Result<CommandResult> {
-        let index = self.core.index(id)?;
-        if let Some(reason) = self.core.owner.borrow().first_fault { return Err(error(reason.0)); }
-        let slot = &mut self.core.slots[index];
-        if slot.accepted_at.is_none() || slot.output_taken { return Err(error("SCOPE_RESULT")); }
-        let status = slot.edge.facts().status.ok_or_else(|| error("SCOPE_RESULT"))?;
-        slot.output_taken = true;
-        Ok(CommandResult { status, output: slot.edge.take_output() })
+        let result = self.core.take_result(id);
+        if result.is_err() {
+            match now() {
+                Ok(at) => self.core.cancel(None, at, self.core.hard_end),
+                Err(_) => self.core.cancel(Some("SCOPE_CLOCK"), 0, 0),
+            }
+        }
+        result
     }
     pub fn begin_cancel(&mut self, reason: ProtocolError, requested_end: u64) {
         match now() {
@@ -306,16 +356,14 @@ impl Scope {
     pub fn finish(&mut self) -> ScopeReport {
         self.core.finish_called = true;
         if self.core.finished { return self.report(); }
-        let at = now().unwrap_or(0);
-        if at == 0 { self.core.cancel(Some("SCOPE_CLOCK"), 0, 0); }
-        else { self.core.cancel(None, at, self.core.hard_end); }
+        match now() {
+            Ok(at) => self.core.cancel(None, at, self.core.hard_end),
+            Err(_) => self.core.cancel(Some("SCOPE_CLOCK"), 0, 0),
+        }
         loop {
             self.core.poll(&mut now);
             let at = now().unwrap_or(u64::MAX);
-            if self.core.all_resources() { break; }
-            if at >= self.core.cancel_end.unwrap_or(0) {
-                self.core.poison("SCOPE_CLEANUP_DEADLINE"); break;
-            }
+            if self.core.finish_at(at) { break; }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         self.core.finished = true;
@@ -424,5 +472,35 @@ mod tests {
         a.request_complete(&id,2).unwrap(); a.poll(&mut ||Ok(3));
         assert!(a.admit(4,1,|_| Ok(fake("b",events.clone()))).is_err());
         assert_eq!(a.slots.len(),1); assert_eq!(a.io_reserved,MAX_IO_BYTES);
+    }
+    #[test]
+    fn a_valid_zero_clock_is_not_replaced_with_a_clock_failure() {
+        let events: Rc<RefCell<Vec<String>>> = Rc::default();
+        let mut core=Core::new(Rc::default(),500_000_000);
+        core.admit(0,1,|_| {
+            let mut a=fake("a",events); a.facts.status=Some(ExitStatus::from_raw(0)); Ok(a)
+        }).unwrap();
+        core.poll(&mut ||Ok(0)); core.poll(&mut ||Ok(0));
+        assert_eq!(core.slots[0].accepted_at,Some(0));
+        assert!(core.owner.borrow().first_fault.is_none());
+    }
+    #[test]
+    fn final_finish_requires_a_fresh_strictly_before_bound_clock_even_if_empty() {
+        let mut core: Core<Fake>=Core::new(Rc::default(),500_000_000);
+        core.cancel(None,2,500_000_000);
+        assert!(core.all_resources());
+        assert!(core.finish_at(core.cancel_end.unwrap()));
+        assert_eq!(core.owner.borrow().first_fault,Some(ProtocolError("SCOPE_CLEANUP_DEADLINE")));
+    }
+    #[test]
+    fn result_is_single_use_and_failed_operation_never_returns_output() {
+        let events: Rc<RefCell<Vec<String>>> = Rc::default();
+        let mut core=Core::new(Rc::default(),500_000_000);
+        let id=core.admit(1,1,|_| Ok(fake("a",events))).unwrap();
+        core.request_complete(&id,2).unwrap(); core.poll(&mut ||Ok(3));
+        assert!(core.take_result(&id).unwrap().status.success());
+        assert!(core.take_result(&id).is_err());
+        assert_eq!(core.slots.len(),1); assert!(core.slots[0].accepted_at.is_some());
+        assert_eq!(core.owner.borrow().first_fault,Some(ProtocolError("SCOPE_RESULT")));
     }
 }

@@ -1533,6 +1533,26 @@ mod tests {
         let _: fn(&mut GroupLease, Command) -> io::Result<()> = GroupLease::start;
     }
     #[test]
+    fn pending_park_cleanup_requires_parked_before_gone() {
+        for skip_parked in [false, true] {
+            let (mut state, mut channel, mut peer) = parent_fixture();
+            state.expected_park = Some("PARKED|42|7|7".to_owned());
+            let mut keeper = FakeWait::default();
+            if !skip_parked { frame(&mut peer, "PARKED|42|7|7"); }
+            frame(&mut peer, "GONE|42");
+            let result = state.poll(&mut || Ok(1), 42, &mut channel, &mut keeper, None::<&mut FakeWait>);
+            if skip_parked {
+                assert_eq!(result.unwrap_err().to_string(), "GROUP_PARK");
+                assert!(!state.group_absent);
+            } else {
+                assert!(result.unwrap().is_none());
+                assert!(state.expected_park.is_none()); assert!(!state.group_absent);
+                assert!(state.poll(&mut || Ok(2), 42, &mut channel, &mut keeper, None::<&mut FakeWait>).unwrap().is_none());
+                assert!(state.group_absent); assert!(state.release_sent);
+            }
+        }
+    }
+    #[test]
     fn duplicate_gone_between_pending_and_completed_wait_is_sticky() {
         let (mut state, mut channel, mut peer) = parent_fixture();
         let mut keeper = FakeWait::default();

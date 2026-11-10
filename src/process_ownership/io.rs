@@ -35,6 +35,9 @@ impl IoPlan {
             stdin_pipe: None,
             stdout_pipe: None,
             stderr_pipe: None,
+            stdin_ready: false,
+            stdout_ready: false,
+            stderr_ready: false,
             fault: None,
         })
     }
@@ -124,6 +127,9 @@ pub(super) struct PipeIo {
     stdin_pipe: Option<ChildStdin>,
     stdout_pipe: Option<ChildStdout>,
     stderr_pipe: Option<ChildStderr>,
+    stdin_ready: bool,
+    stdout_ready: bool,
+    stderr_ready: bool,
     fault: Option<&'static str>,
 }
 fn flags(pipe: &impl AsRawFd) -> io::Result<()> {
@@ -145,15 +151,14 @@ impl PipeIo {
         self.stdin_pipe = input;
         self.stdout_pipe = output;
         self.stderr_pipe = error;
-        let mut failed = false;
-        if let Some(pipe) = &self.stdin_pipe { failed |= flags(pipe).is_err(); } else { failed = true; }
-        if let Some(pipe) = &self.stdout_pipe { failed |= flags(pipe).is_err(); } else { failed = true; }
-        if let Some(pipe) = &self.stderr_pipe { failed |= flags(pipe).is_err(); } else { failed = true; }
-        if failed {
+        self.stdin_ready = self.stdin_pipe.as_ref().is_some_and(|p| flags(p).is_ok());
+        self.stdout_ready = self.stdout_pipe.as_ref().is_some_and(|p| flags(p).is_ok());
+        self.stderr_ready = self.stderr_pipe.as_ref().is_some_and(|p| flags(p).is_ok());
+        if !(self.stdin_ready && self.stdout_ready && self.stderr_ready) {
             self.fault.get_or_insert("IO_FLAGS");
             self.cancel_input();
-            // Failed descriptors remain retained, but MUST NOT be read if their
-            // nonblocking status is unknown. EOF therefore remains unknown.
+            // Failed descriptors remain retained but are not read with unknown
+            // flags. Other independently configured streams continue draining.
             return Err(io::Error::other("IO_FLAGS"));
         }
         Ok(())
@@ -163,15 +168,14 @@ impl PipeIo {
         self.input.closed = true;
     }
     pub(super) fn poll(&mut self) {
-        if self.fault == Some("IO_FLAGS") { return; }
-        if let Some(pipe) = &mut self.stdin_pipe {
+        if let Some(pipe) = self.stdin_pipe.as_mut().filter(|_| self.stdin_ready) {
             if let Some(reason) = self.input.poll(pipe) { self.fault.get_or_insert(reason); }
             if self.input.closed { self.stdin_pipe.take(); }
         }
-        if let Some(pipe) = &mut self.stdout_pipe {
+        if let Some(pipe) = self.stdout_pipe.as_mut().filter(|_| self.stdout_ready) {
             if let Some(reason) = self.stdout.poll(pipe) { self.fault.get_or_insert(reason); }
         }
-        if let Some(pipe) = &mut self.stderr_pipe {
+        if let Some(pipe) = self.stderr_pipe.as_mut().filter(|_| self.stderr_ready) {
             if let Some(reason) = self.stderr.poll(pipe) { self.fault.get_or_insert(reason); }
         }
     }
