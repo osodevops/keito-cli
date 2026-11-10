@@ -773,8 +773,8 @@ impl Scope {
             _signals: None,
         }
     }
-    fn pump(
-        core: &mut Core<ProductEdge>,
+    fn pump<E: Edge>(
+        core: &mut Core<E>,
         upstream: &mut Option<Endpoint>,
         ledger: &mut BTreeMap<Registration, bool>,
         turn_start: usize,
@@ -1052,10 +1052,13 @@ impl Scope {
     /// A bounded hot-path turn. Full retained reports are explicit snapshots,
     /// never an allocation/whole-registry scan on every command I/O poll.
     pub fn poll(&mut self) {
-        let start = self.core.cursor;
-        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger, start);
-        self.core.poll(&mut now);
-        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger, start);
+        Self::poll_turn(&mut self.core, &mut self.upstream, &mut self.ledger);
+    }
+    fn poll_turn<E: Edge>(core: &mut Core<E>, upstream: &mut Option<Endpoint>, ledger: &mut BTreeMap<Registration, bool>) {
+        let start = core.cursor;
+        Self::pump(core, upstream, ledger, start);
+        core.poll(&mut now);
+        Self::pump(core, upstream, ledger, start);
     }
     pub fn request_complete(&mut self, id: &SlotId) -> io::Result<()> {
         let result = match now() {
@@ -1229,6 +1232,30 @@ mod tests {
     fn native_repair_dispatch_enters_durable_guard_without_preparation_child() {
         let source = include_str!("../bin/keito-capture-guard.rs");
         assert!(!source.contains("fn dispatch_guard("));
+        let guardian = include_str!("../native_capture_guard.rs");
+        assert!(guardian.find("let initial = marker.metadata()").unwrap()
+            < guardian.find("Scope::entry_from_environment").unwrap());
+    }
+    #[test]
+    fn native_repair_actual_public_turn_bounds_metadata_and_resource_visits_together() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut core = Core::new(Rc::default(), now().unwrap() + 500_000_000);
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i"] {
+            core.admit(1, 0, |_| Ok(fake(name, events.clone()))).unwrap();
+        }
+        core.slots[2].accepted_at = Some(1);
+        Scope::poll_turn(&mut core, &mut None, &mut BTreeMap::new());
+        let first = events.borrow().clone();
+        assert!(!first.iter().any(|event| event.ends_with(":i")));
+        assert_eq!(first.iter().filter(|event| event.starts_with("metadata:")).count(), 16);
+        assert_eq!(first.iter().filter(|event| event.starts_with("poll:")).count(), 7);
+        assert_eq!(core.cursor, 8);
+        events.borrow_mut().clear();
+        Scope::poll_turn(&mut core, &mut None, &mut BTreeMap::new());
+        assert!(events.borrow().iter().any(|event| event == "metadata:i"));
+        assert!(events.borrow().iter().any(|event| event == "poll:i"));
+        assert_eq!(core.slots.len(), 9);
+        assert_eq!(core.slots[2].accepted_at, Some(1));
     }
     struct Fake {
         events: Rc<RefCell<Vec<String>>>,
@@ -1239,6 +1266,10 @@ mod tests {
         begin_ends: Vec<u64>,
     }
     impl Edge for Fake {
+        fn take_events(&mut self) -> Vec<String> {
+            self.events.borrow_mut().push(format!("metadata:{}", self.name));
+            Vec::new()
+        }
         fn begin(&mut self, end: u64) -> io::Result<()> {
             self.events
                 .borrow_mut()
