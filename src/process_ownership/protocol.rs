@@ -1,6 +1,6 @@
-//! Development-only cancellation metadata. No capture, profile or auth authority.
-//! Not yet integrated with process owners. Protocol proof alone is not a wait or
-//! a process-group absence proof. Default production builds exclude this module.
+//! Shared Unix cancellation metadata. No capture, profile or auth authority.
+//! Included in default library builds; real product process owners are not yet
+//! wired. Protocol proof alone is not a wait or process-group absence proof.
 use std::{
     cell::RefCell,
     collections::BTreeMap,

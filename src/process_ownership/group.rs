@@ -1,4 +1,4 @@
-//! Development-only reserved group cleanup. Not connected to product commands.
+//! Shared Unix reserved group cleanup. Not connected to product commands yet.
 //!
 //! The keeper is a sibling, never a wrapper/ancestor of the workload. Only the
 //! keeper queries or signals its own reserved PGID. An opaque same-session tool
