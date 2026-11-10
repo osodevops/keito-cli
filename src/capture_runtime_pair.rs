@@ -290,6 +290,7 @@ pub fn current() -> Result<CaptureRuntimeIdentity, AppError> {
 #[cfg(unix)]
 pub(crate) struct HookRuntime {
     identity: CaptureRuntimeIdentity,
+    keeper: crate::process_ownership::image::VerifiedKeeperImage,
 }
 #[cfg(unix)]
 impl HookRuntime {
@@ -298,9 +299,11 @@ impl HookRuntime {
         if identity.core_sha256 != expected_core {
             return Err(refused());
         }
-        Ok(Self { identity })
+        let keeper = crate::process_ownership::image::VerifiedKeeperImage::open(&identity.guard_path,&identity.guard_sha256).map_err(|_|refused())?;
+        Ok(Self { identity,keeper })
     }
     pub(crate) fn identity(&self) -> &CaptureRuntimeIdentity {
         &self.identity
     }
+    pub(crate) fn keeper(&self)->&crate::process_ownership::image::VerifiedKeeperImage { &self.keeper }
 }

@@ -21,7 +21,6 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, Instant},
 };
 
 const MAX_PROFILE_BYTES: usize = 64 * 1024;
@@ -511,7 +510,7 @@ fn native_image(bytes: &[u8]) -> bool {
     }
 }
 
-fn observed_version(native: &ImagePin, home: &Path, expected: &str) -> Result<(), AppError> {
+fn observed_version(native: &ImagePin, home: &Path, expected: &str, runner:&mut impl crate::process_ownership::probes::LeafRunner) -> Result<(), AppError> {
     let file = walk(&native.path, false)?;
     if !native
         .stamp
@@ -556,54 +555,10 @@ fn observed_version(native: &ImagePin, home: &Path, expected: &str) -> Result<()
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(|_| refused())?;
-    let Some(mut pipe) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(refused());
-    };
-    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(refused());
-    }
-    let started = Instant::now();
-    let mut bytes = Vec::new();
-    let status = loop {
-        let mut block = [0u8; 1024];
-        match pipe.read(&mut block) {
-            Ok(n) => bytes.extend_from_slice(&block[..n]),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => break None,
-        }
-        if bytes.len() > 8192 || started.elapsed() >= Duration::from_secs(1) {
-            break None;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if pipe
-                    .take(8193 - bytes.len() as u64)
-                    .read_to_end(&mut bytes)
-                    .is_err()
-                {
-                    break None;
-                }
-                break Some(status);
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
-            Err(_) => break None,
-        }
-    };
-    if !status.is_some_and(|status| status.success()) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(refused());
-    }
-    if bytes.len() > 8192
-        || !String::from_utf8_lossy(&bytes)
+    let result=runner.output(command,8192,8192).map_err(|_|refused())?;
+    if !result.status.success() {return Err(refused());}
+    let bytes=String::from_utf8(result.output.stdout).map_err(|_|refused())?;
+    if !bytes
             .split_whitespace()
             .any(|part| part == expected)
         || !native.matches()
@@ -736,7 +691,9 @@ pub(crate) fn approve(options: ProfileOptions<'_>) -> Result<PreparedProfile, Ap
     } else {
         ImagePin::observe(options.launcher, false)?
     };
-    observed_version(&native, options.home, version)?;
+    let mut probe_owner=crate::capture_command_owner::CommandOwner::standalone()?;
+    let probe=observed_version(&native, options.home, version,&mut probe_owner);
+    probe_owner.finish(probe)?;
     if !receipt_stamp.matches(&receipt_path) || !config_stamp.matches(&config_path) {
         return Err(refused());
     }

@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 #[cfg(feature = "dev-tools")]
 use std::time::Duration;
@@ -85,6 +86,12 @@ pub struct Clock {
 impl Clock {
     #[cfg(unix)]
     pub fn now() -> Result<Self, AppError> {
+        let mut owner = crate::capture_command_owner::CommandOwner::standalone()?;
+        let result = Self::now_with(&mut owner);
+        owner.finish(result)
+    }
+    #[cfg(unix)]
+    pub(crate) fn now_with(runner:&mut impl crate::process_ownership::probes::LeafRunner) -> Result<Self,AppError> {
         let mut time = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -96,14 +103,13 @@ impl Clock {
             ));
         }
         #[cfg(target_os = "macos")]
-        let boot = Command::new("/usr/sbin/sysctl")
-            .args(["-n", "kern.boottime"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| hash(o.stdout));
+        let boot = {
+            let mut command=Command::new("/usr/sbin/sysctl");command.args(["-n","kern.boottime"]);
+            let result=runner.output(command,8192,8192).map_err(|_|AppError::Config("Boot command ownership unavailable; capture paused".into()))?;
+            result.status.success().then(|| hash(result.output.stdout))
+        };
         #[cfg(not(target_os = "macos"))]
-        let boot = fs::read("/proc/sys/kernel/random/boot_id").ok().map(hash);
+        let boot = {let _=runner;fs::read("/proc/sys/kernel/random/boot_id").ok().map(hash)};
         Ok(Self {
             wall: chrono::Utc::now().timestamp(),
             monotonic: time.tv_sec,
@@ -137,21 +143,13 @@ pub struct Repository {
     pub linked_without_hint: bool,
     pub disabled: bool,
 }
-fn git(directory: &Path, args: &[&str]) -> Result<String, AppError> {
-    let result = Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args(args)
-        .output()
-        .map_err(|_| AppError::Config("Cannot inspect repository identity".into()))?;
-    if !result.status.success() {
-        return Err(AppError::Config(
-            "Capture requires an identifiable Git repository".into(),
-        ));
-    }
-    String::from_utf8(result.stdout)
-        .map(|v| v.trim().to_owned())
-        .map_err(|_| AppError::Config("Cannot inspect repository identity".into()))
+#[cfg(unix)]
+fn git_with(runner:&mut impl crate::process_ownership::probes::LeafRunner,directory:&Path,args:&[&str],empty_no_match:bool)->Result<String,AppError> {
+    let mut command=Command::new("git");command.arg("-C").arg(directory).args(args);
+    let result=runner.output(command,if empty_no_match {1024*1024} else {8192},8192)
+        .map_err(|_|AppError::Config("Repository command ownership unavailable; capture paused".into()))?;
+    crate::process_ownership::probes::text(result,empty_no_match)
+        .map_err(|_|AppError::Config("Capture requires an identifiable Git repository".into()))
 }
 impl Repository {
     pub fn matches_binding(&self, binding: &Binding) -> bool {
@@ -160,23 +158,37 @@ impl Repository {
             && (self.linked_without_hint || self.hint_hash == binding.hint_hash)
     }
     pub fn resolve(directory: &Path) -> Result<Self, AppError> {
-        let root = PathBuf::from(git(directory, &["rev-parse", "--show-toplevel"])?)
+        #[cfg(unix)]
+        {
+            let mut owner=crate::capture_command_owner::CommandOwner::standalone()?;
+            let result=Self::resolve_with(directory,&mut owner);
+            owner.finish(result)
+        }
+        #[cfg(not(unix))]
+        {let _=directory;Err(AppError::Config("Automatic capture is unsupported on this platform; manual time commands remain available".into()))}
+    }
+    #[cfg(unix)]
+    pub(crate) fn resolve_with(directory:&Path,runner:&mut impl crate::process_ownership::probes::LeafRunner)->Result<Self,AppError> {
+        let root = PathBuf::from(git_with(runner,directory, &["rev-parse", "--show-toplevel"],false)?)
             .canonicalize()
             .map_err(storage_error)?;
-        let common = git(
+        let common = git_with(
+            runner,
             directory,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            false,
         )?;
         let common = PathBuf::from(common)
             .canonicalize()
             .map_err(storage_error)?;
         // All remotes participate in consent; adding/replacing one invalidates it.
         // Raw remotes may contain credentials. Only their digest is ever retained.
-        let remotes = git(
+        let remotes = git_with(
+            runner,
             directory,
             &["config", "--get-regexp", "^remote\\..*\\.url$"],
-        )
-        .unwrap_or_default();
+            true,
+        )?;
         let mut remotes: Vec<_> = remotes.lines().collect();
         remotes.sort_unstable();
         let key = hash(common.to_string_lossy().as_bytes());
@@ -2796,4 +2808,37 @@ pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Resu
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+#[cfg(all(test,unix))]
+mod owned_probe_tests {
+    use super::*;
+    use crate::process_ownership::{probes::LeafRunner,scope::CommandResult,io::CommandOutput};
+    use std::{collections::VecDeque,io,os::unix::process::ExitStatusExt};
+    struct Replies {values:VecDeque<io::Result<CommandResult>>,calls:usize}
+    impl LeafRunner for Replies {
+        fn output(&mut self,command:Command,stdout_cap:usize,stderr_cap:usize)->io::Result<CommandResult> {
+            assert_eq!(command.get_program(),"git");
+            assert!(stdout_cap<=1024*1024 && stderr_cap<=8192);
+            self.calls+=1;self.values.pop_front().expect("unexpected extra command")
+        }
+    }
+    fn reply(code:i32,bytes:Vec<u8>)->io::Result<CommandResult> {
+        Ok(CommandResult {status:std::process::ExitStatus::from_raw(code<<8),output:CommandOutput {stdout:bytes,stderr:Vec::new()}})
+    }
+    #[test]
+    fn r40_real_repository_resolver_uses_three_results_and_known_empty_exit() {
+        let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();
+        let bytes=root.to_str().unwrap().as_bytes().to_vec();
+        let mut replies=Replies {values:[reply(0,bytes.clone()),reply(0,bytes),reply(1,Vec::new())].into(),calls:0};
+        let repository=Repository::resolve_with(&root,&mut replies).unwrap();
+        assert_eq!(replies.calls,3);assert_eq!(repository.remote_hash,hash(""));
+    }
+    #[test]
+    fn r40_real_repository_resolver_never_swallows_ownership_failure() {
+        let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();
+        let bytes=root.to_str().unwrap().as_bytes().to_vec();
+        let mut replies=Replies {values:[reply(0,bytes.clone()),reply(0,bytes),Err(io::Error::other("OWNERSHIP_FAILED"))].into(),calls:0};
+        assert!(Repository::resolve_with(&root,&mut replies).is_err());assert_eq!(replies.calls,3);
+    }
 }

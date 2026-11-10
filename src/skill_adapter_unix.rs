@@ -569,61 +569,22 @@ fn runtime_unchanged(runtime: &CaptureRuntimeIdentity) -> Result<(), AppError> {
     }
     Ok(())
 }
-fn detect_version(agent: SkillAgent) -> String {
-    use std::io::Read;
-    use std::os::fd::AsRawFd;
+fn detect_version(agent: SkillAgent,runner:&mut impl crate::process_ownership::probes::LeafRunner) -> Result<String,AppError> {
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
     let binary = if agent == SkillAgent::Codex {
         "codex"
     } else {
         "claude"
     };
-    let Ok(mut child) = Command::new(binary)
-        .arg("--version")
+    let mut command=Command::new(binary);
+    command.arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return "unknown".into();
-    };
-    let Some(mut pipe) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return "unknown".into();
-    };
-    unsafe {
-        let flags = libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
-    let started = Instant::now();
-    let mut bytes = Vec::new();
-    let status = loop {
-        let mut block = [0u8; 1024];
-        match pipe.read(&mut block) {
-            Ok(n) => bytes.extend_from_slice(&block[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => break None,
-        }
-        if bytes.len() > 8192 || started.elapsed() > Duration::from_secs(1) {
-            break None;
-        }
-        match child.try_wait() {
-            Ok(Some(s)) => {
-                let _ = pipe.take(8193 - bytes.len() as u64).read_to_end(&mut bytes);
-                break Some(s);
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(_) => break None,
-        }
-    };
-    if !status.is_some_and(|s| s.success()) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return "unknown".into();
-    }
-    String::from_utf8_lossy(&bytes)
+        .stderr(Stdio::null());
+    let result=runner.output(command,8192,8192).map_err(|_|failure())?;
+    if !result.status.success() {return Ok("unknown".into());}
+    let bytes=String::from_utf8(result.output.stdout).map_err(|_|failure())?;
+    Ok(bytes
         .split_whitespace()
         .find(|s| {
             identifier(s, 64)
@@ -631,13 +592,17 @@ fn detect_version(agent: SkillAgent) -> String {
                 && s.as_bytes()[0].is_ascii_digit()
         })
         .unwrap_or("unknown")
-        .to_owned()
+        .to_owned())
 }
 pub fn install(options: InstallOptions<'_>) -> Result<InstallOutcome, AppError> {
-    let version = options
-        .harness_version
-        .map(str::to_owned)
-        .unwrap_or_else(|| detect_version(options.agent));
+    let version = match options.harness_version {
+        Some(version)=>version.to_owned(),
+        None=>{
+            let mut owner=crate::capture_command_owner::CommandOwner::standalone()?;
+            let result=detect_version(options.agent,&mut owner);
+            owner.finish(result)?
+        }
+    };
     if !identifier(&version, 64) {
         return Err(AppError::InvalidInput("Harness version is incompatible with the capture identifier contract; review and qualify the exact version without truncating it.".into()));
     }

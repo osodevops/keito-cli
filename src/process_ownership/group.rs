@@ -594,6 +594,11 @@ pub struct GroupLease {
     ready_end: u64,
     park_end: Option<u64>,
 }
+#[derive(Clone, Copy)]
+enum KeeperProgram<'a> {
+    Owned { root: &'a Path, image: &'a Path },
+    Verified(&'a super::image::VerifiedKeeperImage),
+}
 impl GroupLease {
     pub fn spawn_keeper(
         owner: SharedOwner,
@@ -618,6 +623,16 @@ impl GroupLease {
         lifetime_deadline_ns: u64,
         policy: CleanupPolicy,
     ) -> io::Result<Self> {
+        Self::spawn(owner, KeeperProgram::Owned {root:run_root,image:keeper_image}, lifetime_deadline_ns, policy)
+    }
+    pub(crate) fn spawn_verified_keeper(
+        owner: SharedOwner,
+        image: &super::image::VerifiedKeeperImage,
+        lifetime_deadline_ns: u64,
+    ) -> io::Result<Self> {
+        Self::spawn(owner,KeeperProgram::Verified(image),lifetime_deadline_ns,CleanupPolicy::HookShort)
+    }
+    fn spawn(owner:SharedOwner,program:KeeperProgram<'_>,lifetime_deadline_ns:u64,policy:CleanupPolicy)->io::Result<Self> {
         owner
             .borrow()
             .check_admission()
@@ -626,6 +641,7 @@ impl GroupLease {
         if Lifetime::with_policy(current, lifetime_deadline_ns, policy).is_err() {
             return Err(refused("GROUP_LIFETIME"));
         }
+        if let KeeperProgram::Owned {root:run_root,image:keeper_image} = program {
         for path in [run_root, keeper_image] {
             if !path.is_absolute() || path.canonicalize().ok().as_deref() != Some(path) {
                 return Err(refused("GROUP_OWNED_PATH"));
@@ -645,6 +661,7 @@ impl GroupLease {
         {
             return Err(refused("GROUP_OWNED_PATH"));
         }
+        }
         let mut random = [0u8; 16];
         if unsafe { libc::getentropy(random.as_mut_ptr().cast(), random.len()) } != 0 {
             return Err(refused("GROUP_RANDOM"));
@@ -661,10 +678,16 @@ impl GroupLease {
         let owner_pid = std::process::id();
         let owner_pgid = unsafe { libc::getpgrp() };
         let sid = unsafe { libc::getsid(0) };
-        let mut command = Command::new(keeper_image);
+        let (mut command, image_descriptor, cwd) = match program {
+            KeeperProgram::Owned {root,image} => (Command::new(image),None,root),
+            KeeperProgram::Verified(image) => {
+                let (command,fd) = image.command(child_fd)?;
+                (command,Some(fd),Path::new("/"))
+            }
+        };
         command
             .env_clear()
-            .current_dir(run_root)
+            .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -678,6 +701,9 @@ impl GroupLease {
             ]);
         if policy == CleanupPolicy::HookShort {
             command.arg("hook-short-v1");
+        }
+        if let Some(image) = &image_descriptor {
+            command.env(super::image::VerifiedKeeperImage::image_env(),image.as_raw_fd().to_string());
         }
         // Core Foundation may initialize before this helper's main. Supply
         // synthetic UID/zero encoding metadata instead of consulting the
@@ -716,6 +742,7 @@ impl GroupLease {
             ready_end: policy.setup_end(current, lifetime_deadline_ns),
             park_end: None,
         };
+        drop(image_descriptor);
         drop(inherited);
         drop(child_end);
         // Return BEFORE READY I/O. The caller registers even a failing

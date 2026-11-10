@@ -361,6 +361,9 @@ mod unix {
     }
     pub fn run() -> Result<(), ()> {
         let started = Instant::now();
+        // Share a CLOCK_MONOTONIC absolute bound with core leaf commands. This
+        // reserves work inside the existing guard budget, never after it.
+        let leaf_start=crate::process_ownership::scope::monotonic_now().ok();
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         if args.len() != 8 {
             return Err(());
@@ -457,6 +460,8 @@ mod unix {
         if INTERRUPTED.load(Ordering::Relaxed) || started.elapsed() >= Duration::from_millis(600) {
             return Ok(());
         }
+        // Even a clock refusal must leave the already durable pending marker.
+        let leaf_end=leaf_start.ok_or(())?.saturating_add(500_000_000);
         // This digest comes from the fixed managed registration, never stdin.
         // Linux executes the descriptor. Darwin checks its managed pathname
         // immediately before exec and carries this verified imageFD for a
@@ -532,6 +537,7 @@ mod unix {
             .env("KEITO_CAPTURE_INVOCATION_NONCE", nonce)
             .env("KEITO_CAPTURE_ACK_FD", "3")
             .env("KEITO_CAPTURE_IMAGE_FD", core_fd.to_string())
+            .env("KEITO_CAPTURE_LEAF_END_NS",leaf_end.to_string())
             .stdin(Stdio::inherit())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
