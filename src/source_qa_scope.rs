@@ -19,6 +19,8 @@ pub fn run_fixture_opaque(
     plan: crate::process_ownership::io::IoPlan,
     core: &Path,
 ) -> io::Result<crate::process_ownership::scope::CommandResult> {
+    let at = crate::process_ownership::scope::monotonic_now()?;
+    scope.tighten_end(scope.hard_end().min(at.saturating_add(1_000_000_000)));
     let anchor = option_env!("KEITO_RELEASE_GUARD_SHA256")
         .ok_or_else(|| io::Error::other("FIXTURE_PAIR_ANCHOR"))?;
     let runtime = crate::capture_runtime_pair::verify(
@@ -32,7 +34,10 @@ pub fn run_fixture_opaque(
         &runtime.guard_path,
         &runtime.guard_sha256,
     )?;
-    scope.run_verified(command, plan, &image)
+    scope.run_verified_with_policy(
+        command, plan, &image,
+        crate::process_ownership::group::CleanupPolicy::CommandProbe,
+    )
 }
 
 fn now() -> io::Result<u64> {

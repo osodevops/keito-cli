@@ -4,6 +4,7 @@ use crate::{
     capture_runtime_pair,
     error::AppError,
     process_ownership::{
+        group::CleanupPolicy,
         image::VerifiedKeeperImage,
         io::IoPlan,
         probes::LeafRunner,
@@ -39,6 +40,7 @@ pub(crate) struct CommandOwner<'a> {
     scope: ScopeRef<'a>,
     image: Image<'a>,
     end: u64,
+    policy: CleanupPolicy,
 }
 enum ScopeRef<'a> {
     Owned(Box<Scope>),
@@ -83,6 +85,7 @@ impl CommandOwner<'static> {
             scope: ScopeRef::Owned(Box::new(Scope::local_entry(end).map_err(|_| refused())?)),
             image: Image::Owned(image),
             end,
+            policy: CleanupPolicy::CommandProbe,
         })
     }
 }
@@ -98,6 +101,7 @@ impl<'a> CommandOwner<'a> {
             scope: ScopeRef::Borrowed(scope),
             image: Image::Owned(image),
             end,
+            policy: CleanupPolicy::CommandProbe,
         })
     }
     pub(crate) fn for_hook(
@@ -119,6 +123,7 @@ impl<'a> CommandOwner<'a> {
             scope: ScopeRef::Borrowed(scope),
             image: Image::Borrowed(runtime.keeper()),
             end,
+            policy: CleanupPolicy::HookShort,
         })
     }
     pub(crate) fn finish_clean(&mut self) -> bool {
@@ -204,11 +209,12 @@ impl LeafRunner for CommandOwner<'_> {
             Image::Owned(image) => image,
             Image::Borrowed(image) => image,
         };
-        self.scope.run_verified(
-            command,
-            IoPlan::new(Vec::new(), stdout_cap, stderr_cap)?,
-            image,
-        )
+        let plan = IoPlan::new(Vec::new(), stdout_cap, stderr_cap)?;
+        if self.policy == CleanupPolicy::HookShort {
+            self.scope.run_verified(command, plan, image)
+        } else {
+            self.scope.run_verified_with_policy(command, plan, image, self.policy)
+        }
     }
 }
 #[cfg(test)]

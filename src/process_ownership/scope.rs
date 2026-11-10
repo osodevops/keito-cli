@@ -966,9 +966,10 @@ impl Scope {
         command: Command,
         plan: IoPlan,
         image: &super::image::VerifiedKeeperImage,
+        policy: CleanupPolicy,
     ) -> io::Result<SlotId> {
         self.start_with_lease(command, plan, |owner, end| {
-            GroupLease::spawn_verified_keeper(owner, image, end)
+            GroupLease::spawn_verified_keeper(owner, image, end, policy)
         })
     }
     fn start_with_lease(
@@ -1029,7 +1030,16 @@ impl Scope {
         plan: IoPlan,
         image: &super::image::VerifiedKeeperImage,
     ) -> io::Result<CommandResult> {
-        let slot = match self.start_verified_opaque(command, plan, image) {
+        self.run_verified_with_policy(command, plan, image, CleanupPolicy::HookShort)
+    }
+    pub(crate) fn run_verified_with_policy(
+        &mut self,
+        command: Command,
+        plan: IoPlan,
+        image: &super::image::VerifiedKeeperImage,
+        policy: CleanupPolicy,
+    ) -> io::Result<CommandResult> {
+        let slot = match self.start_verified_opaque(command, plan, image, policy) {
             Ok(slot) => slot,
             Err(error) => {
                 self.finish();

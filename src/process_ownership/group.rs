@@ -29,12 +29,13 @@ const MAX_LIFETIME_NS: u64 = 900_000_000_000;
 pub enum CleanupPolicy {
     Legacy,
     HookShort,
+    CommandProbe,
 }
 impl CleanupPolicy {
     fn reserve_ns(self) -> u64 {
         match self {
             Self::Legacy => CLEANUP_NS,
-            Self::HookShort => 50_000_000,
+            Self::HookShort | Self::CommandProbe => 50_000_000,
         }
     }
     fn term_ns(self) -> u64 {
@@ -43,13 +44,14 @@ impl CleanupPolicy {
     fn setup_ns(self) -> u64 {
         match self {
             Self::Legacy => CLEANUP_NS,
-            Self::HookShort => 20_000_000,
+            Self::HookShort | Self::CommandProbe => 20_000_000,
         }
     }
     fn keeper_tag(tag: Option<&str>) -> io::Result<Self> {
         match tag {
             None => Ok(Self::Legacy),
             Some("hook-short-v1") => Ok(Self::HookShort),
+            Some("command-probe-v1") => Ok(Self::CommandProbe),
             _ => Err(refused("KEEPER_POLICY")),
         }
     }
@@ -637,12 +639,13 @@ impl GroupLease {
         owner: SharedOwner,
         image: &super::image::VerifiedKeeperImage,
         lifetime_deadline_ns: u64,
+        policy: CleanupPolicy,
     ) -> io::Result<Self> {
         Self::spawn(
             owner,
             KeeperProgram::Verified(image),
             lifetime_deadline_ns,
-            CleanupPolicy::HookShort,
+            policy,
         )
     }
     fn spawn(
@@ -721,8 +724,10 @@ impl GroupLease {
                 sid.to_string(),
                 lifetime_deadline_ns.to_string(),
             ]);
-        if policy == CleanupPolicy::HookShort {
-            command.arg("hook-short-v1");
+        match policy {
+            CleanupPolicy::Legacy => {}
+            CleanupPolicy::HookShort => { command.arg("hook-short-v1"); }
+            CleanupPolicy::CommandProbe => { command.arg("command-probe-v1"); }
         }
         if let Some(image) = &image_descriptor {
             command.env(
@@ -3206,5 +3211,40 @@ mod short_policy_tests {
         assert_eq!(CleanupPolicy::HookShort.reserve_ns(), 50_000_000);
         assert_eq!(CleanupPolicy::HookShort.term_ns(), 15_000_000);
         assert_eq!(CleanupPolicy::HookShort.setup_ns(), 20_000_000);
+    }
+    #[test]
+    fn command_probe_setup_uses_the_same_original_operation_end() {
+        let policy = CleanupPolicy::CommandProbe;
+        let hard = 1_000_000_000;
+        assert_eq!(policy.setup_end(100_000_000, hard), 950_000_000);
+        assert_eq!(policy.setup_end(300_000_000, hard), 950_000_000);
+        assert_eq!(policy.setup_end(960_000_000, hard), 950_000_000);
+        let lifetime = Lifetime::with_policy(100_000_000, hard, policy).unwrap();
+        assert_eq!(lifetime.operation_end, 950_000_000);
+        assert_eq!(lifetime.hard_end, hard);
+    }
+    #[test]
+    fn command_probe_cleanup_never_renews_original_or_tighter_end() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        let mut channel = Channel::new(left, "a".repeat(32)).unwrap();
+        let mut state = Settlement::with_policy(1_000_000_000, CleanupPolicy::CommandProbe);
+        state.begin(1_000_000_000, 100_000_000, &mut channel).unwrap();
+        assert_eq!(state.progress.deadline_ns, 150_000_000);
+        state.begin(1_000_000_000, 120_000_000, &mut channel).unwrap();
+        assert_eq!(state.progress.deadline_ns, 150_000_000);
+        state.begin(140_000_000, 125_000_000, &mut channel).unwrap();
+        assert_eq!(state.progress.deadline_ns, 140_000_000);
+        assert_eq!(CleanupPolicy::CommandProbe.term_ns(), 15_000_000);
+        assert!(Lifetime::with_policy(0, 50_000_000, CleanupPolicy::CommandProbe).is_err());
+    }
+    #[test]
+    fn command_probe_keeper_tag_is_closed_and_does_not_change_hook_policy() {
+        assert_eq!(CleanupPolicy::keeper_tag(Some("command-probe-v1")).unwrap(), CleanupPolicy::CommandProbe);
+        for invalid in ["command-probe-v2", "command-probe-v1\n", "1000000000", "command-probe-v1:1000000000"] {
+            assert!(CleanupPolicy::keeper_tag(Some(invalid)).is_err());
+        }
+        assert_eq!(CleanupPolicy::HookShort.setup_end(100_000_000, 550_000_000), 120_000_000);
+        assert_eq!(CleanupPolicy::HookShort.reserve_ns(), 50_000_000);
+        assert_eq!(CleanupPolicy::HookShort.term_ns(), 15_000_000);
     }
 }
