@@ -65,12 +65,31 @@ mod unix {
         // No argv, path, environment value or arbitrary error text can enter
         // this early packet. Unknown reasons remain unknown, not a diagnosis.
         let safe = match reason {
-            "ARGS" | "PRIVATE_ENV" | "ENV_KEYS" | "POLICY_PREREQUISITE" | "PATH"
-            | "MODE" | "SELF" | "IMAGE_PATH" | "BINDING" | "BINDING_SCHEMA"
-            | "BINDING_MISMATCH" | "HASH_OPEN" | "HASH_META" | "HASH_READ"
-            | "HASH_LIMIT" | "HASH_DRIFT" | "CANARY" | "EVENT_OPEN"
-            | "CONTROLLER_GROUP" | "CLOCK" | "FIRST_FAILED" | "LEADER_ARGS"
-            | "ROLE_FD" | "ROLE_FD_BLOCKING" | "FORK" => reason,
+            "ARGS"
+            | "PRIVATE_ENV"
+            | "ENV_KEYS"
+            | "POLICY_PREREQUISITE"
+            | "PATH"
+            | "MODE"
+            | "SELF"
+            | "IMAGE_PATH"
+            | "BINDING"
+            | "BINDING_SCHEMA"
+            | "BINDING_MISMATCH"
+            | "HASH_OPEN"
+            | "HASH_META"
+            | "HASH_READ"
+            | "HASH_LIMIT"
+            | "HASH_DRIFT"
+            | "CANARY"
+            | "EVENT_OPEN"
+            | "CONTROLLER_GROUP"
+            | "CLOCK"
+            | "FIRST_FAILED"
+            | "LEADER_ARGS"
+            | "ROLE_FD"
+            | "ROLE_FD_BLOCKING"
+            | "FORK" => reason,
             _ => "UNCLASSIFIED",
         };
         json!({"actor_failure":true,"entry_phase":stage.label(),"reason":safe,
@@ -906,7 +925,11 @@ mod unix {
             let packet = entry_failure(EntryStage::PrivateRole, "ENV_KEYS");
             assert_eq!(packet["reason"], "ENV_KEYS");
             assert!(serde_json::to_vec(&packet).unwrap().len() < 256);
-            assert_eq!(entry_failure(EntryStage::Run, "FIRST_FAILED")["resource_admission_may_have_started"], true);
+            assert_eq!(
+                entry_failure(EntryStage::Run, "FIRST_FAILED")
+                    ["resource_admission_may_have_started"],
+                true
+            );
         }
     }
 }
