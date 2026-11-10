@@ -349,8 +349,7 @@ mod unix {
                         if matches!(
                             e.kind(),
                             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) =>
-                    {}
+                        ) => {}
                     Err(_) => return Err("READY_READ"),
                 }
             }
@@ -365,8 +364,7 @@ mod unix {
                         if matches!(
                             e.kind(),
                             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) =>
-                    {}
+                        ) => {}
                     Err(_) => return Err("LIVE_READ"),
                 }
             }
