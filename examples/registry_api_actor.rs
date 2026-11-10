@@ -243,7 +243,9 @@ mod unix {
     }
     // Classification only: admission remains exactly ten keys. The caller has
     // already validated every required key/value; no unknown name/value emits.
-    fn environment_key_refusal(keys: impl Iterator<Item = std::ffi::OsString>) -> Option<&'static str> {
+    fn environment_key_refusal(
+        keys: impl Iterator<Item = std::ffi::OsString>,
+    ) -> Option<&'static str> {
         let mut count = 0usize;
         let mut cf_text_encoding = false;
         for key in keys {
@@ -952,14 +954,22 @@ mod unix {
 
         #[test]
         fn known_platform_key_is_named_but_still_refused_and_unknown_keys_stay_opaque() {
-            let ten: Vec<_> = (0..10).map(|i| std::ffi::OsString::from(format!("SYNTHETIC_{i}"))).collect();
+            let ten: Vec<_> = (0..10)
+                .map(|i| std::ffi::OsString::from(format!("SYNTHETIC_{i}")))
+                .collect();
             assert_eq!(environment_key_refusal(ten.clone().into_iter()), None);
             let mut known = ten.clone();
             known.push("__CF_USER_TEXT_ENCODING".into());
-            assert_eq!(environment_key_refusal(known.clone().into_iter()), Some("ENV_KEYS_CF_TEXT_ENCODING"));
+            assert_eq!(
+                environment_key_refusal(known.clone().into_iter()),
+                Some("ENV_KEYS_CF_TEXT_ENCODING")
+            );
             let mut unknown = ten;
             unknown.push("UNPRINTED_EXTRA_NAME".into());
-            assert_eq!(environment_key_refusal(unknown.into_iter()), Some("ENV_KEYS"));
+            assert_eq!(
+                environment_key_refusal(unknown.into_iter()),
+                Some("ENV_KEYS")
+            );
             known.push("ANOTHER_UNPRINTED_NAME".into());
             assert_eq!(environment_key_refusal(known.into_iter()), Some("ENV_KEYS"));
         }
