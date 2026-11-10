@@ -24,7 +24,12 @@ join callback cannot return to a caller for reuse. The developer
 registration and coordinates one batch cleanup. Receipt forwarding, cooperative
 core edges and output-pipe ownership remain unintegrated.
 
-The granted lifetime reserves its final 1.8 seconds for failure cleanup. Expiry
+The legacy lifetime reserves its final 1.8 seconds for failure cleanup. The
+explicit `HookShort` lease policy instead reserves 50ms, retains 15ms TERM grace
+and caps setup at 20ms. Its exact optional keeper tag is `hook-short-v1`; absent
+tag retains legacy behavior and every other tag is refused. These are fixed
+policies inside the inherited deadline, not caller-supplied extensions. The
+batch registry remains legacy and actual product wiring is pending. Expiry
 starts cleanup at that earlier trigger, without extending the immutable hard end.
 Cleanup advances incrementally, receiving deadline reductions before each step.
 TERM grace starts once. Every group syscall checks the current absolute end.

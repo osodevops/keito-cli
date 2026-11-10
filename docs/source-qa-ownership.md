@@ -40,8 +40,23 @@ terminal emission. Manager begin/poll/schema errors retain pending collection
 within the same end; collected facts after a callback fault are cached separately
 from clean proof. Failed close/finalization cannot replace the original operation
 exception. Seven retained regressions plus the existing protocol/socket tests
-pass (45 total); independent review is pending. This does not implement the real
-multi-slot process manager or establish actual nested LIVE receipt acceptance.
+pass (45 total). R35 independently approved this finalizer prerequisite with
+53 passing methods, including eight additional reviewer cases. Those eight
+cases are now checked in and called by Linux and Mac CI. This does not implement
+the real multi-slot process manager or establish nested LIVE receipt acceptance;
+R34-06 remains partial and open.
+
+The shared Rust lease now has two closed cleanup policies. The legacy adapter
+keeps its 1.8-second reserve; `HookShort` reserves 50ms, with 15ms TERM grace and
+a 20ms handshake cap, inside the inherited hard end. Its optional keeper tag is
+exactly `hook-short-v1`, never a numeric timeout supplied by a caller. Failed
+parent control also caps local observation without clearing the first fault or
+claiming a wire acknowledgement. At source `1ed602e`, 84 shared Rust state/socket
+tests, default all-target checking, all-feature Clippy and formatting pass.
+Independent extraction/policy review and real product integration remain open.
+The existing batch registry still uses the legacy policy. None of these checks
+establishes an installed guard/core path, short-policy process acceptance or
+default latency.
 
 The remaining integration must preserve the guardian's actual `setsid`, imageFD,
 ACK and timing boundaries; give controlled source processes cooperative owners;
