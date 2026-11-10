@@ -79,8 +79,19 @@ proof. Full retained reports are explicit snapshots outside the hot poll path.
 At source `ff34067`, 98 shared state/socket/fake-stream tests, default all-target
 checking, all-feature Clippy and formatting pass. The retained migration baseline
 has 93 passes and one behavioral failure for containing admission being closed;
-an earlier test-only type error is recorded separately. Independent lifecycle
-review is pending. The only current Scope image entrypoint requires a QA-owned
+an earlier test-only type error is recorded separately. R38 independently found
+two required corrections: retained input capacity was undercharged, and the last
+finish-clock error did not propagate a zero cleanup bound. Their retained
+regressions produced 99 passes and three behavioral failures. Source `a6b89ac`
+passes all 102 focused tests, default all-target checking, all-feature Clippy and
+formatting after correcting both paths; independent repair review is pending.
+Input now charges its reserved Vec capacity, including unused space, and rejects
+oversized reservations before spawn. Output allocation must fit its charged
+capacity too. A final clock error broadcasts irreversible zero bounds before
+marking finished; later clock recovery cannot reopen that observation interval.
+The actual finish envelope is shared with clock-injected regressions, including
+pending resources, accepted historical slots, earlier faults and an empty owner.
+The only current Scope image entrypoint requires a QA-owned
 0700 image. Sealed official images, cooperative core edges, signal/bootstrap
 integration and actual product/probe/Python-manager call sites remain pending.
 These tests do not execute the real command/guard chain or qualify its timing.
