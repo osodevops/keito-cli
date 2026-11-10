@@ -21,6 +21,9 @@ pub mod commands;
 pub mod config;
 pub mod error;
 pub mod output;
+#[cfg(unix)]
+#[doc(hidden)]
+pub mod process_ownership;
 pub mod skill_adapter;
 #[cfg(all(feature = "dev-tools", unix))]
 pub mod source_qa_group;
