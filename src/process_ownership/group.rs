@@ -402,7 +402,9 @@ impl Settlement {
     }
     fn cap_failed_observation(&mut self, at: Option<u64>, requested: u64) {
         // No usable clock means no newly granted observation interval.
-        let end = at.map(|at| self.policy.observation_end(at, requested)).unwrap_or(0);
+        let end = at
+            .map(|at| self.policy.observation_end(at, requested))
+            .unwrap_or(0);
         self.progress.shorten(end);
     }
     fn begin(&mut self, deadline_ns: u64, at: u64, channel: &mut Channel) -> io::Result<()> {
@@ -2906,30 +2908,30 @@ mod short_policy_tests {
     #[test]
     fn faulted_parent_caps_retention_to_short_end_without_clearing_first_fault() {
         let (left, _right) = UnixStream::pair().unwrap();
-        let mut channel=Channel::new(left,"a".repeat(32)).unwrap();
-        let mut state=Settlement::with_policy(550_000_000,CleanupPolicy::HookShort);
+        let mut channel = Channel::new(left, "a".repeat(32)).unwrap();
+        let mut state = Settlement::with_policy(550_000_000, CleanupPolicy::HookShort);
         state.progress.fail("ORIGINAL");
-        assert!(state.begin(550_000_000,100_000_000,&mut channel).is_err());
-        state.cap_failed_observation(Some(100_000_000),550_000_000);
-        assert_eq!(state.progress.deadline_ns,150_000_000);
-        state.cap_failed_observation(Some(110_000_000),500_000_000);
-        assert_eq!(state.progress.deadline_ns,150_000_000);
-        state.cap_failed_observation(None,500_000_000);
-        assert_eq!(state.progress.deadline_ns,0);
-        assert_eq!(state.progress.first_fault,Some("ORIGINAL"));
+        assert!(state.begin(550_000_000, 100_000_000, &mut channel).is_err());
+        state.cap_failed_observation(Some(100_000_000), 550_000_000);
+        assert_eq!(state.progress.deadline_ns, 150_000_000);
+        state.cap_failed_observation(Some(110_000_000), 500_000_000);
+        assert_eq!(state.progress.deadline_ns, 150_000_000);
+        state.cap_failed_observation(None, 500_000_000);
+        assert_eq!(state.progress.deadline_ns, 0);
+        assert_eq!(state.progress.first_fault, Some("ORIGINAL"));
     }
     #[test]
     fn failed_control_send_keeps_failed_observation_within_same_short_policy() {
         let (left, right) = UnixStream::pair().unwrap();
         left.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut channel=Channel::new(left,"a".repeat(32)).unwrap();
-        let mut state=Settlement::with_policy(550_000_000,CleanupPolicy::HookShort);
-        assert!(state.begin(550_000_000,100_000_000,&mut channel).is_err());
+        let mut channel = Channel::new(left, "a".repeat(32)).unwrap();
+        let mut state = Settlement::with_policy(550_000_000, CleanupPolicy::HookShort);
+        assert!(state.begin(550_000_000, 100_000_000, &mut channel).is_err());
         state.progress.fail("SEND_FAILED");
-        state.cap_failed_observation(Some(100_000_000),550_000_000);
-        assert_eq!(state.progress.deadline_ns,150_000_000);
+        state.cap_failed_observation(Some(100_000_000), 550_000_000);
+        assert_eq!(state.progress.deadline_ns, 150_000_000);
         assert!(!state.cleanup_sent);
-        assert_eq!(state.progress.first_fault,Some("SEND_FAILED"));
+        assert_eq!(state.progress.first_fault, Some("SEND_FAILED"));
         drop(right);
     }
     #[test]
