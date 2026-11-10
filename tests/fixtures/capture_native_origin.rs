@@ -79,8 +79,15 @@ fn complete(scope: &mut Scope, slot: &SlotId) -> io::Result<ExitStatus> {
 }
 // Developer-only failure diagnosis. Never serialize argv, environment, command
 // output or arbitrary io::Error text; keep the original operation error primary.
-fn failure_receipt(arguments: &[std::ffi::OsString], scope: &Scope, finality: bool) -> io::Result<()> {
-    let mode = arguments.first().and_then(|s| s.to_str()).ok_or_else(error)?;
+fn failure_receipt(
+    arguments: &[std::ffi::OsString],
+    scope: &Scope,
+    finality: bool,
+) -> io::Result<()> {
+    let mode = arguments
+        .first()
+        .and_then(|s| s.to_str())
+        .ok_or_else(error)?;
     let offset = match mode {
         "--chain" => 2,
         "--cli" | "--run" | "--git-init" => 1,
@@ -91,24 +98,44 @@ fn failure_receipt(arguments: &[std::ffi::OsString], scope: &Scope, finality: bo
     let case = Path::new(&fields[1]);
     let home = case.join("home");
     let capture = home.join("capture");
-    isolation::checked(root, case, Some(&home), Some(&capture), Some(Path::new(&fields[2])))
-        .map_err(|_| error())?;
+    isolation::checked(
+        root,
+        case,
+        Some(&home),
+        Some(&capture),
+        Some(Path::new(&fields[2])),
+    )
+    .map_err(|_| error())?;
     let report = scope.report();
-    let slots: Vec<_> = report.slots.iter().map(|slot| serde_json::json!({
-        "slot": slot.slot, "status": slot.status.and_then(|status| status.code()),
-        "waits_known": slot.waits_known, "group_absent": slot.group_absent,
-        "terminal_eof": slot.terminal_eof, "io_required": slot.io_required,
-        "stdin_closed": slot.io.stdin_closed, "stdout_eof": slot.io.stdout_eof,
-        "stderr_eof": slot.io.stderr_eof, "accepted_at": slot.accepted_at,
-        "completion_end": slot.completion_end, "first_fault": slot.first_fault,
-    })).collect();
+    let slots: Vec<_> = report
+        .slots
+        .iter()
+        .map(|slot| {
+            serde_json::json!({
+                "slot": slot.slot, "status": slot.status.and_then(|status| status.code()),
+                "waits_known": slot.waits_known, "group_absent": slot.group_absent,
+                "terminal_eof": slot.terminal_eof, "io_required": slot.io_required,
+                "stdin_closed": slot.io.stdin_closed, "stdout_eof": slot.io.stdout_eof,
+                "stderr_eof": slot.io.stderr_eof, "accepted_at": slot.accepted_at,
+                "completion_end": slot.completion_end, "first_fault": slot.first_fault,
+            })
+        })
+        .collect();
     let value = serde_json::json!({"source_fixture_diagnosis_only": true,
         "late_final_facts": finality, "first_fault": report.first_fault.map(|fault| fault.0),
         "hard_end_ns": scope.hard_end(), "finish_called": report.finish_called,
         "all_resources": report.all_resources, "clean": report.clean, "slots": slots});
-    let name = if finality { "native-owner-FINAL.json" } else { "native-owner-FIRST.json" };
-    let mut output = OpenOptions::new().write(true).create_new(true).mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW).open(case.join(name))?;
+    let name = if finality {
+        "native-owner-FINAL.json"
+    } else {
+        "native-owner-FIRST.json"
+    };
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(case.join(name))?;
     serde_json::to_writer(&mut output, &value)?;
     output.write_all(b"\n")?;
     output.sync_all()
