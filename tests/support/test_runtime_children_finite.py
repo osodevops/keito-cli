@@ -259,6 +259,7 @@ class RuntimeManagerTests(unittest.TestCase):
         popen.assert_not_called()
         self.assertEqual(owner.deadline_ns, 0)
         self.assertEqual(manager.cleanup_end, 0)
+        self.assertTrue(manager.slots[0]["control_closed"])
 
     def test_review_cached_owner_cannot_finish_clean_at_deadline(self):
         owner = SourceOwner()

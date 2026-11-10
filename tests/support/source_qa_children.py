@@ -518,7 +518,13 @@ class OwnedChildren:
         self.cleanup_end = min(bounds)
         # Broadcast ALL cancellation/close intents before any wait or drain.
         for slot in self.slots:
-            if slot["child"] is None or slot["accepted"] is not None:
+            if slot["child"] is None:
+                # Close the provisional parent channel even at a zero end.
+                # The surrounding start finally owns the temporary peer/mask;
+                # only its later collection turn may mark the slot collected.
+                self._close_control(slot)
+                continue
+            if slot["accepted"] is not None:
                 continue
             child = slot["child"]
             self._close_input(slot)
