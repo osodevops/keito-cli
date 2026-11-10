@@ -32,17 +32,30 @@ pub enum CleanupPolicy {
 }
 impl CleanupPolicy {
     fn reserve_ns(self) -> u64 {
-        match self { Self::Legacy => CLEANUP_NS, Self::HookShort => 50_000_000 }
+        match self {
+            Self::Legacy => CLEANUP_NS,
+            Self::HookShort => 50_000_000,
+        }
     }
-    fn term_ns(self) -> u64 { TERM_NS }
+    fn term_ns(self) -> u64 {
+        TERM_NS
+    }
     fn setup_ns(self) -> u64 {
-        match self { Self::Legacy => CLEANUP_NS, Self::HookShort => 20_000_000 }
+        match self {
+            Self::Legacy => CLEANUP_NS,
+            Self::HookShort => 20_000_000,
+        }
     }
     fn keeper_tag(tag: Option<&str>) -> io::Result<Self> {
-        match tag { None => Ok(Self::Legacy), Some("hook-short-v1") => Ok(Self::HookShort), _ => Err(refused("KEEPER_POLICY")) }
+        match tag {
+            None => Ok(Self::Legacy),
+            Some("hook-short-v1") => Ok(Self::HookShort),
+            _ => Err(refused("KEEPER_POLICY")),
+        }
     }
     fn setup_end(self, at: u64, hard_end: u64) -> u64 {
-        at.saturating_add(self.setup_ns()).min(hard_end.saturating_sub(self.reserve_ns()))
+        at.saturating_add(self.setup_ns())
+            .min(hard_end.saturating_sub(self.reserve_ns()))
     }
     fn observation_end(self, at: u64, inherited_end: u64) -> u64 {
         at.saturating_add(self.reserve_ns()).min(inherited_end)
@@ -572,7 +585,13 @@ impl GroupLease {
         keeper_image: &Path,
         lifetime_deadline_ns: u64,
     ) -> io::Result<Self> {
-        Self::spawn_keeper_with_policy(owner, run_root, keeper_image, lifetime_deadline_ns, CleanupPolicy::Legacy)
+        Self::spawn_keeper_with_policy(
+            owner,
+            run_root,
+            keeper_image,
+            lifetime_deadline_ns,
+            CleanupPolicy::Legacy,
+        )
     }
     /// Explicit short policy for same-session leaves. Product image authority,
     /// cooperative core and I/O wiring remain separate prerequisites.
@@ -723,7 +742,10 @@ impl GroupLease {
             if self.settlement.progress.phase != Phase::AwaitReady {
                 return Err(refused("GROUP_STATE"));
             }
-            let deadline = self.settlement.policy.setup_end(now()?, self.settlement.progress.deadline_ns);
+            let deadline = self
+                .settlement
+                .policy
+                .setup_end(now()?, self.settlement.progress.deadline_ns);
             let body = self.channel.wait_frame(deadline)?;
             if body != format!("READY|{}|{}|{}", self.keeper_pid, self.keeper_pid, self.sid) {
                 return Err(refused("GROUP_READY"));
@@ -770,7 +792,11 @@ impl GroupLease {
                 .advance(Phase::Ready, Phase::Joined)?;
             self.check_admission()?;
             self.channel.send("PARK")?;
-            let response = self.channel.wait_frame(self.settlement.policy.setup_end(now()?, self.settlement.progress.deadline_ns))?;
+            let response = self.channel.wait_frame(
+                self.settlement
+                    .policy
+                    .setup_end(now()?, self.settlement.progress.deadline_ns),
+            )?;
             if response
                 != format!(
                     "PARKED|{}|{}|{}",
@@ -861,7 +887,10 @@ impl Drop for GroupLease {
         // proof deadline passed. Explicit owner must retain report/unknowns.
         self.settlement
             .collect(&mut self.keeper, self.workload.as_mut());
-        let deadline = self.settlement.policy.observation_end(now().unwrap_or(0), self.settlement.progress.deadline_ns);
+        let deadline = self
+            .settlement
+            .policy
+            .observation_end(now().unwrap_or(0), self.settlement.progress.deadline_ns);
         while now().unwrap_or(deadline) < deadline {
             self.settlement
                 .collect(&mut self.keeper, self.workload.as_mut());
@@ -982,7 +1011,9 @@ impl<G: GroupOps> KeeperSession<G> {
         self.first_fault.get_or_insert(reason);
         if !self.cleaning && !self.gone {
             self.cleaning = true;
-            self.end = self.end.min(at.saturating_add(self.lifetime.policy.reserve_ns()));
+            self.end = self
+                .end
+                .min(at.saturating_add(self.lifetime.policy.reserve_ns()));
         }
     }
     fn check_authority(&self) -> io::Result<()> {
@@ -2769,90 +2800,137 @@ mod tests {
 mod short_policy_tests {
     use super::*;
     use std::os::unix::net::UnixStream;
-    struct Group { actions: Vec<&'static str>, absent: bool }
+    struct Group {
+        actions: Vec<&'static str>,
+        absent: bool,
+    }
     impl GroupOps for Group {
-        fn park(&mut self) -> io::Result<()> { self.actions.push("park"); Ok(()) }
-        fn absent(&mut self) -> io::Result<bool> { self.actions.push("query"); Ok(self.absent) }
-        fn signal(&mut self, signal: i32) -> io::Result<()> { self.actions.push(if signal==libc::SIGTERM {"term"} else {"kill"}); Ok(()) }
-        fn abandon_self_group(&mut self) -> io::Result<()> { panic!("not a failure parking case") }
-        fn disable(&mut self) { self.actions.push("disable"); }
+        fn park(&mut self) -> io::Result<()> {
+            self.actions.push("park");
+            Ok(())
+        }
+        fn absent(&mut self) -> io::Result<bool> {
+            self.actions.push("query");
+            Ok(self.absent)
+        }
+        fn signal(&mut self, signal: i32) -> io::Result<()> {
+            self.actions.push(if signal == libc::SIGTERM {
+                "term"
+            } else {
+                "kill"
+            });
+            Ok(())
+        }
+        fn abandon_self_group(&mut self) -> io::Result<()> {
+            panic!("not a failure parking case")
+        }
+        fn disable(&mut self) {
+            self.actions.push("disable");
+        }
     }
     fn session() -> KeeperSession<Group> {
-        KeeperSession::new(Group { actions: vec![], absent: false }, Lifetime::with_policy(0, 550_000_000, CleanupPolicy::HookShort).unwrap())
+        KeeperSession::new(
+            Group {
+                actions: vec![],
+                absent: false,
+            },
+            Lifetime::with_policy(0, 550_000_000, CleanupPolicy::HookShort).unwrap(),
+        )
     }
     #[test]
     fn admitted_hook_lifetime_reserves_fifty_ms_inside_original_end() {
-        let lifetime=Lifetime::with_policy(0,550_000_000,CleanupPolicy::HookShort).unwrap();
-        assert_eq!(lifetime.operation_end,500_000_000);
-        assert_eq!(lifetime.hard_end,550_000_000);
-        assert_eq!(lifetime.policy,CleanupPolicy::HookShort);
-        assert!(Lifetime::with_policy(0,50_000_000,CleanupPolicy::HookShort).is_err());
-        assert!(Lifetime::with_policy(1,0,CleanupPolicy::HookShort).is_err());
+        let lifetime = Lifetime::with_policy(0, 550_000_000, CleanupPolicy::HookShort).unwrap();
+        assert_eq!(lifetime.operation_end, 500_000_000);
+        assert_eq!(lifetime.hard_end, 550_000_000);
+        assert_eq!(lifetime.policy, CleanupPolicy::HookShort);
+        assert!(Lifetime::with_policy(0, 50_000_000, CleanupPolicy::HookShort).is_err());
+        assert!(Lifetime::with_policy(1, 0, CleanupPolicy::HookShort).is_err());
     }
     #[test]
     fn parent_clean_is_capped_to_the_short_reserve_not_legacy_tail() {
-        let (left,_right)=UnixStream::pair().unwrap();
-        let mut channel=Channel::new(left,"a".repeat(32)).unwrap();
-        let mut state=Settlement::with_policy(550_000_000,CleanupPolicy::HookShort);
-        state.begin(550_000_000,100_000_000,&mut channel).unwrap();
-        assert_eq!(state.progress.deadline_ns,150_000_000);
-        state.begin(500_000_000,110_000_000,&mut channel).unwrap();
-        assert_eq!(state.progress.deadline_ns,150_000_000);
-        state.begin(140_000_000,120_000_000,&mut channel).unwrap();
-        assert_eq!(state.progress.deadline_ns,140_000_000);
+        let (left, _right) = UnixStream::pair().unwrap();
+        let mut channel = Channel::new(left, "a".repeat(32)).unwrap();
+        let mut state = Settlement::with_policy(550_000_000, CleanupPolicy::HookShort);
+        state.begin(550_000_000, 100_000_000, &mut channel).unwrap();
+        assert_eq!(state.progress.deadline_ns, 150_000_000);
+        state.begin(500_000_000, 110_000_000, &mut channel).unwrap();
+        assert_eq!(state.progress.deadline_ns, 150_000_000);
+        state.begin(140_000_000, 120_000_000, &mut channel).unwrap();
+        assert_eq!(state.progress.deadline_ns, 140_000_000);
     }
     #[test]
     fn keeper_failure_and_control_share_the_same_short_minimum() {
-        let mut s=session();
-        s.fail("ORIGINAL",100_000_000);
-        assert_eq!(s.end,150_000_000);
-        s.control("CLEAN|140000000",110_000_000).unwrap();
-        s.control("CLEAN|500000000",120_000_000).unwrap();
-        assert_eq!(s.end,140_000_000);
-        assert_eq!(s.first_fault,Some("ORIGINAL"));
+        let mut s = session();
+        s.fail("ORIGINAL", 100_000_000);
+        assert_eq!(s.end, 150_000_000);
+        s.control("CLEAN|140000000", 110_000_000).unwrap();
+        s.control("CLEAN|500000000", 120_000_000).unwrap();
+        assert_eq!(s.end, 140_000_000);
+        assert_eq!(s.first_fault, Some("ORIGINAL"));
     }
     #[test]
     fn expiry_starts_cleanup_inside_end_and_signals_never_after_end() {
-        let mut s=session();s.parked=true;
-        s.step(&mut ||Ok(500_000_000)).unwrap();
-        assert_eq!(s.end,550_000_000);
-        assert_eq!(s.term_end,Some(515_000_000));
-        assert_eq!(s.group.actions,["query","term"]);
-        s.step(&mut ||Ok(515_000_000)).unwrap();
-        assert_eq!(s.group.actions,["query","term","query","kill"]);
-        let before=s.group.actions.clone();
-        assert!(s.step(&mut ||Ok(550_000_000)).is_err());
-        assert_eq!(s.group.actions,before);
-        assert_eq!(s.first_fault,Some("KEEPER_LIFETIME"));
+        let mut s = session();
+        s.parked = true;
+        s.step(&mut || Ok(500_000_000)).unwrap();
+        assert_eq!(s.end, 550_000_000);
+        assert_eq!(s.term_end, Some(515_000_000));
+        assert_eq!(s.group.actions, ["query", "term"]);
+        s.step(&mut || Ok(515_000_000)).unwrap();
+        assert_eq!(s.group.actions, ["query", "term", "query", "kill"]);
+        let before = s.group.actions.clone();
+        assert!(s.step(&mut || Ok(550_000_000)).is_err());
+        assert_eq!(s.group.actions, before);
+        assert_eq!(s.first_fault, Some("KEEPER_LIFETIME"));
     }
     #[test]
     fn short_handshake_and_failed_drop_never_restart_the_inherited_budget() {
-        let p=CleanupPolicy::HookShort;
-        assert_eq!(p.setup_end(100_000_000,550_000_000),120_000_000);
-        assert_eq!(p.setup_end(490_000_000,550_000_000),500_000_000);
-        assert_eq!(p.observation_end(100_000_000,140_000_000),140_000_000);
-        assert_eq!(p.observation_end(200_000_000,140_000_000),140_000_000);
-        assert_eq!(p.observation_end(u64::MAX-1,u64::MAX),u64::MAX);
-        assert_eq!(CleanupPolicy::Legacy.setup_end(0,3_000_000_000),1_200_000_000);
+        let p = CleanupPolicy::HookShort;
+        assert_eq!(p.setup_end(100_000_000, 550_000_000), 120_000_000);
+        assert_eq!(p.setup_end(490_000_000, 550_000_000), 500_000_000);
+        assert_eq!(p.observation_end(100_000_000, 140_000_000), 140_000_000);
+        assert_eq!(p.observation_end(200_000_000, 140_000_000), 140_000_000);
+        assert_eq!(p.observation_end(u64::MAX - 1, u64::MAX), u64::MAX);
+        assert_eq!(
+            CleanupPolicy::Legacy.setup_end(0, 3_000_000_000),
+            1_200_000_000
+        );
     }
     #[test]
     fn keeper_policy_tag_is_closed_not_a_caller_supplied_allowance() {
-        assert_eq!(CleanupPolicy::keeper_tag(None).unwrap(),CleanupPolicy::Legacy);
-        assert_eq!(CleanupPolicy::keeper_tag(Some("hook-short-v1")).unwrap(),CleanupPolicy::HookShort);
-        for invalid in ["", "legacy", "hook-short-v2", "5000000000", "hook-short-v1\n"] {
-            assert_eq!(CleanupPolicy::keeper_tag(Some(invalid)).unwrap_err().to_string(),"KEEPER_POLICY");
+        assert_eq!(
+            CleanupPolicy::keeper_tag(None).unwrap(),
+            CleanupPolicy::Legacy
+        );
+        assert_eq!(
+            CleanupPolicy::keeper_tag(Some("hook-short-v1")).unwrap(),
+            CleanupPolicy::HookShort
+        );
+        for invalid in [
+            "",
+            "legacy",
+            "hook-short-v2",
+            "5000000000",
+            "hook-short-v1\n",
+        ] {
+            assert_eq!(
+                CleanupPolicy::keeper_tag(Some(invalid))
+                    .unwrap_err()
+                    .to_string(),
+                "KEEPER_POLICY"
+            );
         }
     }
     #[test]
     fn legacy_policy_values_and_admission_remain_unchanged() {
-        let life=Lifetime::new(0,3_000_000_000).unwrap();
-        assert_eq!(life.policy,CleanupPolicy::Legacy);
-        assert_eq!(life.operation_end,1_200_000_000);
-        assert!(Lifetime::new(0,CLEANUP_NS).is_err());
-        assert_eq!(CleanupPolicy::Legacy.reserve_ns(),CLEANUP_NS);
-        assert_eq!(CleanupPolicy::Legacy.term_ns(),15_000_000);
-        assert_eq!(CleanupPolicy::HookShort.reserve_ns(),50_000_000);
-        assert_eq!(CleanupPolicy::HookShort.term_ns(),15_000_000);
-        assert_eq!(CleanupPolicy::HookShort.setup_ns(),20_000_000);
+        let life = Lifetime::new(0, 3_000_000_000).unwrap();
+        assert_eq!(life.policy, CleanupPolicy::Legacy);
+        assert_eq!(life.operation_end, 1_200_000_000);
+        assert!(Lifetime::new(0, CLEANUP_NS).is_err());
+        assert_eq!(CleanupPolicy::Legacy.reserve_ns(), CLEANUP_NS);
+        assert_eq!(CleanupPolicy::Legacy.term_ns(), 15_000_000);
+        assert_eq!(CleanupPolicy::HookShort.reserve_ns(), 50_000_000);
+        assert_eq!(CleanupPolicy::HookShort.term_ns(), 15_000_000);
+        assert_eq!(CleanupPolicy::HookShort.setup_ns(), 20_000_000);
     }
 }
