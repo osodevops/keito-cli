@@ -15,7 +15,7 @@ import stat
 import sys
 
 sys.dont_write_bytecode = True
-from source_qa_children import OwnedChildren
+from source_qa_cargo import cargo
 from source_qa_manifest import ManifestLease
 assert sys.platform in ("darwin", "linux"), "Unix source QA is unsupported here"
 assert len(sys.argv) == 4, "run_guarded_usage_qa.py <private-run-root> <cargo> <rustc>"
@@ -67,8 +67,8 @@ BUILD_ENV.update({"HOME": str(ROOT / "home"), "CODEX_HOME": str(ROOT / "home/.co
                   "XDG_CONFIG_HOME": str(ROOT / "home/config"),
                   "XDG_STATE_HOME": str(ROOT / "home/state"), "APPDATA": str(ROOT / "home/AppData"),
                   "TMPDIR": str(ROOT / "tmp"), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
-                  "CARGO_HOME": os.environ.get("CARGO_HOME", str(Path(os.environ["HOME"]) / ".cargo")),
-                  "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path(os.environ["HOME"]) / ".rustup")),
+                  "CARGO_HOME": os.environ["CARGO_HOME"],
+                  "RUSTUP_HOME": os.environ["RUSTUP_HOME"],
                   "CARGO_TARGET_DIR": str(ROOT / "target-source-only"), "CARGO_NET_OFFLINE": "true",
                   "CARGO_BUILD_JOBS": "2", "RUST_TEST_THREADS": "1", "RUSTFLAGS": "-D warnings",
                   "CARGO_PROFILE_DEV_OPT_LEVEL": "2", "CARGO_PROFILE_DEV_LTO": "false",
@@ -77,7 +77,15 @@ BUILD_ENV.update({"HOME": str(ROOT / "home"), "CODEX_HOME": str(ROOT / "home/.co
 
 
 def invoke(label, arguments, timeout, extra=None):
-    manager.run(label, arguments, timeout, extra=extra)
+    assert arguments[0] == CARGO and timeout <= 900
+    config = ["--config", "profile.dev.opt-level=2", "--config", 'profile.dev.debug=0',
+              "--config", "profile.dev.codegen-units=8", "--config", 'profile.dev.strip="symbols"']
+    if extra:
+        assert set(extra) == {"KEITO_RELEASE_GUARD_SHA256"}
+        value = extra["KEITO_RELEASE_GUARD_SHA256"]
+        assert len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+        config += ["--config", 'env.KEITO_RELEASE_GUARD_SHA256="' + value + '"']
+    return cargo(ROOT, REPO, CARGO, BUILD_ENV, label, [*config, *arguments[1:]])
 
 
 def source_snapshot():
@@ -87,7 +95,6 @@ def source_snapshot():
 
 
 manifest = ManifestLease(REPO, PARENT)
-manager = OwnedChildren(ROOT, BUILD_ENV, REPO)
 BOUNDARY = ("macOS: existing proved inherited kernel service/network policy" if sys.platform == "darwin"
             else "Linux: private checked operands and environment; no kernel service/network denial claim")
 snapshot = source_snapshot()
@@ -96,31 +103,36 @@ record("source-before.json", {"source_fixture_only": True, "files": snapshot, "e
                               "source_set_sha256": manifest.value["source_set_sha256"],
                               "collector": manifest.value["collector"], "deleted_paths": manifest.value["deleted_paths"],
                               "not_final_release_qualification": True})
-with manifest, manager:
-    metadata = json.loads(manager.run("source-metadata", [CARGO, "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1"],
-                                      60, capture_limit=2 * 1024 * 1024))
-    version = next(package["version"] for package in metadata["packages"] if package["name"] == "keito-cli")
-    host = next(line.removeprefix("host: ") for line in
-                manager.run("rustc-version", [RUSTC, "-vV"], 30, capture_limit=8192).decode().splitlines() if line.startswith("host: "))
-    invoke("source-guard-build", [CARGO, "build", "--locked", "--offline", "--features", "dev-tools", "--bin", "keito-capture-guard"], 900)
+with manifest:
+    import tomllib
+    package = tomllib.loads((REPO / "Cargo.toml").read_text())
+    version = package["package"]["version"]
+    # Pair target comes from Cargo's source-bound build-script output below,
+    # never an unowned rustc --version child or a caller-supplied namespace.
+    guard_target = invoke("source-guard-build", [CARGO, "build", "--locked", "--offline", "--features", "dev-tools", "--bin", "keito-capture-guard"], 600)
     pair = ROOT / "pair-source-only"
-    shutil.copyfile(ROOT / "target-source-only/debug/keito-capture-guard", pair / "keito-capture-guard")
+    shutil.copyfile(guard_target / "keito-capture-guard", pair / "keito-capture-guard")
     (pair / "keito-capture-guard").chmod(0o700)
     guard_digest = digest(pair / "keito-capture-guard")
-    invoke("source-core-build", [CARGO, "build", "--locked", "--offline", "--features", "dev-tools", "--bin", "keito"],
-           900, {"KEITO_RELEASE_GUARD_SHA256": guard_digest})
-    shutil.copyfile(ROOT / "target-source-only/debug/keito", pair / "keito")
+    core_target = invoke("source-core-build", [CARGO, "build", "--locked", "--offline", "--features", "dev-tools", "--bin", "keito"],
+           600, {"KEITO_RELEASE_GUARD_SHA256": guard_digest})
+    shutil.copyfile(core_target / "keito", pair / "keito")
     (pair / "keito").chmod(0o700)
+    target_outputs = list((core_target / "build").glob("keito-cli-*/output"))
+    targets = {line.split("=", 2)[2] for path in target_outputs for line in path.read_text().splitlines()
+               if line.startswith("cargo:rustc-env=KEITO_BUILD_TARGET=")}
+    assert len(targets) == 1
+    host = targets.pop()
     pair_manifest = {"manifest_contract": 1, "version": version, "target": host, "guard_contract": 2,
                 "files": {"keito": digest(pair / "keito"), "keito-capture-guard": guard_digest}}
     with (pair / "capture-runtime-manifest.json").open("x") as output:
         json.dump(pair_manifest, output, indent=2)
         output.write("\n")
-    for name, version in (("codex-inert-source-only", "0.167.0"), ("claude-inert-source-only", "2.1.319")):
+    for name in ("codex-inert-source-only", "claude-inert-source-only"):
         image = ROOT / "owned-native" / name
-        invoke("build-" + name, [RUSTC, "--edition=2021", "-D", "warnings",
-                                 str(REPO / "tests/fixtures/capture_native_origin.rs"), "-o", str(image)],
-               120, {"OWNED_SOURCE_FIXTURE_VERSION": version})
+        fixture_target = invoke("build-" + name, [CARGO, "build", "--locked", "--offline", "--features", "dev-tools", "--bin", name],
+               600, {"KEITO_RELEASE_GUARD_SHA256": guard_digest})
+        shutil.copyfile(fixture_target / name, image)
         image.chmod(0o700)
     assert source_snapshot() == snapshot, "source changed during source-fixture builds"
     record("pair-and-native-identities.json", {"source_fixture_only": True, "manifest": pair_manifest,
@@ -129,12 +141,21 @@ with manifest, manager:
                                              "native_files": {path.name: digest(path) for path in (ROOT / "owned-native").iterdir()}})
     for label, script, output in (("normal-positive-first", "guarded_usage_acceptance.py", "qa-positives"),
                                    ("normal-negative-first", "guarded_usage_negatives.py", "qa-negatives")):
-        invoke(label, [sys.executable, str(REPO / "tests/support" / script), str(ROOT), str(pair),
-                       str(ROOT / "owned-native"), str(ROOT / output)], 600)
+        # Execute Python acceptance on THIS thread. Every actual runtime Child
+        # is retained by its registered multi-slot manager; no opaque subprocess
+        # around the whole script and no second source ownership implementation.
+        import runpy
+        old_argv = sys.argv
+        sys.argv = [str(REPO / "tests/support" / script), str(ROOT), str(pair),
+                    str(ROOT / "owned-native"), str(ROOT / output)]
+        try:
+            runpy.run_path(str(REPO / "tests/support" / script), run_name="__main__")
+        finally:
+            sys.argv = old_argv
     assert source_snapshot() == snapshot, "source changed during source-fixture verification"
     record("source-qa-complete.json", {"source_fixture_only": True, "positive_namespaces": 2,
                                         "negative_cases": 38, "not_real_harness_provider_or_release_qualification": True,
-                                        "all_tracked_direct_handles_waited": manager.active is None,
+                                        "all_tracked_direct_handles_waited": "see each retained runtime manager receipt and compiler FIRST/FINAL",
                                         "outer_manifest_sha256": manifest.raw_sha256,
                                         "source_set_sha256": manifest.value["source_set_sha256"],
                                         "execution_boundary": BOUNDARY})

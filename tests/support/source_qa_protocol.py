@@ -332,6 +332,7 @@ class SourceOwner:
         self._failed_managers = set()
         self._collected_failed_managers = set()
         self._closed = False
+        self.runtime_io_reserved = 0
 
     def fail(self, reason):
         if self.first_fault is None:
@@ -344,11 +345,25 @@ class SourceOwner:
         self.previous = CURRENT
         descriptor, nonce = os.environ.pop(FD, None), os.environ.pop(NONCE, None)
         try:
+            keys = ("KEITO_PROCESS_OWNER_FD", "KEITO_PROCESS_OWNER_NONCE", "KEITO_PROCESS_OWNER_PID",
+                    "KEITO_PROCESS_OWNER_END_NS", "KEITO_PROCESS_OWNER_CONTRACT")
+            values = [os.environ.pop(key, None) for key in keys]
+            if any(value is not None for value in values):
+                if not all(value is not None for value in values) or descriptor is not None or nonce is not None:
+                    raise ProtocolError("PARTIAL_ENVIRONMENT")
+                descriptor, nonce, parent, end, contract = values
+                if descriptor != "4" or contract != "2" or integer(parent, 1, 2147483647) != os.getppid():
+                    raise ProtocolError("OWNER_PARENT_IDENTITY")
+                self.deadline_ns = integer(end, 1, 18446744073709551615)
+                if self.deadline_ns <= time.monotonic_ns():
+                    raise ProtocolError("OWNER_DEADLINE")
             if (descriptor is None) != (nonce is None):
                 raise ProtocolError("PARTIAL_ENVIRONMENT")
             if descriptor is not None:
                 fd = integer(descriptor, 4, 1024)
-                self.parent = Endpoint(socket.socket(fileno=fd), nonce, budget=self.budget, on_fault=self.fail)
+                self.parent = Endpoint(socket.socket(fileno=fd), nonce,
+                                       expected_pid=os.getppid() if any(value is not None for value in values) else None,
+                                       budget=self.budget, on_fault=self.fail)
                 self.parent.send("LIVE")
         except (OSError, ValueError, ProtocolError):
             self.fail("OWNER_ADMISSION")

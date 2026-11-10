@@ -121,6 +121,8 @@ fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i3
     let checked =
         isolation::checked(&root, &case, Some(&home), Some(&capture), Some(&core)).unwrap();
     assert_eq!(checked.core, core);
+    assert_eq!(checked.home, home);
+    assert_eq!(checked.capture, capture);
     for relative in [".codex", ".claude", "config", "state", "AppData"] {
         owned(&home.join(relative));
     }

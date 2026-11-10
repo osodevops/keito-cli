@@ -252,7 +252,7 @@ class OwnedChildren:
         if end <= at:
             raise ChildFailure("expired cooperative operation")
         charge = len(input_bytes) + capture_limit
-        if self.io_reserved + charge > 4 * 1024 * 1024:
+        if self.owner.runtime_io_reserved + charge > 4 * 1024 * 1024:
             raise ChildFailure("runtime buffer budget")
         nonce = secrets.token_hex(16)
         parent, child_end = socket.socketpair()
@@ -266,6 +266,7 @@ class OwnedChildren:
         # Reserve history and buffers before Popen. Slot remains even on error.
         self.slots.append(slot)
         self.io_reserved += charge
+        self.owner.runtime_io_reserved += charge
         env = {**self.environment, **(extra or {})}
         for key in ("KEITO_SOURCE_OWNER_FD", "KEITO_SOURCE_OWNER_NONCE"):
             env.pop(key, None)
@@ -457,19 +458,6 @@ class OwnedChildren:
             self._fail(error, "RUNTIME_COMMAND_FAILED")
             raise error
         return bytes(slot["stdout"]) if slot["capture_limit"] else None
-
-    def wait_result(self, slot):
-        """Expected business nonzero is returned only after ownership proof."""
-        try:
-            output = self.complete(slot)
-        except ChildFailure:
-            if (slot["accepted"] is None or slot["first_fault"] is not None
-                    or self.owner.first_fault != "RUNTIME_COMMAND_FAILED"):
-                raise
-            # A nonzero command is still an operation failure for this owner;
-            # callers inspecting expected refusal must use a separate owner.
-            output = bytes(slot["stdout"]) if slot["capture_limit"] else b""
-        return subprocess.CompletedProcess([], slot["child"].returncode, output or b"", b"")
 
     def run(self, label, arguments, timeout, extra=None, capture_limit=0, input_bytes=b""):
         return self.complete(self.start(label, arguments, timeout, extra, capture_limit, input_bytes))

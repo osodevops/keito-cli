@@ -15,6 +15,8 @@ import subprocess
 import sys
 import time
 import uuid
+from source_qa_children import OwnedChildren
+from source_qa_protocol import SourceOwner
 
 ROOT, PAIR, NATIVES, OUTPUT = (Path(value) for value in sys.argv[1:])
 for path in [ROOT, PAIR, NATIVES, OUTPUT]:
@@ -43,20 +45,29 @@ def observe(value):
 
 def environment(case):
     home = case / "home"
-    return {"HOME": str(home), "CODEX_HOME": str(home / ".codex"),
+    result = {"HOME": str(home), "CODEX_HOME": str(home / ".codex"),
             "CLAUDE_CONFIG_DIR": str(home / ".claude"),
             "KEITO_CAPTURE_HOME": str(home / "capture"),
             "XDG_CONFIG_HOME": str(home / "config"), "XDG_STATE_HOME": str(home / "state"),
             "APPDATA": str(home / "AppData"), "TMPDIR": str(case / "tmp"),
             "PATH": str(case / "bin"), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    if sys.platform == "darwin":
+        result["__CF_USER_TEXT_ENCODING"] = f"0x{os.getuid():X}:0:0"
+    return result
+
+
+def owned_runtime(case, arguments, seconds, limit=0):
+    label = "runtime-" + uuid.uuid4().hex
+    with OwnedChildren(case, environment(case), case, owner=OWNER) as manager:
+        slot = manager.start(label, arguments, seconds, capture_limit=limit)
+        output = manager.complete(slot)
+        return subprocess.CompletedProcess(arguments, slot["child"].returncode, output or b"", b"")
 
 
 def cli(case, arguments):
     # The owned Rust --cli gateway calls actual isolation::checked plus inert
     # missing-operand negatives before it constructs the product Command.
-    result = subprocess.run([str(CONTROLLER), "--cli", str(ROOT), str(case), str(CORE), *arguments],
-                            env=environment(case), cwd=case, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, timeout=15)
+    result = owned_runtime(case, [str(CONTROLLER), "--cli", str(ROOT), str(case), str(CORE), *arguments], 4, 8192)
     return result
 
 
@@ -79,8 +90,7 @@ def make_case(namespace):
                         "--agent", "codex", "--agent", "claude-code"])
     observe({"namespace": namespace, "case": "quiet-private-install", "exit": result.returncode})
     assert result.returncode == 0 and not result.stdout, "private managed installation failed"
-    git = subprocess.run(["/usr/bin/git", "init", "--quiet"], cwd=case / "repo",
-                         env=environment(case), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+    git = owned_runtime(case, [str(CONTROLLER), "--git-init", str(ROOT), str(case), str(CORE)], 4)
     assert git.returncode == 0
     result = cli(case, ["capture", "status", "--json"])
     assert result.returncode == 0
@@ -126,10 +136,8 @@ def dispatch(case, namespace, session, source, event, turn, *, program_override=
     program = program_override or (CONTROLLER if namespace == "codex" else NATIVES / "claude-inert-source-only")
     mode = ["--run"] if chain_depth is None else ["--chain", str(chain_depth)]
     started = time.monotonic()
-    result = subprocess.run([str(program), *mode, str(ROOT), str(case), str(CORE),
-                             str(command_file), str(event_file), str(result_file)],
-                            cwd=case, env=environment(case), stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, timeout=5)
+    result = owned_runtime(case, [str(program), *mode, str(ROOT), str(case), str(CORE),
+                                 str(command_file), str(event_file), str(result_file)], 1)
     outcome = json.loads(result_file.read_text()) if result_file.exists() else {"missing_result": True}
     flags = list((case / "home/capture/capture-invocations").glob("*.pending"))
     flags += list((case / "home/capture/capture-invocations").glob("*.preparing"))
@@ -205,4 +213,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with SourceOwner() as OWNER:
+        main()
