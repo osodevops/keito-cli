@@ -34,7 +34,9 @@ pub fn run_fixture_opaque(
         &runtime.guard_sha256,
     )?;
     scope.run_verified_with_policy(
-        command, plan, &image,
+        command,
+        plan,
+        &image,
         crate::process_ownership::group::CleanupPolicy::CommandProbe,
     )
 }

@@ -19,7 +19,11 @@ const HOOK_NS: u64 = 500_000_000;
 // This is the command-owner lifetime, not a whole-install/whole-usage wall-clock
 // guarantee: some high-level callers verify a pair before constructing it.
 fn probe_policy(hook: bool) -> CleanupPolicy {
-    if hook { CleanupPolicy::HookShort } else { CleanupPolicy::CommandProbe }
+    if hook {
+        CleanupPolicy::HookShort
+    } else {
+        CleanupPolicy::CommandProbe
+    }
 }
 pub(crate) const LEAF_END_ENV: &str = "KEITO_CAPTURE_LEAF_END_NS";
 fn refused() -> AppError {
@@ -218,7 +222,8 @@ impl LeafRunner for CommandOwner<'_> {
         if self.policy == CleanupPolicy::HookShort {
             self.scope.run_verified(command, plan, image)
         } else {
-            self.scope.run_verified_with_policy(command, plan, image, self.policy)
+            self.scope
+                .run_verified_with_policy(command, plan, image, self.policy)
         }
     }
 }

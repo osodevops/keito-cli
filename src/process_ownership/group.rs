@@ -650,7 +650,12 @@ impl GroupLease {
         image: &super::image::VerifiedKeeperImage,
         lifetime_deadline_ns: u64,
     ) -> io::Result<Self> {
-        Self::spawn_verified_keeper_with_policy(owner, image, lifetime_deadline_ns, CleanupPolicy::HookShort)
+        Self::spawn_verified_keeper_with_policy(
+            owner,
+            image,
+            lifetime_deadline_ns,
+            CleanupPolicy::HookShort,
+        )
     }
     pub(crate) fn spawn_verified_keeper_with_policy(
         owner: SharedOwner,
@@ -743,8 +748,12 @@ impl GroupLease {
             ]);
         match policy {
             CleanupPolicy::Legacy => {}
-            CleanupPolicy::HookShort => { command.arg("hook-short-v1"); }
-            CleanupPolicy::CommandProbe => { command.arg("command-probe-v1"); }
+            CleanupPolicy::HookShort => {
+                command.arg("hook-short-v1");
+            }
+            CleanupPolicy::CommandProbe => {
+                command.arg("command-probe-v1");
+            }
         }
         if let Some(image) = &image_descriptor {
             command.env(
@@ -3245,9 +3254,13 @@ mod short_policy_tests {
         let (left, _right) = UnixStream::pair().unwrap();
         let mut channel = Channel::new(left, "a".repeat(32)).unwrap();
         let mut state = Settlement::with_policy(1_000_000_000, CleanupPolicy::CommandProbe);
-        state.begin(1_000_000_000, 100_000_000, &mut channel).unwrap();
+        state
+            .begin(1_000_000_000, 100_000_000, &mut channel)
+            .unwrap();
         assert_eq!(state.progress.deadline_ns, 150_000_000);
-        state.begin(1_000_000_000, 120_000_000, &mut channel).unwrap();
+        state
+            .begin(1_000_000_000, 120_000_000, &mut channel)
+            .unwrap();
         assert_eq!(state.progress.deadline_ns, 150_000_000);
         state.begin(140_000_000, 125_000_000, &mut channel).unwrap();
         assert_eq!(state.progress.deadline_ns, 140_000_000);
@@ -3256,19 +3269,33 @@ mod short_policy_tests {
     }
     #[test]
     fn command_probe_keeper_tag_is_closed_and_does_not_change_hook_policy() {
-        assert_eq!(CleanupPolicy::keeper_tag(Some("command-probe-v1")).unwrap(), CleanupPolicy::CommandProbe);
-        for invalid in ["command-probe-v2", "command-probe-v1\n", "1000000000", "command-probe-v1:1000000000"] {
+        assert_eq!(
+            CleanupPolicy::keeper_tag(Some("command-probe-v1")).unwrap(),
+            CleanupPolicy::CommandProbe
+        );
+        for invalid in [
+            "command-probe-v2",
+            "command-probe-v1\n",
+            "1000000000",
+            "command-probe-v1:1000000000",
+        ] {
             assert!(CleanupPolicy::keeper_tag(Some(invalid)).is_err());
         }
-        assert_eq!(CleanupPolicy::HookShort.setup_end(100_000_000, 550_000_000), 120_000_000);
+        assert_eq!(
+            CleanupPolicy::HookShort.setup_end(100_000_000, 550_000_000),
+            120_000_000
+        );
         assert_eq!(CleanupPolicy::HookShort.reserve_ns(), 50_000_000);
         assert_eq!(CleanupPolicy::HookShort.term_ns(), 15_000_000);
     }
     #[test]
     fn command_probe_is_refused_by_public_owned_image_gateway_before_preparation() {
         let result = GroupLease::spawn_keeper_with_policy(
-            Default::default(), Path::new("not-an-absolute-root"), Path::new("not-an-image"),
-            1_000_000_000, CleanupPolicy::CommandProbe,
+            Default::default(),
+            Path::new("not-an-absolute-root"),
+            Path::new("not-an-image"),
+            1_000_000_000,
+            CleanupPolicy::CommandProbe,
         );
         assert_eq!(result.err().unwrap().to_string(), "GROUP_POLICY");
     }
@@ -3279,9 +3306,15 @@ mod short_policy_tests {
         assert_eq!(policy.setup_end(120_000_000, 180_000_000), 130_000_000);
         assert_eq!(policy.setup_end(130_000_000, 180_000_000), 130_000_000);
         assert!(Lifetime::with_policy(130_000_000, 180_000_000, policy).is_err());
-        assert_eq!(policy.setup_end(u64::MAX - 1, u64::MAX), u64::MAX - 50_000_000);
+        assert_eq!(
+            policy.setup_end(u64::MAX - 1, u64::MAX),
+            u64::MAX - 50_000_000
+        );
         let mut session = KeeperSession::new(
-            Group { actions: vec![], absent: false },
+            Group {
+                actions: vec![],
+                absent: false,
+            },
             Lifetime::with_policy(0, 1_000_000_000, policy).unwrap(),
         );
         session.parked = true;
