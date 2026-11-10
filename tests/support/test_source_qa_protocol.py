@@ -477,7 +477,7 @@ class ProtocolTests(unittest.TestCase):
             def poll_cleanup(self, deadline): return True
         manager = Manager()
         owner.managers = [manager]
-        with patch("source_qa_protocol.time.monotonic_ns", side_effect=[1, 2, 3, 101, 102]):
+        with patch("source_qa_protocol.monotonic_ns", side_effect=[1, 2, 3, 101, 102]):
             owner.finish_managers()
         self.assertTrue(owner.unsettled)
         self.assertEqual(owner.first_fault, "MANAGER_CLEANUP_DEADLINE")

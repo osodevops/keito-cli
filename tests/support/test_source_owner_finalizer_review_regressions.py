@@ -36,7 +36,7 @@ class ReviewCases(unittest.TestCase):
                 self.collected=True; return True
         a,b,c=[Manager(x) for x in 'abc']; owner.managers=[a,b,c]
         handles=[x.handle for x in owner.managers]
-        with patch.object(p.time,'monotonic_ns',return_value=1), patch.object(p.time,'sleep'):
+        with patch.object(p,'monotonic_ns',return_value=1), patch.object(p.time,'sleep'):
             owner.finish_managers()
         self.assertEqual([(x[0],x[1]) for x in calls[:3]],[('begin','a'),('begin','b'),('begin','c')])
         self.assertEqual(owner._finished_managers,{id(c)})
@@ -46,7 +46,7 @@ class ReviewCases(unittest.TestCase):
         self.assertEqual([x.handle for x in owner.managers],handles)
         self.assertEqual(len({x[2] for x in calls}),1)
         before=list(calls); previous=owner.deadline_ns
-        with patch.object(p.time,'monotonic_ns',return_value=previous+1): owner.finish_managers()
+        with patch.object(p,'monotonic_ns',return_value=previous+1): owner.finish_managers()
         self.assertEqual(calls,before); self.assertEqual(owner.deadline_ns,previous)
         self.assertEqual(owner.first_fault,'MANAGER_CLEANUP_BEGIN'); self.assertTrue(owner.unsettled)
 
@@ -63,7 +63,7 @@ class ReviewCases(unittest.TestCase):
                 return False
         a,b=Manager('error'),Manager('false'); owner.managers=[a,b]
         ticks=iter(range(1,1000))
-        with patch.object(p.time,'monotonic_ns',side_effect=lambda:next(ticks)), patch.object(p.time,'sleep'):
+        with patch.object(p,'monotonic_ns',side_effect=lambda:next(ticks)), patch.object(p.time,'sleep'):
             owner.finish_managers()
         self.assertEqual([(x[0],x[1]) for x in calls[:2]],[('begin','error'),('begin','false')])
         self.assertGreater(a.polls,1); self.assertGreater(b.polls,1)
@@ -81,8 +81,8 @@ class ReviewCases(unittest.TestCase):
         manager=Manager(); owner.managers=[manager]
         # The callback itself crosses the bound; the fixture no longer relies
         # on how many fresh-clock observations the owner performs.
-        with patch.object(p.time,'monotonic_ns',side_effect=lambda:clock[0]): owner.finish_managers()
-        with patch.object(p.time,'monotonic_ns',return_value=12): owner.finish_managers()
+        with patch.object(p,'monotonic_ns',side_effect=lambda:clock[0]): owner.finish_managers()
+        with patch.object(p,'monotonic_ns',return_value=12): owner.finish_managers()
         self.assertEqual([x[0] for x in calls],['begin','poll','begin'])
         self.assertNotIn(id(manager),owner._finished_managers)
         self.assertNotIn(id(manager),owner._collected_failed_managers)
@@ -95,7 +95,7 @@ class ReviewCases(unittest.TestCase):
                 owner=p.SourceOwner(); manager=object(); owner.managers=[manager]
                 parent=Parent(); owner.parent=parent; previous=object(); owner.previous=previous
                 original=OSError('PRIVATE_OPERATION') if has_original else None
-                with patch.object(p,'CURRENT',owner), patch.object(p.time,'monotonic_ns',side_effect=OSError('PRIVATE_CLOCK')):
+                with patch.object(p,'CURRENT',owner), patch.object(p,'monotonic_ns',side_effect=OSError('PRIVATE_CLOCK')):
                     if has_original: self.assertFalse(owner.__exit__(OSError,original,None))
                     else:
                         with self.assertRaises(p.ProtocolError) as error: owner.__exit__(None,None,None)
@@ -111,7 +111,7 @@ class ReviewCases(unittest.TestCase):
             with self.subTest(original=type(original).__name__):
                 owner=p.SourceOwner(); owner.parent=Parent(SystemExit('PRIVATE_SEND'),KeyboardInterrupt())
                 previous=object(); owner.previous=previous
-                with patch.object(p,'CURRENT',owner), patch.object(p.time,'monotonic_ns',return_value=1):
+                with patch.object(p,'CURRENT',owner), patch.object(p,'monotonic_ns',return_value=1):
                     if original is None:
                         with self.assertRaises(p.ProtocolError) as error: owner.__exit__(None,None,None)
                         self.assertEqual(str(error.exception),'TERMINAL_WRITE')
@@ -129,7 +129,7 @@ class ReviewCases(unittest.TestCase):
                 owner=p.SourceOwner(); owner.parent=p.Endpoint(left,'a'*32,budget=owner.budget,on_fault=owner.fail)
                 remote=p.Endpoint(right,'a'*32,os.getpid()); owner.parent.send('LIVE')
                 remote.receive(); self.assertTrue(remote.live); self.assertFalse(remote.settled)
-                with patch.object(p.time,'monotonic_ns',return_value=1):
+                with patch.object(p,'monotonic_ns',return_value=1):
                     self.assertFalse(owner.__exit__(type(original),original,None))
                 with self.assertRaises(p.ProtocolError) as error: remote.receive()
                 self.assertEqual(str(error.exception),'PEER_FAILED'); self.assertFalse(remote.settled)
@@ -144,7 +144,7 @@ class ReviewCases(unittest.TestCase):
             def begin_cleanup(self,end): pass
             def poll_cleanup(self,end): return True
         manager=Manager(); owner.managers=[manager]
-        with patch.object(p.time,'monotonic_ns',return_value=1):
+        with patch.object(p,'monotonic_ns',return_value=1):
             with self.assertRaises(p.ProtocolError) as error: owner.__exit__(None,None,None)
         self.assertEqual(str(error.exception),'UNWAITED_FORWARD_REGISTRATION')
         self.assertEqual(owner._finished_managers,{id(manager)})
@@ -159,8 +159,8 @@ class ReviewCases(unittest.TestCase):
                     def begin_cleanup(self,end): calls.append(end)
                     def poll_cleanup(self,end): calls.append(end); return True
                 manager=Manager(); owner.managers=[manager]
-                with patch.object(p.time,'monotonic_ns',return_value=7): owner.finish_managers()
-                with patch.object(p.time,'monotonic_ns',return_value=8): owner.finish_managers()
+                with patch.object(p,'monotonic_ns',return_value=7): owner.finish_managers()
+                with patch.object(p,'monotonic_ns',return_value=8): owner.finish_managers()
                 self.assertEqual(owner.deadline_ns,expected); self.assertEqual(calls,[expected,expected])
                 self.assertFalse(owner.unsettled); self.assertEqual(owner.managers,[manager])
 

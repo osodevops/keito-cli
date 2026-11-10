@@ -46,7 +46,7 @@ class FinalizerCases(unittest.TestCase):
                 return self.name == "b" or self.polls == 2
         a, b = Manager("a"), Manager("b")
         owner.managers = [a, b]
-        with patch.object(protocol.time, "monotonic_ns", return_value=1), patch.object(protocol.time, "sleep"):
+        with patch.object(protocol, "monotonic_ns", return_value=1), patch.object(protocol.time, "sleep"):
             owner.finish_managers()
         self.assertEqual([(kind, name) for kind, name, _ in calls],
                          [("begin", "a"), ("begin", "b"), ("poll", "a"), ("poll", "b"), ("poll", "a")])
@@ -67,13 +67,13 @@ class FinalizerCases(unittest.TestCase):
                 return True
         manager = Manager()
         owner.managers = [manager]
-        with patch.object(protocol.time, "monotonic_ns", return_value=1), patch.object(protocol.time, "sleep"):
+        with patch.object(protocol, "monotonic_ns", return_value=1), patch.object(protocol.time, "sleep"):
             owner.finish_managers()
         self.assertEqual(manager.polls, 2)
         self.assertEqual(owner.first_fault, "MANAGER_CLEANUP_POLL")
         self.assertNotIn(id(manager), owner._finished_managers)
         before = manager.polls
-        with patch.object(protocol.time, "monotonic_ns", return_value=2):
+        with patch.object(protocol, "monotonic_ns", return_value=2):
             owner.finish_managers()
         self.assertEqual(manager.polls, before)  # collected failed facts are cached, never clean proof
         self.assertTrue(owner.unsettled)
@@ -88,7 +88,7 @@ class FinalizerCases(unittest.TestCase):
                 return "NOT_A_PROOF" if self.polls == 1 else True
         manager = Manager()
         owner.managers = [manager]
-        with patch.object(protocol.time, "monotonic_ns", return_value=1), patch.object(protocol.time, "sleep"):
+        with patch.object(protocol, "monotonic_ns", return_value=1), patch.object(protocol.time, "sleep"):
             owner.finish_managers()
         self.assertEqual(manager.polls, 2)
         self.assertEqual(owner.first_fault, "MANAGER_PROOF_SCHEMA")
@@ -100,7 +100,7 @@ class FinalizerCases(unittest.TestCase):
                 owner = SourceOwner()
                 parent = Parent()
                 owner.parent = parent
-                with patch.object(protocol.time, "monotonic_ns", return_value=1):
+                with patch.object(protocol, "monotonic_ns", return_value=1):
                     self.assertFalse(owner.__exit__(type(original), original, None))
                 self.assertEqual(parent.sent, ["FAILED"])
                 self.assertTrue(parent.closed)
@@ -125,7 +125,7 @@ class FinalizerCases(unittest.TestCase):
         previous = object()
         owner.previous = previous
         original = ProtocolError("ORIGINAL")
-        with patch.object(protocol, "CURRENT", owner), patch.object(protocol.time, "monotonic_ns", return_value=1):
+        with patch.object(protocol, "CURRENT", owner), patch.object(protocol, "monotonic_ns", return_value=1):
             self.assertFalse(owner.__exit__(ProtocolError, original, None))
             self.assertIs(protocol.CURRENT, previous)
         self.assertEqual(owner.first_fault, "ORIGINAL")
@@ -143,7 +143,7 @@ class FinalizerCases(unittest.TestCase):
         manager = Manager()
         owner.managers = [manager]
         ticks = iter(range(1, 100))
-        with patch.object(protocol.time, "monotonic_ns", side_effect=lambda: next(ticks)), patch.object(protocol.time, "sleep"):
+        with patch.object(protocol, "monotonic_ns", side_effect=lambda: next(ticks)), patch.object(protocol.time, "sleep"):
             owner.finish_managers()
         self.assertGreater(manager.polls, 1)
         self.assertEqual(owner.deadline_ns, 10)

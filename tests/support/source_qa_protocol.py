@@ -20,6 +20,13 @@ MAX_FRAMES = 16384
 MAX_WIRE = 4 * 1024 * 1024
 
 
+def monotonic_ns():
+    # Absolute deadlines cross the Python/Rust boundary. Python 3.9 on macOS
+    # gives time.monotonic_ns() a process-local origin; Rust uses this POSIX
+    # clock directly. Never translate/calibrate an inherited deadline.
+    return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+
+
 class ProtocolError(RuntimeError):
     """Only bounded reason codes, never offending input."""
 
@@ -432,7 +439,7 @@ class SourceOwner:
 
     def now(self):
         try:
-            return time.monotonic_ns()
+            return monotonic_ns()
         except BaseException:
             self.deadline_ns = 0
             self.fail("OWNER_CLOCK")

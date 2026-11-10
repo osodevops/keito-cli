@@ -17,6 +17,7 @@ if [ "$#" -eq 0 ]; then
   python3 -I -S -B tests/support/test_source_owner_finalizer.py
   python3 -I -S -B tests/support/test_source_owner_finalizer_review_regressions.py
   python3 -I -S -B tests/support/test_runtime_children_finite.py
+  python3 -I -S -B tests/support/test_source_clock_domain.py
   python3 -I -S -B tests/support/test_source_qa_build_owner.py
   # Developer-only owned pair QA inherits this same proved policy; never nest it.
   PYTHONDONTWRITEBYTECODE=1 python3 tests/support/test_source_qa_contract.py "$root"

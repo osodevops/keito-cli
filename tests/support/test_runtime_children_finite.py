@@ -99,7 +99,7 @@ class RuntimeManagerTests(unittest.TestCase):
     def test_review_cancel_never_extends_original_slot_and_tightens(self):
         self.a["end"] = 1000
         self.b["end"] = 900
-        with patch("time.monotonic_ns", return_value=100):
+        with patch("source_qa_protocol.monotonic_ns", return_value=100):
             self.manager.begin_cleanup(5000)
             self.manager.begin_cleanup(500)
             self.manager.begin_cleanup(6000)
@@ -180,7 +180,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.trace.append((value["label"], "ordinary-poll"))
             if value is self.a: clock[0] = 200
         self.manager._poll_slot = progress
-        with patch("time.monotonic_ns", side_effect=lambda: clock[0]): self.manager.poll()
+        with patch("source_qa_protocol.monotonic_ns", side_effect=lambda: clock[0]): self.manager.poll()
         b_poll = self.trace.index(("b", "ordinary-poll"))
         self.assertTrue(all(any(event[:2] == (name, "CANCEL") for event in self.trace[:b_poll]) for name in ["a", "b"]))
 
@@ -189,7 +189,7 @@ class RuntimeManagerTests(unittest.TestCase):
         self.a["collected"] = True
         self.a["child"].returncode = 0
         (self.root / "a-result.json").write_text("retained")
-        with patch("time.monotonic_ns", side_effect=OSError("inert-clock")):
+        with patch("source_qa_protocol.monotonic_ns", side_effect=OSError("inert-clock")):
             try:
                 self.manager.complete(self.a)
             except BaseException as error:
@@ -229,7 +229,7 @@ class RuntimeManagerTests(unittest.TestCase):
         original_poll = self.a["child"].poll
         def cross_bound(): clock[0] = 901; return original_poll()
         self.a["child"].poll = cross_bound
-        with patch("time.monotonic_ns", side_effect=lambda: clock[0]), patch("os.read", return_value=b""):
+        with patch("source_qa_protocol.monotonic_ns", side_effect=lambda: clock[0]), patch("os.read", return_value=b""):
             self.owner.finish_managers()
         self.assertTrue(self.a["collected"] and self.b["collected"])
         self.assertNotIn(id(self.manager), self.owner._finished_managers)
@@ -254,7 +254,7 @@ class RuntimeManagerTests(unittest.TestCase):
                 original_check()
                 armed[0] = True
             else: original_check()
-        with patch("signal.pthread_sigmask", side_effect=mask), patch("time.monotonic_ns", side_effect=now), patch.object(owner, "check", side_effect=gate_check), patch("subprocess.Popen", side_effect=RuntimeError("POpen must not execute")) as popen:
+        with patch("signal.pthread_sigmask", side_effect=mask), patch("source_qa_protocol.monotonic_ns", side_effect=now), patch.object(owner, "check", side_effect=gate_check), patch("subprocess.Popen", side_effect=RuntimeError("POpen must not execute")) as popen:
             with self.assertRaises(BaseException): manager.start("clock-gate", ["never-execute"], 1)
         popen.assert_not_called()
         self.assertEqual(owner.deadline_ns, 0)
@@ -264,7 +264,7 @@ class RuntimeManagerTests(unittest.TestCase):
     def test_review_cached_owner_cannot_finish_clean_at_deadline(self):
         owner = SourceOwner()
         owner.deadline_ns = 100
-        with patch("time.monotonic_ns", return_value=100):
+        with patch("source_qa_protocol.monotonic_ns", return_value=100):
             owner.finish_managers()
         self.assertIsNotNone(owner.first_fault)
 
