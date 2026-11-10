@@ -16,7 +16,7 @@ pub struct IoPlan {
 }
 impl IoPlan {
     pub fn new(input: Vec<u8>, stdout_cap: usize, stderr_cap: usize) -> io::Result<Self> {
-        if input.len() > MAX_STREAM_BYTES
+        if input.capacity() > MAX_STREAM_BYTES
             || stdout_cap > MAX_STREAM_BYTES
             || stderr_cap > MAX_STREAM_BYTES
         {
@@ -29,7 +29,9 @@ impl IoPlan {
         })
     }
     pub(super) fn capacity(&self) -> usize {
-        self.input.len() + self.stdout_cap + self.stderr_cap
+        // Retained slots keep this allocation even after input is consumed.
+        // Initialized bytes alone are not the owned-buffer reservation.
+        self.input.capacity() + self.stdout_cap + self.stderr_cap
     }
     pub(super) fn prepare(self) -> io::Result<PipeIo> {
         Ok(PipeIo {
@@ -110,6 +112,11 @@ impl Output {
         bytes
             .try_reserve_exact(cap)
             .map_err(|_| io::Error::other("IO_ALLOCATION"))?;
+        // A reserve_exact implementation may overallocate. Refuse before any
+        // child exists unless the retained capacity fits the charged budget.
+        if bytes.capacity() > cap {
+            return Err(io::Error::other("IO_ALLOCATION"));
+        }
         Ok(Self {
             bytes,
             cap,

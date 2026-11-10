@@ -409,7 +409,15 @@ impl<E: Edge> Core<E> {
         }
         loop {
             self.poll(clock);
-            let at = clock().unwrap_or(u64::MAX);
+            let at = match clock() {
+                Ok(at) => at,
+                Err(_) => {
+                    // Broadcast the irreversible zero end BEFORE marking
+                    // finished, including the final fresh-clock placement.
+                    self.cancel(Some("SCOPE_CLOCK"), 0, 0);
+                    0
+                }
+            };
             if self.finish_at(at) {
                 break;
             }
