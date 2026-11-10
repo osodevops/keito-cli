@@ -7,13 +7,16 @@ const STANDALONE_NS:u64=1_000_000_000;
 const HOOK_NS:u64=500_000_000;
 pub(crate) const LEAF_END_ENV:&str="KEITO_CAPTURE_LEAF_END_NS";
 fn refused()->AppError {AppError::Config("Capture command ownership unavailable; collection remains paused".into())}
+const PARENT_KEYS:[&str;7]=["KEITO_PROCESS_OWNER_FD","KEITO_PROCESS_OWNER_NONCE","KEITO_PROCESS_OWNER_PID","KEITO_PROCESS_OWNER_END_NS","KEITO_PROCESS_OWNER_CONTRACT","KEITO_SOURCE_OWNER_FD","KEITO_SOURCE_OWNER_NONCE"];
+fn parent_present(mut present:impl FnMut(&str)->bool)->bool {PARENT_KEYS.iter().any(|key|present(key))}
 enum Image<'a> { Owned(VerifiedKeeperImage), Borrowed(&'a VerifiedKeeperImage) }
 pub(crate) struct CommandOwner<'a> {scope:Scope,image:Image<'a>,end:u64}
 impl CommandOwner<'static> {
     pub(crate) fn standalone()->Result<Self,AppError> {
         // Never ignore an attached/partial parent in a convenience API. The
         // actual entry Session must pass its borrowed runner explicitly.
-        for key in ["KEITO_PROCESS_OWNER_FD","KEITO_PROCESS_OWNER_NONCE","KEITO_PROCESS_OWNER_PID","KEITO_PROCESS_OWNER_END_NS","KEITO_PROCESS_OWNER_CONTRACT","KEITO_SOURCE_OWNER_FD","KEITO_SOURCE_OWNER_NONCE",LEAF_END_ENV,"KEITO_CAPTURE_INVOCATION_NONCE"] {
+        if parent_present(|key|std::env::var_os(key).is_some()) {return Err(refused());}
+        for key in [LEAF_END_ENV,"KEITO_CAPTURE_INVOCATION_NONCE"] {
             if std::env::var_os(key).is_some() {return Err(refused());}
         }
         let end=crate::process_ownership::scope::monotonic_now().map_err(|_|refused())?.saturating_add(STANDALONE_NS);
@@ -24,6 +27,9 @@ impl CommandOwner<'static> {
 }
 impl<'a> CommandOwner<'a> {
     pub(crate) fn for_hook(runtime:&'a capture_runtime_pair::HookRuntime)->Result<Self,AppError> {
+        // Until the entry Session passes a borrowed attached Scope, refuse
+        // parent metadata rather than silently creating an independent owner.
+        if parent_present(|key|std::env::var_os(key).is_some()) {return Err(refused());}
         let at=crate::process_ownership::scope::monotonic_now().map_err(|_|refused())?;
         let raw=std::env::var(LEAF_END_ENV).map_err(|_|refused())?;
         let inherited=raw.parse::<u64>().ok().filter(|n|n.to_string()==raw && *n>at).ok_or_else(refused)?;
@@ -67,6 +73,15 @@ impl<'a> CommandOwner<'a> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn r40_any_partial_parent_requires_the_explicit_entry_owner() {
+        assert!(!parent_present(|_|false));
+        for field in PARENT_KEYS {assert!(parent_present(|key|key==field));}
     }
 }
 impl LeafRunner for CommandOwner<'_> {

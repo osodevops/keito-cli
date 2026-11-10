@@ -15,6 +15,23 @@ const MAX_IMAGE: u64 = 128 * 1024 * 1024;
 const IMAGE_ENV: &str = "KEITO_CAPTURE_KEEPER_IMAGE_FD";
 pub(crate) const KEEPER_ROLE: &str = "--internal-keeper-v1";
 fn refused() -> io::Error { io::Error::other("KEEPER_IMAGE") }
+fn open_path(path:&Path)->io::Result<File> {
+    if !path.is_absolute() || path.components().any(|p|matches!(p,Component::ParentDir|Component::CurDir)) {return Err(refused());}
+    let root=CString::new("/").unwrap();
+    let fd=unsafe {libc::open(root.as_ptr(),libc::O_RDONLY|libc::O_DIRECTORY|libc::O_CLOEXEC)};
+    if fd<0 {return Err(refused());}
+    let mut parent=unsafe {OwnedFd::from_raw_fd(fd)};
+    let parts:Vec<_>=path.components().filter_map(|p|if let Component::Normal(p)=p {Some(p)} else {None}).collect();
+    let (leaf,ancestors)=parts.split_last().ok_or_else(refused)?;
+    for part in ancestors {
+        let name=CString::new(part.as_bytes()).map_err(|_|refused())?;
+        let fd=unsafe {libc::openat(parent.as_raw_fd(),name.as_ptr(),libc::O_RDONLY|libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC)};
+        if fd<0 {return Err(refused());}parent=unsafe {OwnedFd::from_raw_fd(fd)};
+    }
+    let name=CString::new(leaf.as_bytes()).map_err(|_|refused())?;
+    let fd=unsafe {libc::openat(parent.as_raw_fd(),name.as_ptr(),libc::O_RDONLY|libc::O_NONBLOCK|libc::O_NOFOLLOW|libc::O_CLOEXEC)};
+    if fd<0 {return Err(refused());}Ok(unsafe {File::from_raw_fd(fd)})
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Stamp {
@@ -37,22 +54,7 @@ impl VerifiedKeeperImage {
             || !path.is_absolute() || path.components().any(|p| matches!(p, Component::ParentDir | Component::CurDir)) {
             return Err(refused());
         }
-        let root = CString::new("/").unwrap();
-        let fd = unsafe { libc::open(root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-        if fd < 0 { return Err(refused()); }
-        let mut parent = unsafe { OwnedFd::from_raw_fd(fd) };
-        let parts: Vec<_> = path.components().filter_map(|p| if let Component::Normal(p)=p {Some(p)} else {None}).collect();
-        let (leaf, ancestors) = parts.split_last().ok_or_else(refused)?;
-        for part in ancestors {
-            let name = CString::new(part.as_bytes()).map_err(|_| refused())?;
-            let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-            if fd < 0 { return Err(refused()); }
-            parent = unsafe { OwnedFd::from_raw_fd(fd) };
-        }
-        let name = CString::new(leaf.as_bytes()).map_err(|_| refused())?;
-        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-        if fd < 0 { return Err(refused()); }
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        let mut file = open_path(path)?;
         let before = file.metadata().map_err(|_| refused())?;
         // Separate product policy; the legacy QA constructor still requires700.
         if !before.is_file() || before.mode() & 0o111 == 0 || before.mode() & 0o022 != 0 || before.nlink() != 1
@@ -79,8 +81,8 @@ impl VerifiedKeeperImage {
     }
     fn check_current(&self) -> io::Result<()> {
         let file = self.file.metadata().map_err(|_| refused())?;
-        let path = fs::symlink_metadata(&self.path).map_err(|_| refused())?;
-        if Stamp::of(&file) != self.stamp || Stamp::of(&path) != self.stamp || path.file_type().is_symlink() {
+        let path = open_path(&self.path)?.metadata().map_err(|_|refused())?;
+        if Stamp::of(&file) != self.stamp || Stamp::of(&path) != self.stamp {
             return Err(refused());
         }
         Ok(())
@@ -137,8 +139,11 @@ fn inventory(control: i32, image: i32) -> io::Result<Vec<i32>> {
         let entry = unsafe { libc::readdir(raw) };
         if entry.is_null() { break io::Error::last_os_error().raw_os_error().unwrap_or(0) != 0; }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if let Some(fd) = name.to_str().ok().and_then(|n| n.parse::<i32>().ok()) {
-            if fd >= 3 && fd != own && fd != control && fd != image { descriptors.push(fd); }
+        if name.to_bytes()==b"." || name.to_bytes()==b".." {continue;}
+        let Some(fd)=name.to_str().ok().and_then(|n|n.parse::<i32>().ok()) else {break true;};
+        if fd>=3 && fd!=own && fd!=control && fd!=image {
+            if descriptors.len()>=4096 || descriptors.try_reserve(1).is_err() {break true;}
+            descriptors.push(fd);
         }
     };
     unsafe { libc::closedir(raw); }
@@ -151,6 +156,8 @@ fn inventory(_:i32,_:i32)->io::Result<Vec<i32>> { Err(refused()) }
 /// state. The descriptor is consumed/closed, never turned into capture authority.
 #[allow(dead_code)] // Called by the standalone guard's inclusion, not by libkeito.
 pub(crate) fn bootstrap_keeper_image(control: i32) -> io::Result<()> {
+    let encoding=std::env::var("__CF_USER_TEXT_ENCODING").ok();
+    if !closed_environment(std::env::vars_os().map(|(key,_)|key),encoding.as_deref(),unsafe {libc::getuid()}) {return Err(refused());}
     let raw = std::env::var(IMAGE_ENV).map_err(|_| refused())?;
     std::env::remove_var(IMAGE_ENV);
     let fd = bootstrap_fd(&raw,control)?;
@@ -163,6 +170,25 @@ pub(crate) fn bootstrap_keeper_image(control: i32) -> io::Result<()> {
         || unsafe {libc::fcntl(fd,libc::F_GETFL)} & libc::O_ACCMODE != libc::O_RDONLY
         || metadata.dev()!=running.dev() || metadata.ino()!=running.ino() { return Err(refused()); }
     Ok(())
+}
+fn closed_environment(keys:impl IntoIterator<Item=impl AsRef<std::ffi::OsStr>>,encoding:Option<&str>,uid:u32)->bool {
+    let mut count=0;
+    #[cfg(target_os="macos")]
+    let expected=2;
+    #[cfg(not(target_os="macos"))]
+    let expected=1;
+    for key in keys {
+        count+=1;if count>expected {return false;}
+        let key=key.as_ref();
+        if key==IMAGE_ENV {continue;}
+        #[cfg(target_os="macos")]
+        if key=="__CF_USER_TEXT_ENCODING" {continue;}
+        return false;
+    }
+    #[cfg(target_os="macos")]
+    {count==expected && encoding==Some(format!("0x{uid:X}:0:0").as_str())}
+    #[cfg(not(target_os="macos"))]
+    {let _=uid;count==expected && encoding.is_none()}
 }
 fn bootstrap_fd(raw:&str,control:i32)->io::Result<i32> {
     raw.parse::<i32>().ok().filter(|fd|(5..=1024).contains(fd) && *fd!=control && fd.to_string()==raw).ok_or_else(refused)
@@ -229,5 +255,17 @@ mod tests {
         let image=VerifiedKeeperImage::open(&path,&hash).unwrap();
         let old=root.join("old");fs::rename(&managed,&old).unwrap();symlink(&old,&managed).unwrap();
         assert!(image.check_current().is_err());
+    }
+    #[test]
+    fn r40_private_keeper_environment_is_closed_without_auth_or_home() {
+        #[cfg(target_os="macos")]
+        let (keys,encoding)=(vec![IMAGE_ENV,"__CF_USER_TEXT_ENCODING"],Some("0x1F5:0:0"));
+        #[cfg(not(target_os="macos"))]
+        let (keys,encoding)=(vec![IMAGE_ENV],None);
+        assert!(closed_environment(keys.clone(),encoding,501));
+        let mut extra=keys.clone();extra.push("HOME");assert!(!closed_environment(extra,encoding,501));
+        assert!(!closed_environment(Vec::<&str>::new(),encoding,501));
+        #[cfg(target_os="macos")]
+        assert!(!closed_environment(keys,Some("0x1F5:1:0"),501));
     }
 }

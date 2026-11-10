@@ -721,6 +721,9 @@ impl GroupLease {
                 Ok(())
             });
         }
+        // Verification/inventory cannot consume an old admission timestamp and
+        // then start a keeper beyond its setup/operation end.
+        if now()? >= policy.setup_end(current,lifetime_deadline_ns) {return Err(refused("GROUP_DEADLINE"));}
         let keeper = command.spawn()?;
         let keeper_pid = keeper.id() as libc::pid_t;
         // The real handle is owned before any fallible read or publication.
