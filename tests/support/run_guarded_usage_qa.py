@@ -111,7 +111,7 @@ with manifest, manager:
            900, {"KEITO_RELEASE_GUARD_SHA256": guard_digest})
     shutil.copyfile(ROOT / "target-source-only/debug/keito", pair / "keito")
     (pair / "keito").chmod(0o700)
-    pair_manifest = {"manifest_contract": 1, "version": version, "target": host, "guard_contract": 1,
+    pair_manifest = {"manifest_contract": 1, "version": version, "target": host, "guard_contract": 2,
                 "files": {"keito": digest(pair / "keito"), "keito-capture-guard": guard_digest}}
     with (pair / "capture-runtime-manifest.json").open("x") as output:
         json.dump(pair_manifest, output, indent=2)

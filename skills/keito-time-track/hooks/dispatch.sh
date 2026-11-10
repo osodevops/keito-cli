@@ -25,21 +25,9 @@ case "$keito_cmd" in /*) ;; *) exit 0 ;; esac
 case "$guard_cmd" in /*) ;; *) exit 0 ;; esac
 # Core refusal belongs to the native guard, after durable publication.
 [ -f "$guard_cmd" ] && [ -x "$guard_cmd" ] && [ ! -L "$guard_cmd" ] || exit 0
-"$guard_cmd" --core "$keito_cmd" --agent "$agent" --event "$event" --harness-version "$version" \
-  <&0 >/dev/null 2>&1 &
-worker=$!
-# The guard publishes a locked, content-free flag before the heavy core starts.
-# Only a private fixed-byte durable ACK permits exact flag cleanup. A timeout,
-# missing executable or pre-handler death retains evidence for reconciliation.
-# Budget TERM/KILL inside one second, including launch and cleanup margin.
-(
-  sleep 0.65
-  kill -TERM "$worker" >/dev/null 2>&1 || exit 0
-  sleep 0.025
-  kill -KILL "$worker" >/dev/null 2>&1 || true
-) >/dev/null 2>&1 &
-watchdog=$!
-wait "$worker" 2>/dev/null || true
-kill "$watchdog" >/dev/null 2>&1 || true
-wait "$watchdog" 2>/dev/null || true
+# Preserve the directly owned PID across shell -> native dispatch. There are
+# no background timer processes. Exec refusal stays silent and fail-open; attached
+# ownership sees EOF without terminal and cannot accept capture proof.
+shopt -s execfail
+exec "$guard_cmd" --internal-dispatch-v2 --core "$keito_cmd" --agent "$agent" --event "$event" --harness-version "$version" <&0 >/dev/null 2>&1
 exit 0

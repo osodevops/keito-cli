@@ -17,6 +17,8 @@ use std::{
 const MAX_IMAGE: u64 = 128 * 1024 * 1024;
 const IMAGE_ENV: &str = "KEITO_CAPTURE_KEEPER_IMAGE_FD";
 pub(crate) const KEEPER_ROLE: &str = "--internal-keeper-v1";
+pub(crate) const DISPATCH_ROLE: &str = "--internal-dispatch-v2";
+pub(crate) const GUARDIAN_ROLE: &str = "--internal-guardian-v2";
 fn refused() -> io::Error {
     io::Error::other("KEEPER_IMAGE")
 }
@@ -116,6 +118,23 @@ pub(crate) struct VerifiedKeeperImage {
     stamp: Stamp,
 }
 impl VerifiedKeeperImage {
+    /// Resource-only self-image authority in the already-running guard. This
+    /// does not create a release/source/capture proof or accept another path.
+    pub(crate) fn running_guard() -> io::Result<Self> {
+        let path = std::env::current_exe()?;
+        let mut file = open_path(&path)?;
+        let mut digest = Sha256::new();
+        let mut part = [0u8; 65536];
+        let mut total = 0u64;
+        loop {
+            let count = file.read(&mut part)?;
+            if count == 0 { break; }
+            total = total.checked_add(count as u64).filter(|n| *n <= MAX_IMAGE).ok_or_else(refused)?;
+            digest.update(&part[..count]);
+        }
+        let expected: String = digest.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        Self::open(&path, &expected)
+    }
     pub(crate) fn open(path: &Path, expected: &str) -> io::Result<Self> {
         if expected.len() != 64
             || !expected
@@ -185,6 +204,12 @@ impl VerifiedKeeperImage {
     // Keep the duplicated image FD alive in the parent until spawn has returned
     // its real Child. All descriptor inventory/allocation occurs before fork.
     pub(super) fn command(&self, control: i32) -> io::Result<(Command, OwnedFd)> {
+        self.command_role(control, KEEPER_ROLE)
+    }
+    pub(crate) fn guardian_command(&self, control: i32) -> io::Result<(Command, OwnedFd)> {
+        self.command_role(control, GUARDIAN_ROLE)
+    }
+    fn command_role(&self, control: i32, role: &'static str) -> io::Result<(Command, OwnedFd)> {
         if !(4..=1024).contains(&control) {
             return Err(refused());
         }
@@ -204,7 +229,7 @@ impl VerifiedKeeperImage {
         let mut command = Command::new(format!("/dev/fd/{fd}"));
         #[cfg(not(target_os = "linux"))]
         let mut command = Command::new(&self.path);
-        command.arg(KEEPER_ROLE);
+        command.arg(role);
         unsafe {
             command.pre_exec(move || {
                 let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -297,6 +322,9 @@ pub(crate) fn bootstrap_keeper_image(control: i32) -> io::Result<()> {
     ) {
         return Err(refused());
     }
+    bootstrap_role_image(control)
+}
+pub(crate) fn bootstrap_role_image(control: i32) -> io::Result<()> {
     let raw = std::env::var(IMAGE_ENV).map_err(|_| refused())?;
     std::env::remove_var(IMAGE_ENV);
     let fd = bootstrap_fd(&raw, control)?;

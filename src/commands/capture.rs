@@ -176,6 +176,22 @@ pub async fn run(
     global: &GlobalFlags,
     _mode: OutputMode,
 ) -> Result<(), AppError> {
+    #[cfg(unix)]
+    { run_inner(cmd, global, _mode, None).await }
+    #[cfg(not(unix))]
+    { run_inner(cmd, global, _mode).await }
+}
+#[cfg(unix)]
+pub async fn run_with_scope(
+    cmd: CaptureCommand, global: &GlobalFlags, mode: OutputMode,
+    scope: Option<&mut crate::process_ownership::scope::Scope>,
+) -> Result<(), AppError> {
+    run_inner(cmd, global, mode, scope).await
+}
+async fn run_inner(
+    cmd: CaptureCommand, global: &GlobalFlags, _mode: OutputMode,
+    #[cfg(unix)] entry_scope: Option<&mut crate::process_ownership::scope::Scope>,
+) -> Result<(), AppError> {
     if cfg!(not(unix)) {
         return Err(AppError::Config(
             "Automatic capture is unsupported on this platform; manual time commands remain available".into(),
@@ -255,14 +271,14 @@ pub async fn run(
                 })
                 .transpose()?;
             #[cfg(unix)]
-            let mut command_owner = hook_runtime
-                .as_ref()
-                .map(crate::capture_command_owner::CommandOwner::for_hook)
-                .transpose()?;
+            let mut command_owner = match (hook_runtime.as_ref(), entry_scope) {
+                (Some(runtime), Some(scope)) => Some(crate::capture_command_owner::CommandOwner::for_hook(runtime, scope)?),
+                _ => None,
+            };
             let ack_fd = std::env::var("KEITO_CAPTURE_ACK_FD")
                 .ok()
                 .and_then(|fd| fd.parse::<i32>().ok())
-                .filter(|fd| crate::capture_invocations::protect_ack(*fd).is_ok());
+                .filter(|fd| *fd == 3 && crate::capture_invocations::protect_ack(*fd).is_ok());
             let mut accepted_store = None;
             let result = (|| {
                 #[cfg(unix)]

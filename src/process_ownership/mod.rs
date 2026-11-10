@@ -5,8 +5,10 @@
 //! compiling this module in a default artifact is not runtime qualification.
 //! This code grants no capture, profile, billing or authentication authority.
 pub mod group;
+mod attachment;
 pub(crate) mod image;
 pub mod io;
 pub(crate) mod probes;
 pub mod protocol;
 pub mod scope;
+pub(crate) mod signals;

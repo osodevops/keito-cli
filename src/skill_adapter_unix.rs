@@ -127,7 +127,7 @@ fn valid_runtime(value: &Value) -> bool {
         v.get(*k)
             .and_then(Value::as_str)
             .is_some_and(|s| identifier(s, 128))
-    }) && v.get("guard_contract").and_then(Value::as_u64) == Some(1)
+    }) && v.get("guard_contract").and_then(Value::as_u64) == Some(crate::capture_runtime_pair::GUARD_CONTRACT as u64)
 }
 fn validate_receipt(dir: &Dir) -> Result<Receipt, AppError> {
     let receipt: Receipt =
@@ -360,6 +360,11 @@ fn owned(hook: &Value, dest: &Path, agent: &str) -> Option<bool> {
         return None;
     }
     let mut argv = words(hook.get("command")?.as_str()?)?;
+    let modern = argv.first().is_some_and(|s| s == "exec");
+    if modern {
+        argv.remove(0);
+        if argv.first().map(String::as_str) != Some("/usr/bin/env") { return None; }
+    }
     if argv
         .first()
         .is_some_and(|s| matches!(s.as_str(), "env" | "/usr/bin/env"))
@@ -384,6 +389,9 @@ fn owned(hook: &Value, dest: &Path, agent: &str) -> Option<bool> {
         }
         argv.remove(0);
     }
+    if modern && (environment.len() != 3
+        || !["KEITO_CLI_BIN", "KEITO_CAPTURE_GUARD_BIN"].iter().all(|k| environment.get(*k).is_some_and(|s| Path::new(s).is_absolute()))
+        || !environment.get("KEITO_CAPTURE_CORE_SHA256").is_some_and(|s| hex(s, 64))) { return None; }
     if argv
         .first()
         .is_some_and(|s| matches!(s.as_str(), "bash" | "/bin/bash" | "/usr/bin/bash"))
@@ -733,7 +741,7 @@ pub fn install(options: InstallOptions<'_>) -> Result<InstallOutcome, AppError> 
         ),
     ];
     for (event, lifecycle) in events {
-        let command=format!("KEITO_CLI_BIN={} KEITO_CAPTURE_GUARD_BIN={} KEITO_CAPTURE_CORE_SHA256={} {} --agent {} --event {} --harness-version {}",quote(options.runtime.core_path.to_str().ok_or_else(failure)?),quote(options.runtime.guard_path.to_str().ok_or_else(failure)?),options.runtime.core_sha256,quote(generation.path.join("hooks/dispatch.sh").to_str().ok_or_else(failure)?),agent_name(options.agent),lifecycle,quote(&version));
+        let command=format!("exec /usr/bin/env KEITO_CLI_BIN={} KEITO_CAPTURE_GUARD_BIN={} KEITO_CAPTURE_CORE_SHA256={} {} --agent {} --event {} --harness-version {}",quote(options.runtime.core_path.to_str().ok_or_else(failure)?),quote(options.runtime.guard_path.to_str().ok_or_else(failure)?),options.runtime.core_sha256,quote(generation.path.join("hooks/dispatch.sh").to_str().ok_or_else(failure)?),agent_name(options.agent),lifecycle,quote(&version));
         hooks
             .entry(event)
             .or_insert_with(|| Value::Array(vec![]))
@@ -979,6 +987,8 @@ pub fn inspect(
                     let expected = expected_events.iter().find(|(name, _)| name == event).map(
                         |(_, lifecycle)| {
                             vec![
+                                "exec".into(),
+                                "/usr/bin/env".into(),
                                 format!("KEITO_CLI_BIN={}", runtime.core_path.display()),
                                 format!("KEITO_CAPTURE_GUARD_BIN={}", runtime.guard_path.display()),
                                 format!("KEITO_CAPTURE_CORE_SHA256={}", runtime.core_sha256),
@@ -1031,6 +1041,10 @@ pub fn inspect(
 }
 fn invokes_adapter(words: &[String], dest: &Path, host: &Path) -> bool {
     let mut argv = words;
+    if argv.first().is_some_and(|s| s == "exec") {
+        if argv.get(1).map(String::as_str) != Some("/usr/bin/env") { return false; }
+        argv = &argv[1..];
+    }
     if argv
         .first()
         .is_some_and(|s| matches!(s.as_str(), "env" | "/usr/bin/env"))
@@ -1099,7 +1113,7 @@ pub(crate) mod tests {
                 guard_sha256: digest(b"synthetic guard"),
                 version: "0.2.0".into(),
                 target: "aarch64-apple-darwin".into(),
-                guard_contract: 1,
+                guard_contract: 2,
             };
             Self {
                 root,
@@ -1584,7 +1598,7 @@ pub(crate) mod tests {
             guard_sha256: digest(b"synthetic guard"),
             version: "0.2.0".into(),
             target: "aarch64-apple-darwin".into(),
-            guard_contract: 1,
+            guard_contract: 2,
         };
         let boundary = std::env::var("KEITO_TEST_NATIVE_BOUNDARY").unwrap();
         let signal = std::env::var("KEITO_TEST_NATIVE_SIGNAL")

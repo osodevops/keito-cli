@@ -36,9 +36,17 @@ enum Image<'a> {
     Borrowed(&'a VerifiedKeeperImage),
 }
 pub(crate) struct CommandOwner<'a> {
-    scope: Scope,
+    scope: ScopeRef<'a>,
     image: Image<'a>,
     end: u64,
+}
+enum ScopeRef<'a> { Owned(Scope), Borrowed(&'a mut Scope) }
+impl std::ops::Deref for ScopeRef<'_> {
+    type Target = Scope;
+    fn deref(&self) -> &Scope { match self { Self::Owned(s) => s, Self::Borrowed(s) => s } }
+}
+impl std::ops::DerefMut for ScopeRef<'_> {
+    fn deref_mut(&mut self) -> &mut Scope { match self { Self::Owned(s) => s, Self::Borrowed(s) => s } }
 }
 impl CommandOwner<'static> {
     pub(crate) fn standalone() -> Result<Self, AppError> {
@@ -59,7 +67,7 @@ impl CommandOwner<'static> {
         let image = VerifiedKeeperImage::open(&identity.guard_path, &identity.guard_sha256)
             .map_err(|_| refused())?;
         Ok(Self {
-            scope: Scope::with_owner(Default::default(), end),
+            scope: ScopeRef::Owned(Scope::with_owner(Default::default(), end)),
             image: Image::Owned(image),
             end,
         })
@@ -68,12 +76,8 @@ impl CommandOwner<'static> {
 impl<'a> CommandOwner<'a> {
     pub(crate) fn for_hook(
         runtime: &'a capture_runtime_pair::HookRuntime,
+        scope: &'a mut Scope,
     ) -> Result<Self, AppError> {
-        // Until the entry Session passes a borrowed attached Scope, refuse
-        // parent metadata rather than silently creating an independent owner.
-        if parent_present(|key| std::env::var_os(key).is_some()) {
-            return Err(refused());
-        }
         let at = crate::process_ownership::scope::monotonic_now().map_err(|_| refused())?;
         let raw = std::env::var(LEAF_END_ENV).map_err(|_| refused())?;
         let inherited = raw
@@ -81,9 +85,10 @@ impl<'a> CommandOwner<'a> {
             .ok()
             .filter(|n| n.to_string() == raw && *n > at)
             .ok_or_else(refused)?;
-        let end = inherited.min(at.saturating_add(HOOK_NS));
+        let end = inherited.min(at.saturating_add(HOOK_NS)).min(scope.hard_end());
+        scope.tighten_end(end);
         Ok(Self {
-            scope: Scope::with_owner(Default::default(), end),
+            scope: ScopeRef::Borrowed(scope),
             image: Image::Borrowed(runtime.keeper()),
             end,
         })

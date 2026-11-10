@@ -28,7 +28,7 @@ impl fmt::Display for ProtocolError {
 }
 impl std::error::Error for ProtocolError {}
 type Result<T> = std::result::Result<T, ProtocolError>;
-type Registration = (u32, u32, String);
+pub(super) type Registration = (u32, u32, String);
 
 #[derive(Default, Debug)]
 pub struct OwnerState {
@@ -54,7 +54,7 @@ impl OwnerState {
         self.first_fault.get_or_insert(error);
         self.admission_closed = true;
     }
-    fn charge(&mut self, kind: &'static str, amount: usize) -> Result<()> {
+    pub(super) fn charge(&mut self, kind: &'static str, amount: usize) -> Result<()> {
         if let Some(error) = self.budget_fault {
             return Err(error);
         }
@@ -145,6 +145,13 @@ pub struct Endpoint {
     pub last_poll: PollWork,
 }
 impl Endpoint {
+    pub(super) fn set_expected_child(&mut self, pid: u32) -> Result<()> {
+        if self.live || self.expected_pid.is_some() || pid == 0 || pid > i32::MAX as u32 {
+            return Err(self.poison(ProtocolError("PEER_IDENTITY")));
+        }
+        self.expected_pid = Some(pid);
+        Ok(())
+    }
     pub fn new(socket: UnixStream, nonce: String, expected_pid: Option<u32>) -> Result<Self> {
         Self::with_owner(socket, nonce, expected_pid, Rc::default())
     }
@@ -281,31 +288,41 @@ impl Endpoint {
             {
                 return Err(ProtocolError("METADATA_SEND_STATE"));
             }
-            let fields: Vec<_> = value.split('|').collect();
-            if fields.len() != 5
-                || !matches!(fields[0], "REGISTER" | "WAITED")
-                || !nonce_valid(fields[3])
-            {
-                return Err(ProtocolError("METADATA_SCHEMA"));
-            }
-            let key = (pid(fields[1])?, pid(fields[2])?, fields[3].to_owned());
-            if fields[0] == "REGISTER" {
-                unsigned(fields[4])?;
-                Self::validate_registration(&self.sent_registrations, std::process::id(), &key)?;
+            if Self::record_metadata(&mut self.sent_registrations, std::process::id(), value)? {
                 self.owner.borrow_mut().charge("registrations", 1)?;
-                self.sent_registrations.insert(key, false);
-            } else {
-                wait_status(fields[4])?;
-                let waited = self
-                    .sent_registrations
-                    .get_mut(&key)
-                    .filter(|w| !**w)
-                    .ok_or(ProtocolError("UNMATCHED_WAIT"))?;
-                *waited = true;
             }
             self.write_frame(value)
         })();
         result.map_err(|e| self.poison(e))
+    }
+    // The no-upstream root uses this SAME ledger validation as wire senders.
+    // A missing observer does not mean registrations may be forgotten.
+    pub(super) fn record_metadata(
+        registrations: &mut BTreeMap<Registration, bool>,
+        root: u32,
+        value: &str,
+    ) -> Result<bool> {
+        let fields: Vec<_> = value.split('|').collect();
+        if fields.len() != 5 || !matches!(fields[0], "REGISTER" | "WAITED")
+            || !nonce_valid(fields[3]) || value.len() + 34 > MAX_FRAME {
+            return Err(ProtocolError("METADATA_SCHEMA"));
+        }
+        let key = (pid(fields[1])?, pid(fields[2])?, fields[3].to_owned());
+        if fields[0] == "REGISTER" {
+            unsigned(fields[4])?;
+            Self::validate_registration(registrations, root, &key)?;
+            if registrations.len() >= MAX_REGISTRATIONS {
+                return Err(ProtocolError("LIMIT_REGISTRATIONS"));
+            }
+            registrations.insert(key, false);
+            Ok(true)
+        } else {
+            wait_status(fields[4])?;
+            let waited = registrations.get_mut(&key).filter(|w| !**w)
+                .ok_or(ProtocolError("UNMATCHED_WAIT"))?;
+            *waited = true;
+            Ok(false)
+        }
     }
     fn validate_registration(
         registrations: &BTreeMap<Registration, bool>,

@@ -6,7 +6,7 @@
 use serde::Serialize;
 use std::path::PathBuf;
 
-pub const GUARD_CONTRACT: u32 = 1;
+pub const GUARD_CONTRACT: u32 = 2;
 #[cfg(unix)]
 static IMAGE_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -210,7 +210,7 @@ pub fn bootstrap_image() -> Result<(), AppError> {
         let fd = raw
             .to_str()
             .and_then(|v| v.parse::<i32>().ok())
-            .filter(|v| (4..=1024).contains(v))
+            .filter(|v| (5..=1024).contains(v))
             .ok_or_else(refused)?;
         let file = unsafe { fs::File::from_raw_fd(fd) };
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {

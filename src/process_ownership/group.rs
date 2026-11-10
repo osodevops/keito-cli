@@ -751,6 +751,7 @@ impl GroupLease {
         if now()? >= policy.setup_end(current, lifetime_deadline_ns) {
             return Err(refused("GROUP_DEADLINE"));
         }
+        let mask = super::signals::AdmissionMask::block(&mut command)?;
         let keeper = command.spawn()?;
         let keeper_pid = keeper.id() as libc::pid_t;
         // The real handle is owned before any fallible read or publication.
@@ -772,6 +773,7 @@ impl GroupLease {
             ready_end: policy.setup_end(current, lifetime_deadline_ns),
             park_end: None,
         };
+        drop(mask);
         drop(image_descriptor);
         drop(inherited);
         drop(child_end);
@@ -891,8 +893,13 @@ impl GroupLease {
                 Ok(())
             });
         }
+        let mask = super::signals::AdmissionMask::block(&mut command)?;
         let child = command.spawn().map_err(|_| refused("GROUP_SPAWN"))?;
         self.workload = Some(child);
+        drop(mask);
+        if super::signals::pending() {
+            return Err(refused("GROUP_INTERRUPTED"));
+        }
         self.settlement
             .progress
             .advance(Phase::Ready, Phase::Joined)?;
@@ -1071,6 +1078,9 @@ impl GroupLease {
             release_sent: self.settlement.release_sent,
             terminal_eof: self.channel.eof && self.channel.pending.is_empty(),
         }
+    }
+    pub(super) fn registration_nonce(&self) -> &str {
+        &self.channel.nonce
     }
 }
 impl Drop for GroupLease {

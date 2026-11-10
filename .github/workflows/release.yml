@@ -145,7 +145,7 @@ jobs:
           guard_hash=$(sha256sum "$release_dir/keito-capture-guard$suffix" | awk '{print $1}')
           KEITO_RELEASE_GUARD_SHA256="$guard_hash" cargo build --locked --release --target ${{ matrix.target }} --bin keito
           core_hash=$(sha256sum "$release_dir/keito$suffix" | awk '{print $1}')
-          printf '{"manifest_contract":1,"version":"%s","target":"%s","guard_contract":1,"files":{"keito%s":"%s","keito-capture-guard%s":"%s"}}\n' \
+          printf '{"manifest_contract":1,"version":"%s","target":"%s","guard_contract":2,"files":{"keito%s":"%s","keito-capture-guard%s":"%s"}}\n' \
             "${RELEASE_TAG#v}" "${{ matrix.target }}" "$suffix" "$core_hash" "$suffix" "$guard_hash" > "$release_dir/capture-runtime-manifest.json"
 
       - name: Package Unix
@@ -290,7 +290,7 @@ jobs:
 
             test do
               assert_match "keito #{version}", shell_output("#{bin}/keito --version")
-              assert_match '"guard_contract":1', shell_output("#{bin}/keito skill runtime --json")
+              assert_match '"guard_contract":2', shell_output("#{bin}/keito skill runtime --json")
             end
           end
           FORMULA

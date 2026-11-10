@@ -3,12 +3,14 @@
 use super::{
     group::{CleanupPolicy, GroupLease},
     io::{CommandOutput, IoFacts, IoPlan, PipeIo},
-    protocol::{ProtocolError, SharedOwner, MAX_REGISTRATIONS},
+    protocol::{Endpoint, ProtocolError, Registration, SharedOwner, MAX_REGISTRATIONS},
 };
 use std::{
     io,
+    collections::BTreeMap,
+    os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::{net::UnixStream, process::{CommandExt, ExitStatusExt}}},
     path::Path,
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     rc::Rc,
 };
 
@@ -79,6 +81,7 @@ trait Edge {
     fn poll(&mut self) -> io::Result<()>;
     fn facts(&self) -> EdgeFacts;
     fn take_output(&mut self) -> CommandOutput;
+    fn take_events(&mut self) -> Vec<String> { Vec::new() }
 }
 enum Stage {
     Ready,
@@ -94,6 +97,7 @@ struct GroupEdge {
     stage: Stage,
     proof: bool,
     first_fault: Option<&'static str>,
+    published: [bool; 4],
 }
 impl GroupEdge {
     fn progress(&mut self) -> io::Result<()> {
@@ -193,6 +197,100 @@ impl Edge for GroupEdge {
     fn take_output(&mut self) -> CommandOutput {
         self.pipes.take_output()
     }
+    fn take_events(&mut self) -> Vec<String> {
+        let facts = self.lease.report();
+        let parent = std::process::id();
+        let nonce = self.lease.registration_nonce();
+        let mut events = Vec::new();
+        for (index, pid, status) in [
+            (0, Some(facts.keeper_pid), None),
+            (1, facts.workload_pid, None),
+            (2, Some(facts.keeper_pid), facts.keeper_status),
+            (3, facts.workload_pid, facts.workload_status),
+        ] {
+            if !self.published[index] && pid.is_some() && (index < 2 || status.is_some()) {
+                self.published[index] = true;
+                let kind = if index < 2 { "REGISTER" } else { "WAITED" };
+                let value = status.map(ExitStatus::into_raw).unwrap_or(0);
+                events.push(format!("{kind}|{parent}|{}|{nonce}|{value}", pid.unwrap()));
+            }
+        }
+        events
+    }
+}
+
+struct CooperativeEdge {
+    child: Child,
+    endpoint: Endpoint,
+    nonce: String,
+    status: Option<ExitStatus>,
+    cancel_sent: bool,
+    registered: bool,
+    waited: bool,
+    first_fault: Option<&'static str>,
+}
+impl Edge for CooperativeEdge {
+    fn begin(&mut self, end: u64) -> io::Result<()> {
+        if !self.cancel_sent && !self.endpoint.is_settled() {
+            self.cancel_sent = true;
+            // V1's cancellation grammar requires a positive absolute end.
+            // Zero is an already-expired local end, never a fresh allowance.
+            if let Err(e) = self.endpoint.send_cancel(end.max(1)) {
+                self.first_fault.get_or_insert(e.0);
+                return Err(error(e.0));
+            }
+        }
+        Ok(())
+    }
+    fn poll(&mut self) -> io::Result<()> {
+        // Endpoint faults never skip the independently retained direct wait.
+        if let Err(e) = self.endpoint.receive(false) {
+            self.first_fault.get_or_insert(e.0);
+        }
+        if self.status.is_none() {
+            match self.child.try_wait() {
+                Ok(status) => self.status = status,
+                Err(_) => { self.first_fault.get_or_insert("SCOPE_CHILD_WAIT"); }
+            }
+        }
+        self.first_fault.map_or(Ok(()), |e| Err(error(e)))
+    }
+    fn facts(&self) -> EdgeFacts {
+        EdgeFacts {
+            status: self.status,
+            waits_known: self.status.is_some(),
+            terminal_eof: self.endpoint.is_settled(),
+            resource_proof: self.status.is_some() && self.endpoint.is_settled() && self.first_fault.is_none(),
+            first_fault: self.first_fault,
+            ..Default::default()
+        }
+    }
+    fn take_output(&mut self) -> CommandOutput { CommandOutput { stdout: Vec::new(), stderr: Vec::new() } }
+    fn take_events(&mut self) -> Vec<String> {
+        let mut events = Vec::new();
+        let parent = std::process::id();
+        let child = self.child.id();
+        if !self.registered {
+            self.registered = true;
+            events.push(format!("REGISTER|{parent}|{child}|{}|0", self.nonce));
+        }
+        events.extend(self.endpoint.take_events());
+        // A direct WAITED is published after all currently received descendant
+        // records. Terminal+EOF remains a separate acceptance requirement.
+        if let Some(status) = self.status.filter(|_| !self.waited && (self.endpoint.is_settled() || self.first_fault.is_some())) {
+            self.waited = true;
+            events.push(format!("WAITED|{parent}|{child}|{}|{}", self.nonce, status.into_raw()));
+        }
+        events
+    }
+}
+enum ProductEdge { Group(GroupEdge), Cooperative(CooperativeEdge) }
+impl Edge for ProductEdge {
+    fn begin(&mut self, end: u64) -> io::Result<()> { match self { Self::Group(e) => e.begin(end), Self::Cooperative(e) => e.begin(end) } }
+    fn poll(&mut self) -> io::Result<()> { match self { Self::Group(e) => e.poll(), Self::Cooperative(e) => e.poll() } }
+    fn facts(&self) -> EdgeFacts { match self { Self::Group(e) => e.facts(), Self::Cooperative(e) => e.facts() } }
+    fn take_output(&mut self) -> CommandOutput { match self { Self::Group(e) => e.take_output(), Self::Cooperative(e) => e.take_output() } }
+    fn take_events(&mut self) -> Vec<String> { match self { Self::Group(e) => e.take_events(), Self::Cooperative(e) => e.take_events() } }
 }
 struct Slot<E> {
     edge: E,
@@ -416,10 +514,19 @@ impl<E: Edge> Core<E> {
     }
     // The public finish entrypoint and finite regressions use this SAME
     // envelope. Clock injection does not replace any ownership transitions.
+    #[cfg(test)]
     fn finish_with(
         &mut self,
         clock: &mut impl FnMut() -> io::Result<u64>,
         pause: &mut impl FnMut(),
+    ) {
+        self.finish_with_progress(clock, pause, &mut |_| {});
+    }
+    fn finish_with_progress(
+        &mut self,
+        clock: &mut impl FnMut() -> io::Result<u64>,
+        pause: &mut impl FnMut(),
+        progress: &mut impl FnMut(&mut Self),
     ) {
         self.finish_called = true;
         if self.finished {
@@ -430,7 +537,9 @@ impl<E: Edge> Core<E> {
             Err(_) => self.cancel(Some("SCOPE_CLOCK"), 0, 0),
         }
         loop {
+            progress(self);
             self.poll(clock);
+            progress(self);
             let at = match clock() {
                 Ok(at) => at,
                 Err(_) => {
@@ -495,9 +604,39 @@ pub struct CommandResult {
     pub output: CommandOutput,
 }
 pub struct Scope {
-    core: Core<GroupEdge>,
+    core: Core<ProductEdge>,
+    upstream: Option<Endpoint>,
+    ledger: BTreeMap<Registration, bool>,
+    terminal_sent: bool,
 }
 impl Scope {
+    /// Called on the entry thread after image bootstrap and before CLI parsing
+    /// or runtime construction. Absence and malformed metadata are distinct.
+    pub fn entry_from_environment(local_ns: u64) -> io::Result<Option<Self>> {
+        super::signals::install()?;
+        let at = now()?;
+        let end = at.checked_add(local_ns).ok_or_else(|| error("SCOPE_CLOCK"))?;
+        let Some((attachment, stream)) = super::attachment::consume(at, end)? else { return Ok(None); };
+        let owner: SharedOwner = Default::default();
+        let mut endpoint = Endpoint::with_owner(stream, attachment.nonce, Some(attachment.parent), owner.clone())
+            .map_err(|e| error(e.0))?;
+        endpoint.send_live().map_err(|e| error(e.0))?;
+        Ok(Some(Self { core: Core::new(owner, attachment.end), upstream: Some(endpoint), ledger: BTreeMap::new(), terminal_sent: false }))
+    }
+    pub fn hard_end(&self) -> u64 { self.core.hard_end }
+    pub fn slot_status(&self, id: &SlotId) -> Option<ExitStatus> {
+        if !Rc::ptr_eq(&id.scope, &self.core.identity) { return None; }
+        self.core.slots.get(id.index).and_then(|slot| slot.edge.facts().status)
+    }
+    pub fn slot_complete(&self, id: &SlotId) -> bool {
+        Rc::ptr_eq(&id.scope, &self.core.identity)
+            && self.core.slots.get(id.index).is_some_and(|slot| slot.accepted_at.is_some())
+            && self.core.owner.borrow().first_fault.is_none()
+    }
+    pub fn failed(&self) -> bool { self.core.owner.borrow().first_fault.is_some() }
+    pub(crate) fn tighten_end(&mut self, end: u64) {
+        self.core.hard_end = self.core.hard_end.min(end);
+    }
     pub(crate) fn owner_state(&self) -> SharedOwner {
         self.core.owner.clone()
     }
@@ -507,7 +646,85 @@ impl Scope {
     pub fn with_owner(owner: SharedOwner, hard_end: u64) -> Self {
         Self {
             core: Core::new(owner, hard_end),
+            upstream: None,
+            ledger: BTreeMap::new(),
+            terminal_sent: false,
         }
+    }
+    fn pump(core: &mut Core<ProductEdge>, upstream: &mut Option<Endpoint>, ledger: &mut BTreeMap<Registration, bool>) {
+        if super::signals::pending() {
+            match now() { Ok(at) => core.cancel(Some("SCOPE_INTERRUPTED"), at, core.hard_end), Err(_) => core.cancel(Some("SCOPE_CLOCK"), 0, 0) }
+        }
+        if let Some(endpoint) = upstream {
+            match endpoint.receive(true) {
+                Ok(false) => {},
+                result => {
+                    let reason = result.err().map(|e| e.0).unwrap_or("SCOPE_PARENT_CANCELLED");
+                    let end = endpoint.cancel_deadline_ns().unwrap_or(core.hard_end);
+                    match now() { Ok(at) => core.cancel(Some(reason), at, end), Err(_) => core.cancel(Some("SCOPE_CLOCK"), 0, 0) }
+                }
+            }
+        }
+        for slot in &mut core.slots {
+            for event in slot.edge.take_events() {
+                let result = if let Some(endpoint) = upstream {
+                    endpoint.metadata(&event)
+                } else {
+                    Endpoint::record_metadata(ledger, std::process::id(), &event).and_then(|registered| {
+                        if registered { core.owner.borrow_mut().charge("registrations", 1)?; }
+                        Ok(())
+                    })
+                };
+                if let Err(e) = result { core.owner.borrow_mut().poison(e); }
+            }
+        }
+    }
+    /// Retain an ORIGINAL cooperative Command without setpgid or cached-PID
+    /// signals. Its own entry owner must settle descendants and close the wire.
+    /// Caller-specified stdin/stdout/stderr and pre_exec are preserved.
+    pub fn start_cooperative(&mut self, mut command: Command) -> io::Result<SlotId> {
+        self.poll();
+        let at = now()?;
+        let mut random = [0u8; 16];
+        if unsafe { libc::getentropy(random.as_mut_ptr().cast(), random.len()) } != 0 { return Err(error("SCOPE_RANDOM")); }
+        let nonce: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let (parent, child_end) = UnixStream::pair()?;
+        let fd = unsafe { libc::fcntl(child_end.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+        if !(5..=1024).contains(&fd) {
+            if fd >= 0 { unsafe { libc::close(fd); } }
+            return Err(error("SCOPE_FD"));
+        }
+        let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
+        for key in super::attachment::KEYS.into_iter().chain(["KEITO_SOURCE_OWNER_FD", "KEITO_SOURCE_OWNER_NONCE"]) {
+            command.env_remove(key);
+        }
+        command.env("KEITO_PROCESS_OWNER_FD", "4")
+            .env("KEITO_PROCESS_OWNER_NONCE", &nonce)
+            .env("KEITO_PROCESS_OWNER_PID", std::process::id().to_string())
+            .env("KEITO_PROCESS_OWNER_END_NS", self.core.hard_end.to_string())
+            .env("KEITO_PROCESS_OWNER_CONTRACT", "2");
+        unsafe { command.pre_exec(move || {
+            if libc::dup2(fd, 4) < 0 || libc::fcntl(4, libc::F_SETFD, 0) < 0 { return Err(io::Error::last_os_error()); }
+            if fd != 4 { libc::close(fd); }
+            Ok(())
+        }); }
+        let mask = super::signals::AdmissionMask::block(&mut command)?;
+        let admission_end = self.core.hard_end.saturating_sub(RESERVE_NS);
+        let result = self.core.admit(at, 0, |owner| {
+            let endpoint = Endpoint::with_owner(parent, nonce.clone(), None, owner).map_err(|e| error(e.0))?;
+            if now()? >= admission_end || super::signals::pending() { return Err(error("SCOPE_ADMISSION")); }
+            let child = command.spawn()?;
+            // The edge owns the actual handle before identity publication.
+            let mut edge = CooperativeEdge { child, endpoint, nonce, status: None, cancel_sent: false, registered: false, waited: false, first_fault: None };
+            if let Err(e) = edge.endpoint.set_expected_child(edge.child.id()) { edge.first_fault = Some(e.0); }
+            Ok(ProductEdge::Cooperative(edge))
+        });
+        drop(mask);
+        drop(inherited);
+        drop(child_end);
+        self.poll();
+        if result.is_err() { self.begin_cancel(ProtocolError("SCOPE_COOPERATIVE_SPAWN"), self.core.hard_end); }
+        result
     }
     /// QA-owned700 image constructor only. A sealed official-pair image entry
     /// point is still required before wiring installed product call sites.
@@ -563,14 +780,15 @@ impl Scope {
                 }
             };
             let lease = create(owner, hard_end)?;
-            Ok(GroupEdge {
+            Ok(ProductEdge::Group(GroupEdge {
                 lease,
                 command: Some(command),
                 pipes,
                 stage: Stage::Ready,
                 proof: false,
                 first_fault: None,
-            })
+                published: [false; 4],
+            }))
         });
         if result.is_err() {
             if self.core.owner.borrow().first_fault.is_none() {
@@ -612,7 +830,9 @@ impl Scope {
     /// A bounded hot-path turn. Full retained reports are explicit snapshots,
     /// never an allocation/whole-registry scan on every command I/O poll.
     pub fn poll(&mut self) {
+        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger);
         self.core.poll(&mut now);
+        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger);
     }
     pub fn request_complete(&mut self, id: &SlotId) -> io::Result<()> {
         let result = match now() {
@@ -647,10 +867,25 @@ impl Scope {
         }
     }
     pub fn finish(&mut self) -> ScopeReport {
-        self.core.finish_with(&mut now, &mut || {
+        let upstream = &mut self.upstream;
+        let ledger = &mut self.ledger;
+        self.core.finish_with_progress(&mut now, &mut || {
             std::thread::sleep(std::time::Duration::from_millis(1));
-        });
+        }, &mut |core| Self::pump(core, upstream, ledger));
+        if self.ledger.values().any(|waited| !*waited) { self.core.poison("SCOPE_ACTIVE_REGISTRATION"); }
         self.report()
+    }
+    /// Separate from finish so the existing durable ACK is written only after
+    /// resources settle, and BEFORE the ownership terminal/physical EOF.
+    pub fn publish_terminal(&mut self, operation_clean: bool) -> bool {
+        if self.terminal_sent { return false; }
+        self.terminal_sent = true;
+        let clean = self.report().clean && operation_clean;
+        if !clean { self.core.poison("SCOPE_OPERATION_FAILED"); }
+        if let Some(endpoint) = &mut self.upstream {
+            if let Err(e) = endpoint.send_terminal(clean) { self.core.owner.borrow_mut().poison(e); return false; }
+        }
+        clean
     }
     pub fn report(&self) -> ScopeReport {
         let first_fault = self.core.owner.borrow().first_fault;
@@ -694,6 +929,7 @@ impl Drop for Scope {
             self.begin_cancel(ProtocolError("SCOPE_DROPPED"), self.core.hard_end);
             self.finish();
         }
+        if self.upstream.is_some() && !self.terminal_sent { self.publish_terminal(false); }
     }
 }
 

@@ -28,7 +28,7 @@ impl Pair {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let hash = capture::hash(fs::read(&guard).unwrap());
-        fs::write(&manifest, json!({"manifest_contract":1,"version":"0.2.0","target":"test-target","guard_contract":1,"files":{"keito":capture::hash(fs::read(&core).unwrap()),"keito-capture-guard":hash}}).to_string()).unwrap();
+        fs::write(&manifest, json!({"manifest_contract":1,"version":"0.2.0","target":"test-target","guard_contract":2,"files":{"keito":capture::hash(fs::read(&core).unwrap()),"keito-capture-guard":hash}}).to_string()).unwrap();
         Self {
             _temp: temp,
             core,
@@ -79,7 +79,7 @@ fn target_version_contract_and_extra_manifest_fields_refuse() {
     fs::write(&p.manifest, v.to_string()).unwrap();
     assert!(!p.valid());
     v.as_object_mut().unwrap().remove("untrusted_extra");
-    v["guard_contract"] = json!(2);
+    v["guard_contract"] = json!(1);
     fs::write(&p.manifest, v.to_string()).unwrap();
     assert!(!p.valid());
 }

@@ -12,15 +12,10 @@ mod unix {
         },
         path::{Component, Path, PathBuf},
         process::{Command, Stdio},
-        sync::atomic::{AtomicBool, Ordering},
         time::{Duration, Instant},
     };
     const PENDING: &[u8] = b"KEITO_CAPTURE_PENDING_V1\n";
     const ACK: &[u8] = b"KEITO_CAPTURE_DURABLE_V1\n";
-    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-    extern "C" fn interrupted(_: libc::c_int) {
-        INTERRUPTED.store(true, Ordering::Relaxed);
-    }
     fn c(value: &std::ffi::OsStr) -> Result<CString, ()> {
         CString::new(value.as_bytes()).map_err(|_| ())
     }
@@ -267,7 +262,7 @@ mod unix {
             }
             if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
                 || started.elapsed() >= Duration::from_millis(25)
-                || INTERRUPTED.load(Ordering::Relaxed)
+                || crate::process_ownership::signals::pending()
             {
                 return Err(());
             }
@@ -359,12 +354,11 @@ mod unix {
         }
         sync(state)
     }
-    pub fn run() -> Result<(), ()> {
+    pub fn run(args: &[std::ffi::OsString], scope: &mut crate::process_ownership::scope::Scope) -> Result<(), ()> {
         let started = Instant::now();
         // Share a CLOCK_MONOTONIC absolute bound with core leaf commands. This
         // reserves work inside the existing guard budget, never after it.
         let leaf_start = crate::process_ownership::scope::monotonic_now().ok();
-        let args: Vec<_> = std::env::args_os().skip(1).collect();
         if args.len() != 8 {
             return Err(());
         }
@@ -399,13 +393,6 @@ mod unix {
                 .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
         {
             return Err(());
-        }
-        unsafe {
-            libc::signal(
-                libc::SIGTERM,
-                interrupted as *const () as libc::sighandler_t,
-            );
-            libc::signal(libc::SIGINT, interrupted as *const () as libc::sighandler_t);
         }
         let root = root_path()?;
         let state = directory(&root, 1).map_err(|_| ())?;
@@ -457,7 +444,7 @@ mod unix {
         sync(&flags)?;
         unlock(&publication);
         let initial = marker.metadata().map_err(|_| ())?;
-        if INTERRUPTED.load(Ordering::Relaxed) || started.elapsed() >= Duration::from_millis(600) {
+        if crate::process_ownership::signals::pending() || started.elapsed() >= Duration::from_millis(600) {
             return Ok(());
         }
         // Even a clock refusal must leave the already durable pending marker.
@@ -467,11 +454,14 @@ mod unix {
         // immediately before exec and carries this verified imageFD for a
         // synchronous identity cross-check before Tokio/CLI parsing.
         let expected = std::env::var("KEITO_CAPTURE_CORE_SHA256").map_err(|_| ())?;
-        let core_file = executable(&core, &expected)?;
-        let core_fd = core_file.as_raw_fd();
-        if !(4..=1024).contains(&core_fd) {
+        let original = executable(&core, &expected)?;
+        let core_fd = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+        if !(5..=1024).contains(&core_fd) {
+            if core_fd >= 0 { unsafe { libc::close(core_fd); } }
             return Err(());
         }
+        let core_file = unsafe { File::from_raw_fd(core_fd) };
+        drop(original);
         let mut pipe = [-1; 2];
         if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
             return Err(());
@@ -577,7 +567,7 @@ mod unix {
                 Ok(())
             });
         }
-        let mut child = command.spawn().map_err(|_| ())?;
+        let child = scope.start_cooperative(command).map_err(|_| ())?;
         drop(writer);
         let mut reader = File::from(reader);
         let mut bytes = Vec::with_capacity(ACK.len() + 1);
@@ -596,41 +586,26 @@ mod unix {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => break,
             }
-            status = child.try_wait().map_err(|_| ())?;
-            if status.is_some() && eof {
+            scope.poll();
+            status = scope.slot_status(&child);
+            if scope.slot_complete(&child) && eof {
                 break;
             }
-            if INTERRUPTED.load(Ordering::Relaxed)
+            if scope.failed() || crate::process_ownership::signals::pending()
                 || started.elapsed() >= Duration::from_millis(600)
             {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        if status.is_none() {
-            let pid = child.id() as i32;
-            unsafe {
-                libc::kill(-pid, libc::SIGTERM);
-            }
-            let end = Instant::now();
-            loop {
-                if child.try_wait().map_err(|_| ())?.is_some() {
-                    break;
-                }
-                if end.elapsed() >= Duration::from_millis(15) {
-                    unsafe {
-                        libc::kill(-pid, libc::SIGKILL);
-                    }
-                    let _ = child.wait();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
+        if !scope.slot_complete(&child) || !eof || bytes != ACK {
+            scope.begin_cancel(crate::process_ownership::protocol::ProtocolError("GUARD_CORE_INCOMPLETE"), scope.hard_end());
         }
-        if status.is_some_and(|s| s.success())
+        let resources_clean = scope.finish().clean;
+        if resources_clean && status.is_some_and(|s| s.success())
             && eof
             && bytes == ACK
-            && !INTERRUPTED.load(Ordering::Relaxed)
+            && !crate::process_ownership::signals::pending()
             && started.elapsed() < Duration::from_millis(600)
             && lock(&publication)
         {
@@ -661,7 +636,10 @@ mod unix {
         Ok(())
     }
 }
-pub fn main() {
+#[cfg(unix)]
+pub fn run(args: &[std::ffi::OsString], scope: &mut crate::process_ownership::scope::Scope) -> Result<(), ()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let _ = unix::run();
+    { unix::run(args, scope) }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    { let _ = (args, scope); Err(()) }
 }
