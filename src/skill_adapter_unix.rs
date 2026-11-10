@@ -569,21 +569,27 @@ fn runtime_unchanged(runtime: &CaptureRuntimeIdentity) -> Result<(), AppError> {
     }
     Ok(())
 }
-fn detect_version(agent: SkillAgent,runner:&mut impl crate::process_ownership::probes::LeafRunner) -> Result<String,AppError> {
+fn detect_version(
+    agent: SkillAgent,
+    runner: &mut impl crate::process_ownership::probes::LeafRunner,
+) -> Result<String, AppError> {
     use std::process::{Command, Stdio};
     let binary = if agent == SkillAgent::Codex {
         "codex"
     } else {
         "claude"
     };
-    let mut command=Command::new(binary);
-    command.arg("--version")
+    let mut command = Command::new(binary);
+    command
+        .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let result=runner.output(command,8192,8192).map_err(|_|failure())?;
-    if !result.status.success() {return Ok("unknown".into());}
-    let bytes=String::from_utf8(result.output.stdout).map_err(|_|failure())?;
+    let result = runner.output(command, 8192, 8192).map_err(|_| failure())?;
+    if !result.status.success() {
+        return Ok("unknown".into());
+    }
+    let bytes = String::from_utf8(result.output.stdout).map_err(|_| failure())?;
     Ok(bytes
         .split_whitespace()
         .find(|s| {
@@ -596,10 +602,10 @@ fn detect_version(agent: SkillAgent,runner:&mut impl crate::process_ownership::p
 }
 pub fn install(options: InstallOptions<'_>) -> Result<InstallOutcome, AppError> {
     let version = match options.harness_version {
-        Some(version)=>version.to_owned(),
-        None=>{
-            let mut owner=crate::capture_command_owner::CommandOwner::standalone()?;
-            let result=detect_version(options.agent,&mut owner);
+        Some(version) => version.to_owned(),
+        None => {
+            let mut owner = crate::capture_command_owner::CommandOwner::standalone()?;
+            let result = detect_version(options.agent, &mut owner);
             owner.finish(result)?
         }
     };

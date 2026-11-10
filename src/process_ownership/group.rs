@@ -623,16 +623,34 @@ impl GroupLease {
         lifetime_deadline_ns: u64,
         policy: CleanupPolicy,
     ) -> io::Result<Self> {
-        Self::spawn(owner, KeeperProgram::Owned {root:run_root,image:keeper_image}, lifetime_deadline_ns, policy)
+        Self::spawn(
+            owner,
+            KeeperProgram::Owned {
+                root: run_root,
+                image: keeper_image,
+            },
+            lifetime_deadline_ns,
+            policy,
+        )
     }
     pub(crate) fn spawn_verified_keeper(
         owner: SharedOwner,
         image: &super::image::VerifiedKeeperImage,
         lifetime_deadline_ns: u64,
     ) -> io::Result<Self> {
-        Self::spawn(owner,KeeperProgram::Verified(image),lifetime_deadline_ns,CleanupPolicy::HookShort)
+        Self::spawn(
+            owner,
+            KeeperProgram::Verified(image),
+            lifetime_deadline_ns,
+            CleanupPolicy::HookShort,
+        )
     }
-    fn spawn(owner:SharedOwner,program:KeeperProgram<'_>,lifetime_deadline_ns:u64,policy:CleanupPolicy)->io::Result<Self> {
+    fn spawn(
+        owner: SharedOwner,
+        program: KeeperProgram<'_>,
+        lifetime_deadline_ns: u64,
+        policy: CleanupPolicy,
+    ) -> io::Result<Self> {
         owner
             .borrow()
             .check_admission()
@@ -641,26 +659,30 @@ impl GroupLease {
         if Lifetime::with_policy(current, lifetime_deadline_ns, policy).is_err() {
             return Err(refused("GROUP_LIFETIME"));
         }
-        if let KeeperProgram::Owned {root:run_root,image:keeper_image} = program {
-        for path in [run_root, keeper_image] {
-            if !path.is_absolute() || path.canonicalize().ok().as_deref() != Some(path) {
+        if let KeeperProgram::Owned {
+            root: run_root,
+            image: keeper_image,
+        } = program
+        {
+            for path in [run_root, keeper_image] {
+                if !path.is_absolute() || path.canonicalize().ok().as_deref() != Some(path) {
+                    return Err(refused("GROUP_OWNED_PATH"));
+                }
+            }
+            let root = fs::symlink_metadata(run_root)?;
+            let image = fs::symlink_metadata(keeper_image)?;
+            if !root.is_dir()
+                || root.uid() != unsafe { libc::geteuid() }
+                || root.mode() & 0o777 != 0o700
+                || !keeper_image.starts_with(run_root)
+                || !image.is_file()
+                || image.file_type().is_symlink()
+                || image.uid() != root.uid()
+                || image.nlink() != 1
+                || image.mode() & 0o777 != 0o700
+            {
                 return Err(refused("GROUP_OWNED_PATH"));
             }
-        }
-        let root = fs::symlink_metadata(run_root)?;
-        let image = fs::symlink_metadata(keeper_image)?;
-        if !root.is_dir()
-            || root.uid() != unsafe { libc::geteuid() }
-            || root.mode() & 0o777 != 0o700
-            || !keeper_image.starts_with(run_root)
-            || !image.is_file()
-            || image.file_type().is_symlink()
-            || image.uid() != root.uid()
-            || image.nlink() != 1
-            || image.mode() & 0o777 != 0o700
-        {
-            return Err(refused("GROUP_OWNED_PATH"));
-        }
         }
         let mut random = [0u8; 16];
         if unsafe { libc::getentropy(random.as_mut_ptr().cast(), random.len()) } != 0 {
@@ -679,10 +701,10 @@ impl GroupLease {
         let owner_pgid = unsafe { libc::getpgrp() };
         let sid = unsafe { libc::getsid(0) };
         let (mut command, image_descriptor, cwd) = match program {
-            KeeperProgram::Owned {root,image} => (Command::new(image),None,root),
+            KeeperProgram::Owned { root, image } => (Command::new(image), None, root),
             KeeperProgram::Verified(image) => {
-                let (command,fd) = image.command(child_fd)?;
-                (command,Some(fd),Path::new("/"))
+                let (command, fd) = image.command(child_fd)?;
+                (command, Some(fd), Path::new("/"))
             }
         };
         command
@@ -703,7 +725,10 @@ impl GroupLease {
             command.arg("hook-short-v1");
         }
         if let Some(image) = &image_descriptor {
-            command.env(super::image::VerifiedKeeperImage::image_env(),image.as_raw_fd().to_string());
+            command.env(
+                super::image::VerifiedKeeperImage::image_env(),
+                image.as_raw_fd().to_string(),
+            );
         }
         // Core Foundation may initialize before this helper's main. Supply
         // synthetic UID/zero encoding metadata instead of consulting the
@@ -723,7 +748,9 @@ impl GroupLease {
         }
         // Verification/inventory cannot consume an old admission timestamp and
         // then start a keeper beyond its setup/operation end.
-        if now()? >= policy.setup_end(current,lifetime_deadline_ns) {return Err(refused("GROUP_DEADLINE"));}
+        if now()? >= policy.setup_end(current, lifetime_deadline_ns) {
+            return Err(refused("GROUP_DEADLINE"));
+        }
         let keeper = command.spawn()?;
         let keeper_pid = keeper.id() as libc::pid_t;
         // The real handle is owned before any fallible read or publication.

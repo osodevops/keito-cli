@@ -7,6 +7,6 @@
 pub mod group;
 pub(crate) mod image;
 pub mod io;
-pub mod protocol;
 pub(crate) mod probes;
+pub mod protocol;
 pub mod scope;

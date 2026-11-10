@@ -255,7 +255,10 @@ pub async fn run(
                 })
                 .transpose()?;
             #[cfg(unix)]
-            let mut command_owner = hook_runtime.as_ref().map(crate::capture_command_owner::CommandOwner::for_hook).transpose()?;
+            let mut command_owner = hook_runtime
+                .as_ref()
+                .map(crate::capture_command_owner::CommandOwner::for_hook)
+                .transpose()?;
             let ack_fd = std::env::var("KEITO_CAPTURE_ACK_FD")
                 .ok()
                 .and_then(|fd| fd.parse::<i32>().ok())
@@ -263,22 +266,26 @@ pub async fn run(
             let mut accepted_store = None;
             let result = (|| {
                 #[cfg(unix)]
-                let owner=command_owner.as_mut().ok_or_else(||AppError::Config("Capture hook requires a verified guarded command owner".into()))?;
+                let owner = command_owner.as_mut().ok_or_else(|| {
+                    AppError::Config(
+                        "Capture hook requires a verified guarded command owner".into(),
+                    )
+                })?;
                 #[cfg(unix)]
-                let bytes=owner.read_event(MAX_EVENT_BYTES)?;
+                let bytes = owner.read_event(MAX_EVENT_BYTES)?;
                 #[cfg(not(unix))]
-                let bytes={
-                let mut bytes = Vec::new();
-                std::io::stdin()
-                    .take((MAX_EVENT_BYTES + 1) as u64)
-                    .read_to_end(&mut bytes)
-                    .map_err(|_| AppError::InvalidInput("Cannot read capture event".into()))?;
-                if bytes.len() > MAX_EVENT_BYTES {
-                    return Err(AppError::InvalidInput(
-                        "Capture input limit exceeded".into(),
-                    ));
-                }
-                bytes
+                let bytes = {
+                    let mut bytes = Vec::new();
+                    std::io::stdin()
+                        .take((MAX_EVENT_BYTES + 1) as u64)
+                        .read_to_end(&mut bytes)
+                        .map_err(|_| AppError::InvalidInput("Cannot read capture event".into()))?;
+                    if bytes.len() > MAX_EVENT_BYTES {
+                        return Err(AppError::InvalidInput(
+                            "Capture input limit exceeded".into(),
+                        ));
+                    }
+                    bytes
                 };
                 let value: Value = serde_json::from_slice(&bytes)
                     .map_err(|_| AppError::InvalidInput("Malformed capture event".into()))?;
@@ -309,7 +316,7 @@ pub async fn run(
                     .and_then(Value::as_str)
                     .ok_or_else(|| AppError::InvalidInput("Missing repository identity".into()))?;
                 #[cfg(unix)]
-                let repo = Repository::resolve_with(Path::new(cwd),owner)?;
+                let repo = Repository::resolve_with(Path::new(cwd), owner)?;
                 #[cfg(not(unix))]
                 let repo = Repository::resolve(Path::new(cwd))?;
                 let mut store = Store::open(&directory()?)?;
@@ -317,9 +324,9 @@ pub async fn run(
                     store.hook_invocation(nonce)?;
                 }
                 #[cfg(unix)]
-                let clock=Clock::now_with(owner)?;
+                let clock = Clock::now_with(owner)?;
                 #[cfg(not(unix))]
-                let clock=Clock::now()?;
+                let clock = Clock::now()?;
                 let signal = capture::Signal {
                     source: agent.namespace(),
                     resumed: event == crate::cli::capture::CaptureEvent::SessionStart
@@ -345,7 +352,7 @@ pub async fn run(
                 accepted_store = Some(store);
                 Ok(())
             })();
-            let mut ack_store=None;
+            let mut ack_store = None;
             if let Err(error) = result {
                 let reason = match error {
                     AppError::Config(ref message) if message.contains("queue limit") => {
@@ -362,9 +369,9 @@ pub async fn run(
                 });
                 if saved && boundary_id.is_some() {
                     if let (Some(nonce), Some(_)) = (&invocation_nonce, ack_fd) {
-                        if let Ok(mut store) = directory().and_then(|d|Store::open(&d)) {
+                        if let Ok(mut store) = directory().and_then(|d| Store::open(&d)) {
                             if store.hook_invocation(nonce).is_ok() {
-                                ack_store=Some(store);
+                                ack_store = Some(store);
                             }
                         }
                     }
@@ -378,19 +385,23 @@ pub async fn run(
                     }
                 );
             } else {
-                ack_store=accepted_store;
+                ack_store = accepted_store;
             }
             // Preserve the original business/durability predicate above, but
             // never acknowledge it until the actual command owner has finished.
             #[cfg(unix)]
-            let resources_clean=command_owner.as_mut().is_some_and(|owner|owner.finish_clean());
+            let resources_clean = command_owner
+                .as_mut()
+                .is_some_and(|owner| owner.finish_clean());
             #[cfg(not(unix))]
-            let resources_clean=false;
+            let resources_clean = false;
             if resources_clean {
-                if let (Some(store),Some(fd))=(ack_store,ack_fd) {
+                if let (Some(store), Some(fd)) = (ack_store, ack_fd) {
                     if store.acknowledge_hook(fd).is_err() {
                         #[cfg(unix)]
-                        if let Some(owner)=command_owner.as_mut() {owner.fail_ack();}
+                        if let Some(owner) = command_owner.as_mut() {
+                            owner.fail_ack();
+                        }
                     }
                 }
             }

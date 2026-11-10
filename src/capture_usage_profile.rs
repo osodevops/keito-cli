@@ -510,7 +510,12 @@ fn native_image(bytes: &[u8]) -> bool {
     }
 }
 
-fn observed_version(native: &ImagePin, home: &Path, expected: &str, runner:&mut impl crate::process_ownership::probes::LeafRunner) -> Result<(), AppError> {
+fn observed_version(
+    native: &ImagePin,
+    home: &Path,
+    expected: &str,
+    runner: &mut impl crate::process_ownership::probes::LeafRunner,
+) -> Result<(), AppError> {
     let file = walk(&native.path, false)?;
     if !native
         .stamp
@@ -555,14 +560,12 @@ fn observed_version(native: &ImagePin, home: &Path, expected: &str, runner:&mut 
             Ok(())
         });
     }
-    let result=runner.output(command,8192,8192).map_err(|_|refused())?;
-    if !result.status.success() {return Err(refused());}
-    let bytes=String::from_utf8(result.output.stdout).map_err(|_|refused())?;
-    if !bytes
-            .split_whitespace()
-            .any(|part| part == expected)
-        || !native.matches()
-    {
+    let result = runner.output(command, 8192, 8192).map_err(|_| refused())?;
+    if !result.status.success() {
+        return Err(refused());
+    }
+    let bytes = String::from_utf8(result.output.stdout).map_err(|_| refused())?;
+    if !bytes.split_whitespace().any(|part| part == expected) || !native.matches() {
         return Err(refused());
     }
     Ok(())
@@ -691,8 +694,8 @@ pub(crate) fn approve(options: ProfileOptions<'_>) -> Result<PreparedProfile, Ap
     } else {
         ImagePin::observe(options.launcher, false)?
     };
-    let mut probe_owner=crate::capture_command_owner::CommandOwner::standalone()?;
-    let probe=observed_version(&native, options.home, version,&mut probe_owner);
+    let mut probe_owner = crate::capture_command_owner::CommandOwner::standalone()?;
+    let probe = observed_version(&native, options.home, version, &mut probe_owner);
     probe_owner.finish(probe)?;
     if !receipt_stamp.matches(&receipt_path) || !config_stamp.matches(&config_path) {
         return Err(refused());

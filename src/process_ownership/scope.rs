@@ -18,10 +18,22 @@ const SLOTS_PER_TURN: usize = 8;
 fn error(reason: &'static str) -> io::Error {
     io::Error::other(reason)
 }
-fn clear_parent_environment(command:&mut Command) {
-    for key in ["KEITO_PROCESS_OWNER_FD","KEITO_PROCESS_OWNER_NONCE","KEITO_PROCESS_OWNER_PID","KEITO_PROCESS_OWNER_END_NS","KEITO_PROCESS_OWNER_CONTRACT",
-        "KEITO_SOURCE_OWNER_FD","KEITO_SOURCE_OWNER_NONCE","KEITO_CAPTURE_ACK_FD","KEITO_CAPTURE_IMAGE_FD","KEITO_CAPTURE_INVOCATION_NONCE",
-        "KEITO_CAPTURE_LEAF_END_NS","KEITO_CAPTURE_KEEPER_IMAGE_FD","KEITO_CAPTURE_CORE_SHA256"] {
+fn clear_parent_environment(command: &mut Command) {
+    for key in [
+        "KEITO_PROCESS_OWNER_FD",
+        "KEITO_PROCESS_OWNER_NONCE",
+        "KEITO_PROCESS_OWNER_PID",
+        "KEITO_PROCESS_OWNER_END_NS",
+        "KEITO_PROCESS_OWNER_CONTRACT",
+        "KEITO_SOURCE_OWNER_FD",
+        "KEITO_SOURCE_OWNER_NONCE",
+        "KEITO_CAPTURE_ACK_FD",
+        "KEITO_CAPTURE_IMAGE_FD",
+        "KEITO_CAPTURE_INVOCATION_NONCE",
+        "KEITO_CAPTURE_LEAF_END_NS",
+        "KEITO_CAPTURE_KEEPER_IMAGE_FD",
+        "KEITO_CAPTURE_CORE_SHA256",
+    ] {
         command.env_remove(key);
     }
 }
@@ -37,7 +49,9 @@ fn now() -> io::Result<u64> {
         .and_then(|s| s.checked_add(clock.tv_nsec as u64))
         .ok_or_else(|| error("SCOPE_CLOCK"))
 }
-pub(crate) fn monotonic_now()->io::Result<u64> {now()}
+pub(crate) fn monotonic_now() -> io::Result<u64> {
+    now()
+}
 
 #[derive(Clone)]
 pub struct SlotId {
@@ -484,8 +498,12 @@ pub struct Scope {
     core: Core<GroupEdge>,
 }
 impl Scope {
-    pub(crate) fn owner_state(&self)->SharedOwner {self.core.owner.clone()}
-    pub(crate) fn first_fault(&self)->Option<ProtocolError> {self.core.owner.borrow().first_fault}
+    pub(crate) fn owner_state(&self) -> SharedOwner {
+        self.core.owner.clone()
+    }
+    pub(crate) fn first_fault(&self) -> Option<ProtocolError> {
+        self.core.owner.borrow().first_fault
+    }
     pub fn with_owner(owner: SharedOwner, hard_end: u64) -> Self {
         Self {
             core: Core::new(owner, hard_end),
@@ -500,12 +518,26 @@ impl Scope {
         root: &Path,
         image: &Path,
     ) -> io::Result<SlotId> {
-        self.start_with_lease(command,plan,|owner,end| GroupLease::spawn_keeper_with_policy(owner,root,image,end,CleanupPolicy::HookShort))
+        self.start_with_lease(command, plan, |owner, end| {
+            GroupLease::spawn_keeper_with_policy(owner, root, image, end, CleanupPolicy::HookShort)
+        })
     }
-    pub(crate) fn start_verified_opaque(&mut self,command:Command,plan:IoPlan,image:&super::image::VerifiedKeeperImage)->io::Result<SlotId> {
-        self.start_with_lease(command,plan,|owner,end|GroupLease::spawn_verified_keeper(owner,image,end))
+    pub(crate) fn start_verified_opaque(
+        &mut self,
+        command: Command,
+        plan: IoPlan,
+        image: &super::image::VerifiedKeeperImage,
+    ) -> io::Result<SlotId> {
+        self.start_with_lease(command, plan, |owner, end| {
+            GroupLease::spawn_verified_keeper(owner, image, end)
+        })
     }
-    fn start_with_lease(&mut self,mut command:Command,plan:IoPlan,create:impl FnOnce(SharedOwner,u64)->io::Result<GroupLease>)->io::Result<SlotId> {
+    fn start_with_lease(
+        &mut self,
+        mut command: Command,
+        plan: IoPlan,
+        create: impl FnOnce(SharedOwner, u64) -> io::Result<GroupLease>,
+    ) -> io::Result<SlotId> {
         clear_parent_environment(&mut command);
         let at = match now() {
             Ok(at) => at,
@@ -530,7 +562,7 @@ impl Scope {
                     return Err(error("SCOPE_IO_PREPARE"));
                 }
             };
-            let lease = create(owner,hard_end)?;
+            let lease = create(owner, hard_end)?;
             Ok(GroupEdge {
                 lease,
                 command: Some(command),
@@ -551,16 +583,29 @@ impl Scope {
         }
         result
     }
-    pub(crate) fn run_verified(&mut self,command:Command,plan:IoPlan,image:&super::image::VerifiedKeeperImage)->io::Result<CommandResult> {
-        let slot=match self.start_verified_opaque(command,plan,image) {
-            Ok(slot)=>slot,
-            Err(error)=>{self.finish();return Err(error);}
+    pub(crate) fn run_verified(
+        &mut self,
+        command: Command,
+        plan: IoPlan,
+        image: &super::image::VerifiedKeeperImage,
+    ) -> io::Result<CommandResult> {
+        let slot = match self.start_verified_opaque(command, plan, image) {
+            Ok(slot) => slot,
+            Err(error) => {
+                self.finish();
+                return Err(error);
+            }
         };
         loop {
             self.poll();
-            let fault=self.core.owner.borrow().first_fault;
-            if let Some(reason)=fault {self.finish();return Err(error(reason.0));}
-            if self.core.slots[slot.index].accepted_at.is_some() {return self.take_result(&slot);}
+            let fault = self.core.owner.borrow().first_fault;
+            if let Some(reason) = fault {
+                self.finish();
+                return Err(error(reason.0));
+            }
+            if self.core.slots[slot.index].accepted_at.is_some() {
+                return self.take_result(&slot);
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
@@ -939,15 +984,28 @@ mod tests {
     }
     #[test]
     fn r40_leaf_environment_preserves_routing_but_removes_parent_control() {
-        let mut command=Command::new("inert-never-execute");
-        command.arg("--version").env("OPENAI_BASE_URL","https://proxy.invalid").env("CODEX_HOME","/private/owned-profile")
-            .env("KEITO_CAPTURE_ACK_FD","3").env("KEITO_PROCESS_OWNER_NONCE","parent");
+        let mut command = Command::new("inert-never-execute");
+        command
+            .arg("--version")
+            .env("OPENAI_BASE_URL", "https://proxy.invalid")
+            .env("CODEX_HOME", "/private/owned-profile")
+            .env("KEITO_CAPTURE_ACK_FD", "3")
+            .env("KEITO_PROCESS_OWNER_NONCE", "parent");
         clear_parent_environment(&mut command);
-        let env:std::collections::BTreeMap<_,_>=command.get_envs().collect();
-        assert_eq!(env[std::ffi::OsStr::new("OPENAI_BASE_URL")],Some(std::ffi::OsStr::new("https://proxy.invalid")));
-        assert_eq!(env[std::ffi::OsStr::new("CODEX_HOME")],Some(std::ffi::OsStr::new("/private/owned-profile")));
-        assert_eq!(env[std::ffi::OsStr::new("KEITO_CAPTURE_ACK_FD")],None);
-        assert_eq!(env[std::ffi::OsStr::new("KEITO_PROCESS_OWNER_NONCE")],None);
-        assert_eq!(command.get_args().collect::<Vec<_>>(),[std::ffi::OsStr::new("--version")]);
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            env[std::ffi::OsStr::new("OPENAI_BASE_URL")],
+            Some(std::ffi::OsStr::new("https://proxy.invalid"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("CODEX_HOME")],
+            Some(std::ffi::OsStr::new("/private/owned-profile"))
+        );
+        assert_eq!(env[std::ffi::OsStr::new("KEITO_CAPTURE_ACK_FD")], None);
+        assert_eq!(env[std::ffi::OsStr::new("KEITO_PROCESS_OWNER_NONCE")], None);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("--version")]
+        );
     }
 }

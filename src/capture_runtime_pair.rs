@@ -299,11 +299,17 @@ impl HookRuntime {
         if identity.core_sha256 != expected_core {
             return Err(refused());
         }
-        let keeper = crate::process_ownership::image::VerifiedKeeperImage::open(&identity.guard_path,&identity.guard_sha256).map_err(|_|refused())?;
-        Ok(Self { identity,keeper })
+        let keeper = crate::process_ownership::image::VerifiedKeeperImage::open(
+            &identity.guard_path,
+            &identity.guard_sha256,
+        )
+        .map_err(|_| refused())?;
+        Ok(Self { identity, keeper })
     }
     pub(crate) fn identity(&self) -> &CaptureRuntimeIdentity {
         &self.identity
     }
-    pub(crate) fn keeper(&self)->&crate::process_ownership::image::VerifiedKeeperImage { &self.keeper }
+    pub(crate) fn keeper(&self) -> &crate::process_ownership::image::VerifiedKeeperImage {
+        &self.keeper
+    }
 }

@@ -1,10 +1,10 @@
 mod adapter_files;
 pub mod api;
 pub mod capture;
-#[cfg(unix)]
-mod capture_command_owner;
 mod capture_authority;
 mod capture_busy;
+#[cfg(unix)]
+mod capture_command_owner;
 mod capture_invocations;
 pub mod capture_mapping;
 pub mod capture_runtime_pair;
