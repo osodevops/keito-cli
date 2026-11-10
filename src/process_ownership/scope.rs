@@ -830,7 +830,9 @@ mod tests {
             let events: Rc<RefCell<Vec<String>>> = Rc::default();
             let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
             if !empty {
-                let accepted = core.admit(1, 0, |_| Ok(fake("accepted", events.clone()))).unwrap();
+                let accepted = core
+                    .admit(1, 0, |_| Ok(fake("accepted", events.clone())))
+                    .unwrap();
                 core.request_complete(&accepted, 2).unwrap();
                 core.poll(&mut || Ok(3));
                 assert!(core.slots[0].accepted_at.is_some());
@@ -838,35 +840,57 @@ mod tests {
                     let mut pending = fake("pending", events.clone());
                     pending.facts.io_required = true;
                     Ok(pending)
-                }).unwrap();
+                })
+                .unwrap();
             }
-            if prior_fault { core.poison("ORIGINAL"); }
+            if prior_fault {
+                core.poison("ORIGINAL");
+            }
             events.borrow_mut().clear();
             let mut calls = 0;
-            core.finish_with(&mut || {
-                calls += 1;
-                match calls {
-                    1 => Ok(100),
-                    2 => Ok(101),
-                    3 => Err(error("SCOPE_CLOCK")),
-                    _ => Ok(200),
-                }
-            }, &mut || panic!("final failed clock must end this envelope"));
+            core.finish_with(
+                &mut || {
+                    calls += 1;
+                    match calls {
+                        1 => Ok(100),
+                        2 => Ok(101),
+                        3 => Err(error("SCOPE_CLOCK")),
+                        _ => Ok(200),
+                    }
+                },
+                &mut || panic!("final failed clock must end this envelope"),
+            );
             assert_eq!(calls, 3);
-            assert_eq!(core.cancel_end, Some(0), "final clock failure retained a positive end");
-            assert_eq!(core.owner.borrow().first_fault,
-                Some(ProtocolError(if prior_fault { "ORIGINAL" } else { "SCOPE_CLOCK" })));
-            assert!(core.finished); assert!(core.finish_called);
+            assert_eq!(
+                core.cancel_end,
+                Some(0),
+                "final clock failure retained a positive end"
+            );
+            assert_eq!(
+                core.owner.borrow().first_fault,
+                Some(ProtocolError(if prior_fault {
+                    "ORIGINAL"
+                } else {
+                    "SCOPE_CLOCK"
+                }))
+            );
+            assert!(core.finished);
+            assert!(core.finish_called);
             if !empty {
                 assert!(core.slots[0].accepted_at.is_some());
                 assert!(core.slots[1].accepted_at.is_none());
                 assert_eq!(core.slots[1].completion_end, Some(0));
                 assert_eq!(core.slots[1].edge.begin_ends, [50_000_100, 0]);
-                assert_eq!(&*events.borrow(), &["begin:pending", "poll:pending", "begin:pending"]);
+                assert_eq!(
+                    &*events.borrow(),
+                    &["begin:pending", "poll:pending", "begin:pending"]
+                );
             }
             let before = events.borrow().clone();
             core.cancel(None, 200, 500_000_000);
-            core.finish_with(&mut || Ok(201), &mut || panic!("finished failure cannot restart"));
+            core.finish_with(&mut || Ok(201), &mut || {
+                panic!("finished failure cannot restart")
+            });
             assert_eq!(core.cancel_end, Some(0));
             assert_eq!(*events.borrow(), before);
         }
@@ -876,13 +900,14 @@ mod tests {
         let events: Rc<RefCell<Vec<String>>> = Rc::default();
         let mut core = Core::new(Rc::default(), 500_000_000);
         for name in ["0", "1", "2", "3", "4", "5", "6", "7", "8"] {
-            core.admit(1, 0, |_| Ok(fake(name, events.clone()))).unwrap();
+            core.admit(1, 0, |_| Ok(fake(name, events.clone())))
+                .unwrap();
         }
         core.poll(&mut || Ok(2));
-        assert_eq!(&*events.borrow(), &[
-            "poll:0", "poll:1", "poll:2", "poll:3",
-            "poll:4", "poll:5", "poll:6", "poll:7",
-        ]);
+        assert_eq!(
+            &*events.borrow(),
+            &["poll:0", "poll:1", "poll:2", "poll:3", "poll:4", "poll:5", "poll:6", "poll:7",]
+        );
         core.poll(&mut || Ok(3));
         assert_eq!(events.borrow()[8], "poll:8");
         assert_eq!(events.borrow().len(), 16);
