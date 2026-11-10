@@ -16,8 +16,6 @@ class Pipe:
     def __init__(self, fd): self.fd, self.closed = fd, False
     def fileno(self): return self.fd
     def close(self): self.closed = True
-    def cancel_tighter(self, end): self.send("CANCEL", deadline_ns=end)
-    def drain_failed(self): return self.eof
 
 
 class Child:
@@ -39,6 +37,8 @@ class Peer:
         self.trace.append((self.name, "poll"))
         if self.first_fault: raise ProtocolError(self.first_fault)
     def close(self): self.closed = True
+    def cancel_tighter(self, end): self.send("CANCEL", deadline_ns=end)
+    def drain_failed(self): return self.eof
 
 
 def slot(name, pid, trace, end):
@@ -114,6 +114,22 @@ class RuntimeManagerTests(unittest.TestCase):
             self.manager._poll_slot(self.a, False)
         self.assertNotIn(101, [call.args[0] for call in read.call_args_list])
         self.assertFalse(self.a["stdout_eof"])
+
+    def test_review_each_stream_flags_attempted_after_an_independent_failure(self):
+        for failed in [100, 101, 102]:
+            owner = SourceOwner()
+            manager = OwnedChildren(self.root, {}, self.root, owner)
+            value = slot("a", 101, [], self.end)
+            value.update({"stdin_configured": False, "stdout_configured": False, "stderr_configured": False})
+            attempted = []
+            def configure(fd, blocking):
+                attempted.append(fd)
+                if fd == failed: raise OSError("inert-flags")
+            with patch("os.set_blocking", side_effect=configure), self.assertRaises(OSError):
+                manager._configure_pipes(value)
+            self.assertEqual(attempted, [100, 101, 102])
+            for name, fd in [("stdin",100),("stdout",101),("stderr",102)]:
+                self.assertEqual(value[name + "_configured"], fd != failed)
 
     def test_review_cached_owner_cannot_finish_clean_at_deadline(self):
         owner = SourceOwner()

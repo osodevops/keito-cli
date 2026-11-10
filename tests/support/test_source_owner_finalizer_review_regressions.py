@@ -74,11 +74,14 @@ class ReviewCases(unittest.TestCase):
 
     def test_late_true_stays_unknown_on_repeated_finish(self):
         owner=p.SourceOwner(); owner.deadline_ns=10; calls=[]
+        clock=[1]
         class Manager:
             def begin_cleanup(self,end): calls.append(('begin',end))
-            def poll_cleanup(self,end): calls.append(('poll',end)); return True
+            def poll_cleanup(self,end): calls.append(('poll',end)); clock[0]=10; return True
         manager=Manager(); owner.managers=[manager]
-        with patch.object(p.time,'monotonic_ns',side_effect=[1,2,3,10,11]): owner.finish_managers()
+        # The callback itself crosses the bound; the fixture no longer relies
+        # on how many fresh-clock observations the owner performs.
+        with patch.object(p.time,'monotonic_ns',side_effect=lambda:clock[0]): owner.finish_managers()
         with patch.object(p.time,'monotonic_ns',return_value=12): owner.finish_managers()
         self.assertEqual([x[0] for x in calls],['begin','poll','begin'])
         self.assertNotIn(id(manager),owner._finished_managers)

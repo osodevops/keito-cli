@@ -17,6 +17,28 @@ PEER = 12345
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_review_real_cancel_wire_only_moves_to_strictly_earlier_ends(self):
+        left, right = socket.socketpair()
+        self.addCleanup(left.close); self.addCleanup(right.close)
+        sender = Endpoint(left, NONCE, os.getpid())
+        receiver = Endpoint(right, NONCE, os.getpid())
+        for end, expected in [(1000,1000),(500,500),(1,1),(5000,1),(1,1)]:
+            sender.cancel_tighter(end)
+            receiver.receive(parent=True)
+            self.assertEqual(receiver.cancel_deadline_ns, expected)
+        self.assertFalse(receiver.settled)
+
+    def test_review_failed_control_writer_stays_unknown_until_actual_read_zero(self):
+        endpoint, writer = self.pair()
+        self.live(endpoint, writer)
+        self.frame(writer, "FAILED")
+        with self.assertRaises(ProtocolError): endpoint.receive()
+        self.assertFalse(endpoint.eof)
+        self.assertFalse(endpoint.drain_failed())
+        writer.shutdown(socket.SHUT_WR)
+        self.assertTrue(endpoint.drain_failed())
+        self.assertEqual(endpoint.first_fault, "PEER_FAILED")
+        self.assertFalse(endpoint.settled)
     def pair(self):
         reader, writer = socket.socketpair()
         self.addCleanup(reader.close)
@@ -419,7 +441,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(owner.unsettled)
         owner.deadline_ns = 1
         owner.finish_managers()
-        self.assertFalse(owner.unsettled)
+        # AO-05: accepted manager history is cached, but the containing owner
+        # cannot emit a fresh clean terminal after its inherited end.
+        self.assertTrue(owner.unsettled)
         self.assertEqual(observed, ["begin", "poll"])
 
     def test_owner_fault_yields_failed_not_clean_at_remote_peer(self):

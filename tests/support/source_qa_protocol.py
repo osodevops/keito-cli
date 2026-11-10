@@ -434,7 +434,7 @@ class SourceOwner:
     def limit_end(self, end):
         self.deadline_ns = end if self.deadline_ns is None else min(self.deadline_ns, end)
 
-    def pump_parent(self):
+    def pump_parent(self, deadline_reason="OWNER_DEADLINE"):
         if self.parent:
             try:
                 if self.first_fault is None:
@@ -449,7 +449,7 @@ class SourceOwner:
                 self.limit_end(self.parent.cancel_deadline_ns)
         at = self.now()
         if self.deadline_ns is not None and at >= self.deadline_ns:
-            self.fail("OWNER_DEADLINE")
+            self.fail(deadline_reason)
 
     def forward(self, events):
         try:
@@ -488,7 +488,7 @@ class SourceOwner:
         self.admission_closed = True
         if self.budget.first_fault or self.budget.owner_fault:
             self.fail(self.budget.first_fault or self.budget.owner_fault)
-        self.pump_parent()
+        self.pump_parent("MANAGER_CLEANUP_DEADLINE")
         deadline = self.now() + 4_000_000_000
         self.limit_end(deadline)
         if len(self.managers) > MAX_REGISTRATIONS:
@@ -510,7 +510,7 @@ class SourceOwner:
                 self.fail("MANAGER_CLEANUP_BEGIN")
         while pending:
             previous_end = self.deadline_ns
-            self.pump_parent()
+            self.pump_parent("MANAGER_CLEANUP_DEADLINE")
             if self.deadline_ns < previous_end:
                 for manager in pending:
                     try: manager.begin_cleanup(self.deadline_ns)
@@ -553,7 +553,7 @@ class SourceOwner:
                 time.sleep(0.001)
         if not self._forward_ledger.complete():
             self.fail("UNWAITED_FORWARD_REGISTRATION")
-        self.pump_parent()
+        self.pump_parent("MANAGER_CLEANUP_DEADLINE")
 
     def __exit__(self, exception_type, exception, traceback):
         global CURRENT
