@@ -382,6 +382,7 @@ struct Settlement {
     release_sent: bool,
     group_absent: bool,
     expected_ready: Option<String>,
+    expected_park: Option<String>,
     policy: CleanupPolicy,
 }
 impl Settlement {
@@ -397,6 +398,7 @@ impl Settlement {
             release_sent: false,
             group_absent: false,
             expected_ready: None,
+            expected_park: None,
             policy,
         }
     }
@@ -494,6 +496,9 @@ impl Settlement {
                         return Err(refused("GROUP_READY"));
                     }
                     self.expected_ready = None;
+                } else if let Some(expected) = &self.expected_park {
+                    if body != *expected { return Err(refused("GROUP_PARK")); }
+                    self.expected_park = None;
                 } else {
                     if body != format!("GONE|{pid}") || self.progress.phase != Phase::Cleaning {
                         return Err(refused("GROUP_TERMINAL"));
@@ -584,6 +589,8 @@ pub struct GroupLease {
     keeper_pid: libc::pid_t,
     owner_pgid: libc::pid_t,
     sid: libc::pid_t,
+    ready_end: u64,
+    park_end: Option<u64>,
 }
 impl GroupLease {
     pub fn spawn_keeper(
@@ -704,6 +711,8 @@ impl GroupLease {
             keeper_pid,
             owner_pgid,
             sid,
+            ready_end: policy.setup_end(current, lifetime_deadline_ns),
+            park_end: None,
         };
         drop(inherited);
         drop(child_end);
@@ -765,11 +774,34 @@ impl GroupLease {
         })();
         self.checked(result)
     }
-    /// Consume the ORIGINAL prepared Command. Its join callback can never escape
-    /// back to a caller for reuse after release. No argv/env/FD reconstruction.
-    pub fn start(&mut self, mut command: Command) -> io::Result<()> {
+    /// One bounded READY turn for the product runner. The setup cap was fixed
+    /// before keeper spawn; an incomplete read never grants a fresh interval.
+    pub(super) fn poll_ready(&mut self) -> io::Result<bool> {
         let result = (|| {
             self.check_admission()?;
+            if self.settlement.progress.phase != Phase::AwaitReady {
+                return Err(refused("GROUP_STATE"));
+            }
+            if now()? >= self.ready_end { return Err(refused("GROUP_DEADLINE")); }
+            let body = self.channel.receive()?;
+            if now()? >= self.ready_end { return Err(refused("GROUP_DEADLINE")); }
+            let Some(body) = body else {
+                if self.channel.eof { return Err(refused("GROUP_EOF")); }
+                return Ok(false);
+            };
+            if Some(&body) != self.settlement.expected_ready.as_ref() {
+                return Err(refused("GROUP_READY"));
+            }
+            self.settlement.expected_ready = None;
+            self.settlement.progress.advance(Phase::AwaitReady, Phase::Ready)?;
+            Ok(true)
+        })();
+        self.checked(result)
+    }
+    /// Consume the ORIGINAL prepared Command. Its join callback can never escape
+    /// back to a caller for reuse after release. No argv/env/FD reconstruction.
+    fn spawn_joined(&mut self, mut command: Command) -> io::Result<()> {
+        self.check_admission()?;
             if self.settlement.progress.phase != Phase::Ready || self.workload.is_some() {
                 return Err(refused("GROUP_START_STATE"));
             }
@@ -797,6 +829,11 @@ impl GroupLease {
             self.settlement
                 .progress
                 .advance(Phase::Ready, Phase::Joined)?;
+        Ok(())
+    }
+    pub fn start(&mut self, command: Command) -> io::Result<()> {
+        let result = (|| {
+            self.spawn_joined(command)?;
             self.check_admission()?;
             self.channel.send("PARK")?;
             let response = self.channel.wait_frame(
@@ -818,6 +855,54 @@ impl GroupLease {
         })();
         self.checked(result)
     }
+    /// Retain the original workload and return before PARKED. Pipes can then
+    /// be owned/drained by Scope while this handshake remains pending.
+    pub(super) fn start_pending(&mut self, command: Command) -> io::Result<()> {
+        let result = (|| {
+            self.check_admission()?;
+            if self.settlement.progress.phase != Phase::Ready || self.workload.is_some() {
+                return Err(refused("GROUP_START_STATE"));
+            }
+            let at = now()?;
+            let end = self.settlement.policy.setup_end(at, self.settlement.progress.deadline_ns);
+            if at >= end { return Err(refused("GROUP_DEADLINE")); }
+            self.spawn_joined(command)?;
+            self.park_end = Some(end);
+            self.settlement.expected_park = Some(format!("PARKED|{}|{}|{}", self.keeper_pid, self.owner_pgid, self.sid));
+            self.check_admission()?;
+            self.channel.send("PARK")
+        })();
+        self.checked(result)
+    }
+    pub(super) fn poll_parked(&mut self) -> io::Result<bool> {
+        let result = (|| {
+            self.check_admission()?;
+            if self.settlement.progress.phase != Phase::Joined {
+                return Err(refused("GROUP_STATE"));
+            }
+            let end = self.park_end.ok_or_else(|| refused("GROUP_STATE"))?;
+            if now()? >= end { return Err(refused("GROUP_DEADLINE")); }
+            let body = self.channel.receive()?;
+            if now()? >= end { return Err(refused("GROUP_DEADLINE")); }
+            let Some(body) = body else {
+                if self.channel.eof { return Err(refused("GROUP_EOF")); }
+                return Ok(false);
+            };
+            if body != format!("PARKED|{}|{}|{}", self.keeper_pid, self.owner_pgid, self.sid) {
+                return Err(refused("GROUP_PARK"));
+            }
+            self.settlement.expected_park = None;
+            self.settlement.progress.advance(Phase::Joined, Phase::Parked)?;
+            Ok(true)
+        })();
+        self.checked(result)
+    }
+    pub(super) fn poll_workload(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.settlement.collect(&mut self.keeper, self.workload.as_mut());
+        if self.settlement.keeper_status.is_some() { self.fail("GROUP_KEEPER_FAILED"); }
+        if let Some(reason) = self.settlement.progress.first_fault { return Err(refused(reason)); }
+        Ok(self.settlement.workload_status)
+    }
     /// Transferred pipes MUST have a caller-scoped close/drain/EOF owner. Neither
     /// GroupProof nor terminal keeper EOF proves those output streams drained.
     pub fn stdin(&mut self) -> Option<std::process::ChildStdin> {
@@ -831,6 +916,12 @@ impl GroupLease {
     }
     pub fn begin_cleanup(&mut self, deadline_ns: u64) -> io::Result<()> {
         self.owner.borrow_mut().admission_closed = true;
+        self.begin_local_cleanup(deadline_ns)
+    }
+    /// Slot-local settlement does not close containing admission. An operation
+    /// fault still poisons Scope, but does not itself invalidate an intact
+    /// keeper channel's independent resource observations.
+    pub(super) fn begin_local_cleanup(&mut self, deadline_ns: u64) -> io::Result<()> {
         if let Some(child) = &mut self.workload {
             child.stdin.take();
         }
@@ -852,6 +943,9 @@ impl GroupLease {
         if let Some(reason) = owner_fault {
             self.fail(reason.0);
         }
+        self.poll_local_cleanup()
+    }
+    pub(super) fn poll_local_cleanup(&mut self) -> io::Result<Option<GroupProof>> {
         // Always collect available waits, including on clock failure/expiry.
         let result = self.settlement.poll(
             &mut now,
