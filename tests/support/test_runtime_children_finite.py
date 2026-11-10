@@ -164,6 +164,102 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertEqual(calls[-1], (signal.SIGTERM, old))
         self.assertEqual(len(calls), 3)
 
+    def test_second_review_unspawned_failed_close_remains_unknown(self):
+        self.a["child"] = None
+        def cannot_close(): raise OSError("inert-control-close")
+        self.a["endpoint"].close = cannot_close
+        self.manager._poll_slot(self.a, False)
+        self.assertFalse(self.a["control_closed"])
+        self.assertFalse(self.a["collected"])
+
+    def test_second_review_expiry_after_a_poll_broadcasts_before_b_progress(self):
+        clock = [100]
+        self.a["end"] = 200
+        self.b["end"] = 1000
+        def progress(value, accepting):
+            self.trace.append((value["label"], "ordinary-poll"))
+            if value is self.a: clock[0] = 200
+        self.manager._poll_slot = progress
+        with patch("time.monotonic_ns", side_effect=lambda: clock[0]): self.manager.poll()
+        b_poll = self.trace.index(("b", "ordinary-poll"))
+        self.assertTrue(all(any(event[:2] == (name, "CANCEL") for event in self.trace[:b_poll]) for name in ["a", "b"]))
+
+    def test_second_review_receipt_clock_failure_preserves_original_and_zeroes_siblings(self):
+        self.a["accepted"] = 5
+        self.a["collected"] = True
+        self.a["child"].returncode = 0
+        (self.root / "a-result.json").write_text("retained")
+        with patch("time.monotonic_ns", side_effect=OSError("inert-clock")):
+            try:
+                self.manager.complete(self.a)
+            except BaseException as error:
+                observed = error
+        self.assertIsInstance(observed, FileExistsError)
+        self.assertIs(self.manager.first_error, observed)
+        self.assertEqual(self.owner.deadline_ns, 0)
+        self.assertEqual(self.manager.cleanup_end, 0)
+        self.assertTrue(self.b["cancel_sent"])
+
+    def test_second_review_failed_rollback_still_exits_owner_and_restores_current(self):
+        import source_qa_protocol as protocol
+        previous = protocol.CURRENT
+        manager = OwnedChildren(self.root, {}, self.root)
+        original = OSError("inert-install")
+        calls = []
+        def install(signum, handler):
+            calls.append(signum)
+            if len(calls) == 2: raise original
+            if len(calls) == 3: raise OSError("inert-restore")
+            return object()
+        with patch("signal.signal", side_effect=install):
+            try: manager.__enter__()
+            except BaseException as error: observed = error
+        self.assertIs(observed, original)
+        self.assertIs(protocol.CURRENT, previous)
+        self.assertTrue(manager.owner._closed)
+
+    def test_second_review_late_cleanup_never_becomes_clean_manager_proof(self):
+        self.owner.managers = [self.manager]
+        self.owner.deadline_ns = 4000
+        self.a["end"] = self.b["end"] = 900
+        for value in [self.a, self.b]:
+            value["endpoint"].settled = value["endpoint"].eof = True
+            value["child"].returncode = 0
+        clock = [800]
+        original_poll = self.a["child"].poll
+        def cross_bound(): clock[0] = 901; return original_poll()
+        self.a["child"].poll = cross_bound
+        with patch("time.monotonic_ns", side_effect=lambda: clock[0]), patch("os.read", return_value=b""):
+            self.owner.finish_managers()
+        self.assertTrue(self.a["collected"] and self.b["collected"])
+        self.assertNotIn(id(self.manager), self.owner._finished_managers)
+        self.assertTrue(self.owner.unsettled)
+
+    def test_second_review_admission_gate_clock_failure_never_calls_popen(self):
+        owner = SourceOwner()
+        manager = OwnedChildren(self.root, {}, self.root, owner)
+        manager.entered = True
+        armed = [False]
+        def mask(*args): armed[0] = True; return set()
+        def now():
+            if armed[0]:
+                armed[0] = False
+                raise OSError("inert-gate-clock")
+            return 100
+        # First gate check succeeds. The failure is the following fresh read.
+        original_check = owner.check
+        def gate_check():
+            if armed[0]:
+                armed[0] = False
+                original_check()
+                armed[0] = True
+            else: original_check()
+        with patch("signal.pthread_sigmask", side_effect=mask), patch("time.monotonic_ns", side_effect=now), patch.object(owner, "check", side_effect=gate_check), patch("subprocess.Popen", side_effect=RuntimeError("POpen must not execute")) as popen:
+            with self.assertRaises(BaseException): manager.start("clock-gate", ["never-execute"], 1)
+        popen.assert_not_called()
+        self.assertEqual(owner.deadline_ns, 0)
+        self.assertEqual(manager.cleanup_end, 0)
+
     def test_review_cached_owner_cannot_finish_clean_at_deadline(self):
         owner = SourceOwner()
         owner.deadline_ns = 100
