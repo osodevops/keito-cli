@@ -1,7 +1,7 @@
 """Developer-only cancellation/settlement metadata; no capture/auth authority.
 
-Not yet connected to process-owning QA runners. A clean protocol trace alone
-never proves reserved-group absence or an actual direct wait.
+Connected to retained cooperative runtime managers. A clean protocol trace
+alone never proves reserved-group absence or an actual direct wait.
 """
 import os
 import signal
@@ -316,7 +316,7 @@ class Endpoint:
 
 
 class SourceOwner:
-    """Permanent owner fault/admission latch; not yet integrated into runners."""
+    """Permanent owner fault/admission latch with retained runtime managers."""
     def __init__(self):
         self.parent = None
         self.managers = []

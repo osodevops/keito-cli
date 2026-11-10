@@ -41,7 +41,7 @@ pub(crate) struct CommandOwner<'a> {
     end: u64,
 }
 enum ScopeRef<'a> {
-    Owned(Scope),
+    Owned(Box<Scope>),
     Borrowed(&'a mut Scope),
 }
 impl std::ops::Deref for ScopeRef<'_> {
@@ -80,7 +80,7 @@ impl CommandOwner<'static> {
         let image = VerifiedKeeperImage::open(&identity.guard_path, &identity.guard_sha256)
             .map_err(|_| refused())?;
         Ok(Self {
-            scope: ScopeRef::Owned(Scope::local_entry(end).map_err(|_| refused())?),
+            scope: ScopeRef::Owned(Box::new(Scope::local_entry(end).map_err(|_| refused())?)),
             image: Image::Owned(image),
             end,
         })

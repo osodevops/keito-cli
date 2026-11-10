@@ -1,5 +1,6 @@
 //! Explicit entry-thread command owner. No implicit/TLS runner or positive
-//! capture authority. Cooperative edges and sealed product images remain pending.
+//! capture authority. Cooperative children require terminal, physical EOF and
+//! retained direct waits; opaque leaves use the paired guard's reserved groups.
 use super::{
     group::{CleanupPolicy, GroupLease},
     io::{CommandOutput, IoFacts, IoPlan, PipeIo},
@@ -216,11 +217,12 @@ impl Edge for GroupEdge {
             (2, Some(facts.keeper_pid), facts.keeper_status),
             (3, facts.workload_pid, facts.workload_status),
         ] {
-            if !self.published[index] && pid.is_some() && (index < 2 || status.is_some()) {
+            let Some(pid) = pid else { continue; };
+            if !self.published[index] && (index < 2 || status.is_some()) {
                 self.published[index] = true;
                 let kind = if index < 2 { "REGISTER" } else { "WAITED" };
                 let value = status.map(ExitStatus::into_raw).unwrap_or(0);
-                events.push(format!("{kind}|{parent}|{}|{nonce}|{value}", pid.unwrap()));
+                events.push(format!("{kind}|{parent}|{pid}|{nonce}|{value}"));
             }
         }
         events
@@ -937,8 +939,8 @@ impl Scope {
         }
         result
     }
-    /// QA-owned700 image constructor only. A sealed official-pair image entry
-    /// point is still required before wiring installed product call sites.
+    /// QA-owned700 image constructor only. Product callers use the separate
+    /// compiled-pair verified-image entry and cannot supply this QA authority.
     pub fn start_owned_opaque(
         &mut self,
         command: Command,

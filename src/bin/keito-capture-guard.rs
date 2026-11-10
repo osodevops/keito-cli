@@ -43,25 +43,9 @@ fn main() {
         } else {
             &args[..]
         };
-        let duration = 600_000_000;
-        let mut scope = match process_ownership::scope::Scope::entry_from_environment(duration) {
-            Ok(Some(scope)) => scope,
-            Ok(None) => {
-                let Ok(at) = process_ownership::scope::monotonic_now() else {
-                    return;
-                };
-                match process_ownership::scope::Scope::local_entry(at.saturating_add(duration)) {
-                    Ok(scope) => scope,
-                    Err(_) => return,
-                }
-            }
-            Err(_) => return,
-        };
         // Dispatch and guardian share one durable prelaunch entry. No image
         // hash/verification or child admission precedes marker publication.
-        let result = native_capture_guard::run(fields, &mut scope);
-        let clean = scope.finish().clean && result.is_ok();
-        scope.publish_terminal(clean);
+        let _ = native_capture_guard::run(fields);
         // Installed hooks remain silent/fail-open; a failed/absent ownership
         // terminal and retained durable marker independently forbid time proof.
     }

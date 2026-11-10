@@ -354,10 +354,10 @@ mod unix {
         }
         sync(state)
     }
-    pub fn run(
-        args: &[std::ffi::OsString],
-        scope: &mut crate::process_ownership::scope::Scope,
-    ) -> Result<(), ()> {
+    pub fn run(args: &[std::ffi::OsString]) -> Result<(), ()> {
+        // This entry owns no Child before publication. Signals only latch,
+        // and an interruption still reaches the durable marker check below.
+        let _prelaunch_signals = crate::process_ownership::signals::install().map_err(|_| ())?;
         let started = Instant::now();
         // Share a CLOCK_MONOTONIC absolute bound with core leaf commands. This
         // reserves work inside the existing guard budget, never after it.
@@ -454,6 +454,14 @@ mod unix {
         }
         // Even a clock refusal must leave the already durable pending marker.
         let leaf_end = leaf_start.ok_or(())?.saturating_add(500_000_000);
+        let hard_end = leaf_start.ok_or(())?.saturating_add(600_000_000);
+        // Parent validation/clock refusal and all executable preparation occur
+        // AFTER the durable pending marker. No failed entry loses the boundary.
+        let mut scope = match crate::process_ownership::scope::Scope::entry_from_environment(600_000_000).map_err(|_| ())? {
+            Some(mut scope) => { scope.tighten_end(hard_end); scope },
+            None => crate::process_ownership::scope::Scope::local_entry(hard_end).map_err(|_| ())?,
+        };
+        let result = (|| {
         // This digest comes from the fixed managed registration, never stdin.
         // Linux executes the descriptor. Darwin checks its managed pathname
         // immediately before exec and carries this verified imageFD for a
@@ -648,20 +656,21 @@ mod unix {
             unlock(&publication);
         }
         Ok(())
+        })();
+        let clean = scope.finish().clean && result.is_ok();
+        scope.publish_terminal(clean);
+        result
     }
 }
 #[cfg(unix)]
-pub fn run(
-    args: &[std::ffi::OsString],
-    scope: &mut crate::process_ownership::scope::Scope,
-) -> Result<(), ()> {
+pub fn run(args: &[std::ffi::OsString]) -> Result<(), ()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        unix::run(args, scope)
+        unix::run(args)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (args, scope);
+        let _ = args;
         Err(())
     }
 }
