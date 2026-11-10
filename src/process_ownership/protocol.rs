@@ -252,6 +252,9 @@ impl Endpoint {
         self.sent_cancel = true;
         self.write_frame(&format!("CANCEL|{}|{}", std::process::id(), deadline_ns))
     }
+    pub fn send_cancel_tighter(&mut self, deadline_ns: u64) -> Result<()> {
+        self.send_cancel(deadline_ns)
+    }
     pub fn send_terminal(&mut self, clean: bool) -> Result<()> {
         if clean {
             self.check()?;

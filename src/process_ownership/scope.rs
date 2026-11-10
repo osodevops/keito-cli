@@ -247,7 +247,7 @@ impl Edge for CooperativeEdge {
             self.cancel_sent = true;
             // V1's cancellation grammar requires a positive absolute end.
             // Zero is an already-expired local end, never a fresh allowance.
-            if let Err(e) = self.endpoint.send_cancel(end.max(1)) {
+            if let Err(e) = self.endpoint.send_cancel_tighter(end.max(1)) {
                 self.first_fault.get_or_insert(e.0);
                 return Err(error(e.0));
             }
@@ -392,6 +392,9 @@ impl<E: Edge> Core<E> {
     }
     fn poison(&mut self, reason: &'static str) {
         self.owner.borrow_mut().poison(ProtocolError(reason));
+    }
+    fn admission_clock(&mut self, clock: &mut impl FnMut() -> io::Result<u64>) -> io::Result<u64> {
+        clock()
     }
     fn admit(
         &mut self,
@@ -815,7 +818,7 @@ impl Scope {
         plan: Option<IoPlan>,
     ) -> io::Result<SlotId> {
         self.poll();
-        let at = now()?;
+        let at = self.core.admission_clock(&mut now)?;
         let mut random = [0u8; 16];
         if unsafe { libc::getentropy(random.as_mut_ptr().cast(), random.len()) } != 0 {
             return Err(error("SCOPE_RANDOM"));
@@ -1130,6 +1133,32 @@ impl Drop for Scope {
 mod tests {
     use super::*;
     use std::{cell::RefCell, os::unix::process::ExitStatusExt};
+    #[test]
+    fn native_repair_admission_clock_failure_zeroes_retained_sibling() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut core = Core::new(Rc::default(), 500_000_000);
+        core.admit(1, 0, |_| Ok(fake("a", events.clone()))).unwrap();
+        assert!(core.admission_clock(&mut || Err(error("INERT_CLOCK"))).is_err());
+        assert_eq!(core.cancel_end, Some(0));
+        assert_eq!(core.slots[0].completion_end, Some(0));
+        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("SCOPE_CLOCK")));
+    }
+    #[test]
+    fn native_repair_unattached_entry_does_not_install_signal_handlers() {
+        let source = include_str!("scope.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
+        let entry = source.split("pub fn entry_from_environment").nth(1).unwrap().split("pub fn hard_end").next().unwrap();
+        assert!(entry.find("attachment::consume").unwrap() < entry.find("signals::install").unwrap());
+    }
+    #[test]
+    fn native_repair_public_metadata_turn_does_not_scan_all_history() {
+        let source = include_str!("scope.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!source.contains("for slot in &mut core.slots"));
+    }
+    #[test]
+    fn native_repair_dispatch_enters_durable_guard_without_preparation_child() {
+        let source = include_str!("../bin/keito-capture-guard.rs");
+        assert!(!source.contains("fn dispatch_guard("));
+    }
     struct Fake {
         events: Rc<RefCell<Vec<String>>>,
         name: &'static str,
