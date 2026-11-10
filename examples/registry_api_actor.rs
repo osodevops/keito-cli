@@ -255,7 +255,9 @@ mod unix {
             count = count.saturating_add(1);
             cf_text_encoding |= key == std::ffi::OsStr::new("__CF_USER_TEXT_ENCODING");
         }
-        if (!macos && count == 10 && !cf_text_encoding) || (macos && count == 11 && cf_text_encoding) {
+        if (!macos && count == 10 && !cf_text_encoding)
+            || (macos && count == 11 && cf_text_encoding)
+        {
             None
         } else if count == 11 && cf_text_encoding {
             Some("ENV_KEYS_CF_TEXT_ENCODING")
@@ -308,10 +310,16 @@ mod unix {
             }
         }
         #[cfg(target_os = "macos")]
-        if !platform_encoding_is_exact(std::env::var_os("__CF_USER_TEXT_ENCODING").as_deref(), unsafe {libc::getuid()}) {
+        if !platform_encoding_is_exact(
+            std::env::var_os("__CF_USER_TEXT_ENCODING").as_deref(),
+            unsafe { libc::getuid() },
+        ) {
             return Err("PLATFORM_ENV");
         }
-        if let Some(reason) = environment_key_refusal(std::env::vars_os().map(|(key, _)| key), cfg!(target_os = "macos")) {
+        if let Some(reason) = environment_key_refusal(
+            std::env::vars_os().map(|(key, _)| key),
+            cfg!(target_os = "macos"),
+        ) {
             return Err(reason);
         }
         Ok(())
@@ -591,7 +599,10 @@ mod unix {
                     self.safety.to_string(),
                 ]);
             #[cfg(target_os = "macos")]
-            command.env("__CF_USER_TEXT_ENCODING", platform_encoding_value(unsafe {libc::getuid()}));
+            command.env(
+                "__CF_USER_TEXT_ENCODING",
+                platform_encoding_value(unsafe { libc::getuid() }),
+            );
             unsafe {
                 command.pre_exec(move || {
                     if libc::write(mf, b"P".as_ptr().cast(), 1) != 1
@@ -974,15 +985,24 @@ mod unix {
             let ten: Vec<_> = (0..10)
                 .map(|i| std::ffi::OsString::from(format!("SYNTHETIC_{i}")))
                 .collect();
-            assert_eq!(environment_key_refusal(ten.clone().into_iter(), false), None);
-            assert_eq!(environment_key_refusal(ten.clone().into_iter(), true), Some("ENV_KEYS"));
+            assert_eq!(
+                environment_key_refusal(ten.clone().into_iter(), false),
+                None
+            );
+            assert_eq!(
+                environment_key_refusal(ten.clone().into_iter(), true),
+                Some("ENV_KEYS")
+            );
             let mut known = ten.clone();
             known.push("__CF_USER_TEXT_ENCODING".into());
             assert_eq!(
                 environment_key_refusal(known.clone().into_iter(), false),
                 Some("ENV_KEYS_CF_TEXT_ENCODING")
             );
-            assert_eq!(environment_key_refusal(known.clone().into_iter(), true), None);
+            assert_eq!(
+                environment_key_refusal(known.clone().into_iter(), true),
+                None
+            );
             let mut unknown = ten;
             unknown.push("UNPRINTED_EXTRA_NAME".into());
             assert_eq!(
@@ -990,15 +1010,30 @@ mod unix {
                 Some("ENV_KEYS")
             );
             known.push("ANOTHER_UNPRINTED_NAME".into());
-            assert_eq!(environment_key_refusal(known.into_iter(), true), Some("ENV_KEYS"));
+            assert_eq!(
+                environment_key_refusal(known.into_iter(), true),
+                Some("ENV_KEYS")
+            );
         }
 
         #[test]
         fn encoding_value_cannot_select_another_uid_or_nonzero_encoding() {
             let exact = platform_encoding_value(501);
-            assert!(platform_encoding_is_exact(Some(std::ffi::OsStr::new(&exact)), 501));
-            for value in [None, Some("0x0:0:0"), Some("0x1F5:1:0"), Some("0x1F5:0:1"), Some("/private/secret")] {
-                assert!(!platform_encoding_is_exact(value.map(std::ffi::OsStr::new), 501));
+            assert!(platform_encoding_is_exact(
+                Some(std::ffi::OsStr::new(&exact)),
+                501
+            ));
+            for value in [
+                None,
+                Some("0x0:0:0"),
+                Some("0x1F5:1:0"),
+                Some("0x1F5:0:1"),
+                Some("/private/secret"),
+            ] {
+                assert!(!platform_encoding_is_exact(
+                    value.map(std::ffi::OsStr::new),
+                    501
+                ));
             }
         }
     }
