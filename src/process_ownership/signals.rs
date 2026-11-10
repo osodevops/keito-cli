@@ -12,18 +12,33 @@ extern "C" fn interrupted(_: libc::c_int) {
 pub(crate) fn pending() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
 }
-pub(crate) fn install() -> io::Result<()> {
-    for signal in [libc::SIGINT, libc::SIGTERM] {
-        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
-        action.sa_sigaction = interrupted as *const () as libc::sighandler_t;
-        unsafe {
-            libc::sigemptyset(&mut action.sa_mask);
-            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
-                return Err(io::Error::last_os_error());
+pub(super) struct InstalledHandlers {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+impl Drop for InstalledHandlers {
+    fn drop(&mut self) {
+        for (signal, previous) in self.previous.iter().rev() {
+            if unsafe { libc::sigaction(*signal, previous, std::ptr::null_mut()) } != 0 {
+                INTERRUPTED.store(true, Ordering::Relaxed);
             }
         }
     }
-    Ok(())
+}
+pub(super) fn install() -> io::Result<InstalledHandlers> {
+    let mut guard = InstalledHandlers { previous: Vec::with_capacity(2) };
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = interrupted as *const () as libc::sighandler_t;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(signal, &action, &mut previous) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        guard.previous.push((signal, previous));
+    }
+    Ok(guard)
 }
 /// The caller retains the returned Child before restoring this mask. The
 /// child's pre_exec callback restores the original mask using libc only.

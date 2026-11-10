@@ -80,7 +80,7 @@ impl CommandOwner<'static> {
         let image = VerifiedKeeperImage::open(&identity.guard_path, &identity.guard_sha256)
             .map_err(|_| refused())?;
         Ok(Self {
-            scope: ScopeRef::Owned(Scope::with_owner(Default::default(), end)),
+            scope: ScopeRef::Owned(Scope::local_entry(end).map_err(|_| refused())?),
             image: Image::Owned(image),
             end,
         })

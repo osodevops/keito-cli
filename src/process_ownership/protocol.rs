@@ -141,6 +141,7 @@ pub struct Endpoint {
     sent_live: bool,
     sent_terminal: bool,
     sent_cancel: bool,
+    sent_cancel_end: Option<u64>,
     failed_attempted: bool,
     pub last_poll: PollWork,
 }
@@ -193,6 +194,7 @@ impl Endpoint {
             sent_live: false,
             sent_terminal: false,
             sent_cancel: false,
+            sent_cancel_end: None,
             failed_attempted: false,
             last_poll: PollWork::default(),
         })
@@ -250,10 +252,22 @@ impl Endpoint {
             return Err(self.poison(ProtocolError("CANCEL_STATE")));
         }
         self.sent_cancel = true;
+        self.sent_cancel_end = Some(deadline_ns);
         self.write_frame(&format!("CANCEL|{}|{}", std::process::id(), deadline_ns))
     }
     pub fn send_cancel_tighter(&mut self, deadline_ns: u64) -> Result<()> {
-        self.send_cancel(deadline_ns)
+        self.check()?;
+        if deadline_ns == 0 || self.sent_terminal || self.sent_live {
+            return Err(self.poison(ProtocolError("CANCEL_STATE")));
+        }
+        match self.sent_cancel_end {
+            None => self.send_cancel(deadline_ns),
+            Some(previous) if deadline_ns >= previous => Ok(()),
+            Some(_) => {
+                self.sent_cancel_end = Some(deadline_ns);
+                self.write_frame(&format!("CANCEL|{}|{}", std::process::id(), deadline_ns))
+            }
+        }
     }
     pub fn send_terminal(&mut self, clean: bool) -> Result<()> {
         if clean {

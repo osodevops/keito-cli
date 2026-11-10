@@ -232,7 +232,7 @@ struct CooperativeEdge {
     endpoint: Endpoint,
     nonce: String,
     status: Option<ExitStatus>,
-    cancel_sent: bool,
+    cancel_sent: Option<u64>,
     registered: bool,
     waited: bool,
     first_fault: Option<&'static str>,
@@ -243,8 +243,9 @@ impl Edge for CooperativeEdge {
         if let Some(pipes) = &mut self.pipes {
             pipes.cancel_input();
         }
-        if !self.cancel_sent && self.status.is_none() && !self.endpoint.is_settled() {
-            self.cancel_sent = true;
+        if self.status.is_none() && !self.endpoint.is_settled()
+            && self.cancel_sent.is_none_or(|previous| end < previous) {
+            self.cancel_sent = Some(end);
             // V1's cancellation grammar requires a positive absolute end.
             // Zero is an already-expired local end, never a fresh allowance.
             if let Err(e) = self.endpoint.send_cancel_tighter(end.max(1)) {
@@ -394,7 +395,13 @@ impl<E: Edge> Core<E> {
         self.owner.borrow_mut().poison(ProtocolError(reason));
     }
     fn admission_clock(&mut self, clock: &mut impl FnMut() -> io::Result<u64>) -> io::Result<u64> {
-        clock()
+        match clock() {
+            Ok(at) => Ok(at),
+            Err(_) => {
+                self.cancel(Some("SCOPE_CLOCK"), 0, 0);
+                Err(error("SCOPE_CLOCK"))
+            }
+        }
     }
     fn admit(
         &mut self,
@@ -678,12 +685,13 @@ pub struct Scope {
     upstream: Option<Endpoint>,
     ledger: BTreeMap<Registration, bool>,
     terminal_sent: bool,
+    _signals: Option<super::signals::InstalledHandlers>,
 }
 impl Scope {
     /// Called on the entry thread after image bootstrap and before CLI parsing
     /// or runtime construction. Absence and malformed metadata are distinct.
     pub fn entry_from_environment(local_ns: u64) -> io::Result<Option<Self>> {
-        super::signals::install()?;
+        if !super::attachment::present() { return Ok(None); }
         let at = now()?;
         let end = at
             .checked_add(local_ns)
@@ -691,6 +699,7 @@ impl Scope {
         let Some((attachment, stream)) = super::attachment::consume(at, end)? else {
             return Ok(None);
         };
+        let signals = super::signals::install()?;
         let owner: SharedOwner = Default::default();
         let mut endpoint = Endpoint::with_owner(
             stream,
@@ -705,7 +714,14 @@ impl Scope {
             upstream: Some(endpoint),
             ledger: BTreeMap::new(),
             terminal_sent: false,
+            _signals: Some(signals),
         }))
+    }
+    pub fn local_entry(hard_end: u64) -> io::Result<Self> {
+        let signals = super::signals::install()?;
+        let mut scope = Self::with_owner(Default::default(), hard_end);
+        scope._signals = Some(signals);
+        Ok(scope)
     }
     pub fn hard_end(&self) -> u64 {
         self.core.hard_end
@@ -746,12 +762,14 @@ impl Scope {
             upstream: None,
             ledger: BTreeMap::new(),
             terminal_sent: false,
+            _signals: None,
         }
     }
     fn pump(
         core: &mut Core<ProductEdge>,
         upstream: &mut Option<Endpoint>,
         ledger: &mut BTreeMap<Registration, bool>,
+        turn_start: usize,
     ) {
         if super::signals::pending() {
             match now() {
@@ -775,7 +793,9 @@ impl Scope {
                 }
             }
         }
-        for slot in &mut core.slots {
+        let len = core.slots.len();
+        for offset in 0..len.min(SLOTS_PER_TURN) {
+            let slot = &mut core.slots[(turn_start + offset) % len];
             for event in slot.edge.take_events() {
                 let result = if let Some(endpoint) = upstream {
                     endpoint.metadata(&event)
@@ -861,11 +881,20 @@ impl Scope {
         let mask = super::signals::AdmissionMask::block(command)?;
         let admission_end = self.core.hard_end.saturating_sub(RESERVE_NS);
         let capacity = plan.as_ref().map(IoPlan::capacity).unwrap_or(0);
+        let mut clock_failed = false;
         let result = self.core.admit(at, capacity, |owner| {
             let endpoint =
-                Endpoint::with_owner(parent, nonce.clone(), None, owner).map_err(|e| error(e.0))?;
+                Endpoint::with_owner(parent, nonce.clone(), None, owner.clone()).map_err(|e| error(e.0))?;
             let pipes = plan.map(IoPlan::prepare).transpose()?;
-            if now()? >= admission_end || super::signals::pending() {
+            let fresh = match now() {
+                Ok(at) => at,
+                Err(_) => {
+                    clock_failed = true;
+                    owner.borrow_mut().poison(ProtocolError("SCOPE_CLOCK"));
+                    return Err(error("SCOPE_CLOCK"));
+                }
+            };
+            if fresh >= admission_end || super::signals::pending() {
                 return Err(error("SCOPE_ADMISSION"));
             }
             let child = command.spawn()?;
@@ -875,7 +904,7 @@ impl Scope {
                 endpoint,
                 nonce,
                 status: None,
-                cancel_sent: false,
+                cancel_sent: None,
                 registered: false,
                 waited: false,
                 first_fault: None,
@@ -901,6 +930,7 @@ impl Scope {
         drop(mask);
         drop(inherited);
         drop(child_end);
+        if clock_failed { self.core.cancel(Some("SCOPE_CLOCK"), 0, 0); return result; }
         self.poll();
         if result.is_err() {
             self.begin_cancel(ProtocolError("SCOPE_COOPERATIVE_SPAWN"), self.core.hard_end);
@@ -1011,9 +1041,10 @@ impl Scope {
     /// A bounded hot-path turn. Full retained reports are explicit snapshots,
     /// never an allocation/whole-registry scan on every command I/O poll.
     pub fn poll(&mut self) {
-        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger);
+        let start = self.core.cursor;
+        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger, start);
         self.core.poll(&mut now);
-        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger);
+        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger, start);
     }
     pub fn request_complete(&mut self, id: &SlotId) -> io::Result<()> {
         let result = match now() {
@@ -1050,12 +1081,18 @@ impl Scope {
     pub fn finish(&mut self) -> ScopeReport {
         let upstream = &mut self.upstream;
         let ledger = &mut self.ledger;
+        let mut before = true;
+        let mut turn_start = self.core.cursor;
         self.core.finish_with_progress(
             &mut now,
             &mut || {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             },
-            &mut |core| Self::pump(core, upstream, ledger),
+            &mut |core| {
+                if before { turn_start = core.cursor; }
+                Self::pump(core, upstream, ledger, turn_start);
+                before = !before;
+            },
         );
         if self.ledger.values().any(|waited| !*waited) {
             self.core.poison("SCOPE_ACTIVE_REGISTRATION");
@@ -1068,6 +1105,7 @@ impl Scope {
         if self.terminal_sent {
             return false;
         }
+        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger, self.core.cursor);
         self.terminal_sent = true;
         let clean = self.report().clean && operation_clean;
         if !clean {
