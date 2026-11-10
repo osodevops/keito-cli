@@ -594,6 +594,14 @@ impl GroupLease {
                 sid.to_string(),
                 lifetime_deadline_ns.to_string(),
             ]);
+        // Core Foundation may initialize before this helper's main. Supply
+        // synthetic UID/zero encoding metadata instead of consulting the
+        // operator's encoding file. No auth/profile value is inherited.
+        #[cfg(target_os = "macos")]
+        command.env(
+            "__CF_USER_TEXT_ENCODING",
+            format!("0x{:X}:0:0", unsafe { libc::getuid() }),
+        );
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 || libc::fcntl(child_fd, libc::F_SETFD, 0) < 0 {

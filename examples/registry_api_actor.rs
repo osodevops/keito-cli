@@ -69,6 +69,7 @@ mod unix {
             | "PRIVATE_ENV"
             | "ENV_KEYS"
             | "ENV_KEYS_CF_TEXT_ENCODING"
+            | "PLATFORM_ENV"
             | "POLICY_PREREQUISITE"
             | "PATH"
             | "MODE"
@@ -241,10 +242,12 @@ mod unix {
             .and_then(|()| sink.flush())
             .map_err(|_| "FACT_OUTPUT")
     }
-    // Classification only: admission remains exactly ten keys. The caller has
-    // already validated every required key/value; no unknown name/value emits.
+    // Required values are validated first. macOS also gets one explicit
+    // UID-derived encoding value, preventing CF's home-file fallback.
+    // Unknown names/values never emit; additional keys still refuse.
     fn environment_key_refusal(
         keys: impl Iterator<Item = std::ffi::OsString>,
+        macos: bool,
     ) -> Option<&'static str> {
         let mut count = 0usize;
         let mut cf_text_encoding = false;
@@ -252,13 +255,21 @@ mod unix {
             count = count.saturating_add(1);
             cf_text_encoding |= key == std::ffi::OsStr::new("__CF_USER_TEXT_ENCODING");
         }
-        if count == 10 {
+        if (!macos && count == 10 && !cf_text_encoding) || (macos && count == 11 && cf_text_encoding) {
             None
         } else if count == 11 && cf_text_encoding {
             Some("ENV_KEYS_CF_TEXT_ENCODING")
         } else {
             Some("ENV_KEYS")
         }
+    }
+    #[cfg(any(target_os = "macos", test))]
+    fn platform_encoding_value(uid: u32) -> String {
+        format!("0x{uid:X}:0:0")
+    }
+    #[cfg(any(target_os = "macos", test))]
+    fn platform_encoding_is_exact(value: Option<&std::ffi::OsStr>, uid: u32) -> bool {
+        value == Some(std::ffi::OsStr::new(&platform_encoding_value(uid)))
     }
     fn private_role(root: &Path) -> R<()> {
         if std::env::var("KEITO_ACTOR_POLICY_CONFIRMED").as_deref()
@@ -296,7 +307,11 @@ mod unix {
                 return Err("PRIVATE_ENV");
             }
         }
-        if let Some(reason) = environment_key_refusal(std::env::vars_os().map(|(key, _)| key)) {
+        #[cfg(target_os = "macos")]
+        if !platform_encoding_is_exact(std::env::var_os("__CF_USER_TEXT_ENCODING").as_deref(), unsafe {libc::getuid()}) {
+            return Err("PLATFORM_ENV");
+        }
+        if let Some(reason) = environment_key_refusal(std::env::vars_os().map(|(key, _)| key), cfg!(target_os = "macos")) {
             return Err(reason);
         }
         Ok(())
@@ -575,6 +590,8 @@ mod unix {
                     lf.to_string(),
                     self.safety.to_string(),
                 ]);
+            #[cfg(target_os = "macos")]
+            command.env("__CF_USER_TEXT_ENCODING", platform_encoding_value(unsafe {libc::getuid()}));
             unsafe {
                 command.pre_exec(move || {
                     if libc::write(mf, b"P".as_ptr().cast(), 1) != 1
@@ -953,25 +970,36 @@ mod unix {
         }
 
         #[test]
-        fn known_platform_key_is_named_but_still_refused_and_unknown_keys_stay_opaque() {
+        fn platform_key_requires_explicit_platform_layout_and_unknown_extras_stay_opaque() {
             let ten: Vec<_> = (0..10)
                 .map(|i| std::ffi::OsString::from(format!("SYNTHETIC_{i}")))
                 .collect();
-            assert_eq!(environment_key_refusal(ten.clone().into_iter()), None);
+            assert_eq!(environment_key_refusal(ten.clone().into_iter(), false), None);
+            assert_eq!(environment_key_refusal(ten.clone().into_iter(), true), Some("ENV_KEYS"));
             let mut known = ten.clone();
             known.push("__CF_USER_TEXT_ENCODING".into());
             assert_eq!(
-                environment_key_refusal(known.clone().into_iter()),
+                environment_key_refusal(known.clone().into_iter(), false),
                 Some("ENV_KEYS_CF_TEXT_ENCODING")
             );
+            assert_eq!(environment_key_refusal(known.clone().into_iter(), true), None);
             let mut unknown = ten;
             unknown.push("UNPRINTED_EXTRA_NAME".into());
             assert_eq!(
-                environment_key_refusal(unknown.into_iter()),
+                environment_key_refusal(unknown.into_iter(), true),
                 Some("ENV_KEYS")
             );
             known.push("ANOTHER_UNPRINTED_NAME".into());
-            assert_eq!(environment_key_refusal(known.into_iter()), Some("ENV_KEYS"));
+            assert_eq!(environment_key_refusal(known.into_iter(), true), Some("ENV_KEYS"));
+        }
+
+        #[test]
+        fn encoding_value_cannot_select_another_uid_or_nonzero_encoding() {
+            let exact = platform_encoding_value(501);
+            assert!(platform_encoding_is_exact(Some(std::ffi::OsStr::new(&exact)), 501));
+            for value in [None, Some("0x0:0:0"), Some("0x1F5:1:0"), Some("0x1F5:0:1"), Some("/private/secret")] {
+                assert!(!platform_encoding_is_exact(value.map(std::ffi::OsStr::new), 501));
+            }
         }
     }
 }
