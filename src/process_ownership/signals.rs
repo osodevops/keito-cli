@@ -12,7 +12,7 @@ extern "C" fn interrupted(_: libc::c_int) {
 pub(crate) fn pending() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
 }
-pub(super) struct InstalledHandlers {
+pub(crate) struct InstalledHandlers {
     previous: Vec<(libc::c_int, libc::sigaction)>,
 }
 impl Drop for InstalledHandlers {
@@ -24,7 +24,7 @@ impl Drop for InstalledHandlers {
         }
     }
 }
-pub(super) fn install() -> io::Result<InstalledHandlers> {
+pub(crate) fn install() -> io::Result<InstalledHandlers> {
     let mut guard = InstalledHandlers {
         previous: Vec::with_capacity(2),
     };
