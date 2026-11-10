@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn slot_identity_and_whole_scope_buffer_budget_are_not_recycled() {
         let events: Rc<RefCell<Vec<String>>> = Rc::default(); let mut a=Core::new(Rc::default(),500_000_000);
-        let mut b=Core::new(Rc::default(),500_000_000);
+        let mut b: Core<Fake>=Core::new(Rc::default(),500_000_000);
         let id=a.admit(1,MAX_IO_BYTES,|_| Ok(fake("a",events.clone()))).unwrap();
         assert!(b.index(&id).is_err());
         a.request_complete(&id,2).unwrap(); a.poll(&mut ||Ok(3));
