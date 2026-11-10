@@ -1,0 +1,127 @@
+use super::*;
+use std::cell::RefCell;
+
+#[derive(Default)]
+struct Trace { calls: Vec<(&'static str, usize, u64)> }
+struct Fake {
+    id: usize,
+    trace: Rc<RefCell<Trace>>,
+    begin_error: bool,
+    poll_error: bool,
+    proof: bool,
+    waited: bool,
+}
+impl Edge for Fake {
+    fn begin(&mut self, end: u64) -> io::Result<()> {
+        self.trace.borrow_mut().calls.push(("begin", self.id, end));
+        if self.begin_error { Err(io::Error::other("synthetic begin")) } else { Ok(()) }
+    }
+    fn poll(&mut self) -> io::Result<()> {
+        self.trace.borrow_mut().calls.push(("poll", self.id, 0));
+        if self.poll_error { Err(io::Error::other("synthetic poll")) } else { Ok(()) }
+    }
+    fn proof(&self) -> bool { self.proof }
+    fn waits_known(&self) -> bool { self.waited }
+}
+fn edge(trace: &Rc<RefCell<Trace>>, id: usize) -> Fake {
+    Fake { id, trace: trace.clone(), begin_error: false, poll_error: false, proof: false, waited: false }
+}
+fn registry() -> Registry<Fake> { Registry::new(SharedOwner::default(), 10_000_000_000) }
+
+#[test]
+fn returned_edge_is_registered_before_the_actual_publisher_runs() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    let id = r.admit(1, |_| Ok(edge(&trace, 0)), |id, slots| {
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[id.index].id, 0);
+        Ok(())
+    }).unwrap();
+    assert_eq!(r.slot(&id).unwrap().id, 0);
+}
+
+#[test]
+fn failed_publication_keeps_the_real_slot_and_closes_later_admission() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    let error = r.admit(1, |_| Ok(edge(&trace, 0)), |_, _| Err(io::Error::other("ORIGINAL_RECEIPT"))).unwrap_err();
+    assert_eq!(error.to_string(), "ORIGINAL_RECEIPT");
+    assert_eq!(r.slots.len(), 1);
+    assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("SCOPE_PUBLICATION")));
+    let mut created = false;
+    assert!(r.admit(2, |_| { created = true; Ok(edge(&trace, 1)) }, |_, _| Ok(())).is_err());
+    assert!(!created);
+    assert!(trace.borrow().calls.iter().any(|v| v.0 == "begin"));
+}
+
+#[test]
+fn broadcasts_every_slot_before_any_poll_even_when_first_begin_fails() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    let mut first = edge(&trace, 0); first.begin_error = true;
+    r.slots.extend([first, edge(&trace, 1), edge(&trace, 2)]);
+    r.begin(10, 500);
+    assert_eq!(trace.borrow().calls, [("begin", 0, 500), ("begin", 1, 500), ("begin", 2, 500)]);
+    r.poll();
+    assert_eq!(trace.borrow().calls.iter().filter(|v| v.0 == "poll").count(), 3);
+}
+
+#[test]
+fn one_poll_failure_cannot_skip_known_sibling_wait_collection_or_clear_slots() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    let mut first = edge(&trace, 0); first.poll_error = true;
+    let mut second = edge(&trace, 1); second.waited = true;
+    r.slots.extend([first, second]);
+    r.poll();
+    assert_eq!(trace.borrow().calls, [("poll", 0, 0), ("poll", 1, 0)]);
+    assert_eq!(r.slots.len(), 2);
+}
+
+#[test]
+fn cleanup_bound_can_only_decrease_and_begin_does_not_wait() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    r.slots.push(edge(&trace, 0));
+    r.begin(1, 500);
+    r.begin(100, 800);
+    r.begin(200, 300);
+    assert_eq!(r.cleanup_end, Some(300));
+    assert_eq!(trace.borrow().calls, [("begin", 0, 500), ("begin", 0, 300)]);
+}
+
+#[test]
+fn waited_but_unproven_slot_is_retained_for_failed_final_report() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    let mut first = edge(&trace, 0); first.waited = true;
+    r.slots.push(first);
+    r.poll();
+    assert_eq!(r.slots.len(), 1);
+    assert!(!r.slots[0].proof());
+}
+
+#[test]
+fn cancelled_owner_never_calls_factory_and_foreign_slot_cannot_target_another_registry() {
+    let mut a = registry();
+    let mut b = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    let id = a.admit(1, |_| Ok(edge(&trace, 0)), |_, _| Ok(())).unwrap();
+    assert!(b.slot(&id).is_err());
+    b.owner.borrow_mut().admission_closed = true;
+    let mut called = false;
+    assert!(b.admit(1, |_| { called = true; Ok(edge(&trace, 1)) }, |_, _| Ok(())).is_err());
+    assert!(!called);
+}
+
+#[test]
+fn slot_limit_refuses_before_factory_and_preserves_first_owner_fault() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    for id in 0..MAX_REGISTRATIONS { r.slots.push(edge(&trace, id)); }
+    let mut called = false;
+    assert!(r.admit(1, |_| { called = true; Ok(edge(&trace, 9999)) }, |_, _| Ok(())).is_err());
+    assert!(!called);
+    assert_eq!(r.slots.len(), MAX_REGISTRATIONS);
+    assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("SCOPE_SLOT_LIMIT")));
+}

@@ -26,4 +26,6 @@ pub mod skill_adapter;
 pub mod source_qa_group;
 #[cfg(all(feature = "dev-tools", unix))]
 pub mod source_qa_protocol;
+#[cfg(all(feature = "dev-tools", unix))]
+pub mod source_qa_scope;
 pub mod types;
