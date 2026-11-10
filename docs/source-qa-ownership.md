@@ -53,10 +53,37 @@ exactly `hook-short-v1`, never a numeric timeout supplied by a caller. Failed
 parent control also caps local observation without clearing the first fault or
 claiming a wire acknowledgement. At source `1ed602e`, 84 shared Rust state/socket
 tests, default all-target checking, all-feature Clippy and formatting pass.
-Independent extraction/policy review and real product integration remain open.
+R37 independently approved extraction, policy plumbing and test promotion as
+source prerequisites, with no required findings. Real product integration remains open.
 The existing batch registry still uses the legacy policy. None of these checks
 establishes an installed guard/core path, short-policy process acceptance or
 default latency.
+
+The shared Unix `Scope` now retains individual command slots and can settle one
+without closing the containing owner. It consumes the original prepared Command,
+returns pending keeper ownership, and progresses READY/PARK while bounded pipe
+reads and writes continue. Global cancellation broadcasts every retained slot's
+intent before polling waits; a failed slot or operation cannot restore clean
+completion. Direct waits, keeper terminal EOF, group absence and output read-zero
+EOF remain separate facts. Completed slots and their identities are not recycled.
+
+Transient input and each output are capped at 1MiB; admitted buffer capacities
+total at most 4MiB per Scope. Each pipe turn performs at most one 4096-byte I/O
+attempt, and a Scope turn visits at most eight slots in rotation. WouldBlock,
+interruption, a closed local descriptor or child exit never substitutes for
+observed output EOF. Overflow retains the first fault while bounded draining
+continues. Raw output has no Debug/Serialize implementation and stays outside
+metadata reports. Result retrieval is single-use and requires timely resource
+proof. Full retained reports are explicit snapshots outside the hot poll path.
+
+At source `ff34067`, 98 shared state/socket/fake-stream tests, default all-target
+checking, all-feature Clippy and formatting pass. The retained migration baseline
+has 93 passes and one behavioral failure for containing admission being closed;
+an earlier test-only type error is recorded separately. Independent lifecycle
+review is pending. The only current Scope image entrypoint requires a QA-owned
+0700 image. Sealed official images, cooperative core edges, signal/bootstrap
+integration and actual product/probe/Python-manager call sites remain pending.
+These tests do not execute the real command/guard chain or qualify its timing.
 
 The remaining integration must preserve the guardian's actual `setsid`, imageFD,
 ACK and timing boundaries; give controlled source processes cooperative owners;
