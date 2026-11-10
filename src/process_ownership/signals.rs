@@ -25,7 +25,9 @@ impl Drop for InstalledHandlers {
     }
 }
 pub(super) fn install() -> io::Result<InstalledHandlers> {
-    let mut guard = InstalledHandlers { previous: Vec::with_capacity(2) };
+    let mut guard = InstalledHandlers {
+        previous: Vec::with_capacity(2),
+    };
     for signal in [libc::SIGINT, libc::SIGTERM] {
         let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
         let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };

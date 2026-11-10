@@ -12,7 +12,8 @@ pub(super) const KEYS: [&str; 5] = [
     "KEITO_PROCESS_OWNER_CONTRACT",
 ];
 pub(super) fn present() -> bool {
-    KEYS.into_iter().chain(["KEITO_SOURCE_OWNER_FD", "KEITO_SOURCE_OWNER_NONCE"])
+    KEYS.into_iter()
+        .chain(["KEITO_SOURCE_OWNER_FD", "KEITO_SOURCE_OWNER_NONCE"])
         .any(|key| std::env::var_os(key).is_some())
 }
 fn error() -> io::Error {

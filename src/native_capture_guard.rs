@@ -457,205 +457,213 @@ mod unix {
         let hard_end = leaf_start.ok_or(())?.saturating_add(600_000_000);
         // Parent validation/clock refusal and all executable preparation occur
         // AFTER the durable pending marker. No failed entry loses the boundary.
-        let mut scope = match crate::process_ownership::scope::Scope::entry_from_environment(600_000_000).map_err(|_| ())? {
-            Some(mut scope) => { scope.tighten_end(hard_end); scope },
-            None => crate::process_ownership::scope::Scope::local_entry(hard_end).map_err(|_| ())?,
-        };
-        let result = (|| {
-        // This digest comes from the fixed managed registration, never stdin.
-        // Linux executes the descriptor. Darwin checks its managed pathname
-        // immediately before exec and carries this verified imageFD for a
-        // synchronous identity cross-check before Tokio/CLI parsing.
-        let expected = std::env::var("KEITO_CAPTURE_CORE_SHA256").map_err(|_| ())?;
-        let original = executable(&core, &expected)?;
-        let core_fd = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
-        if !(5..=1024).contains(&core_fd) {
-            if core_fd >= 0 {
-                unsafe {
-                    libc::close(core_fd);
+        let mut scope =
+            match crate::process_ownership::scope::Scope::entry_from_environment(600_000_000)
+                .map_err(|_| ())?
+            {
+                Some(mut scope) => {
+                    scope.tighten_end(hard_end);
+                    scope
                 }
-            }
-            return Err(());
-        }
-        let core_file = unsafe { File::from_raw_fd(core_fd) };
-        drop(original);
-        let mut pipe = [-1; 2];
-        if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
-            return Err(());
-        }
-        let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
-        let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-        for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
-            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                None => {
+                    crate::process_ownership::scope::Scope::local_entry(hard_end).map_err(|_| ())?
+                }
+            };
+        let result = (|| {
+            // This digest comes from the fixed managed registration, never stdin.
+            // Linux executes the descriptor. Darwin checks its managed pathname
+            // immediately before exec and carries this verified imageFD for a
+            // synchronous identity cross-check before Tokio/CLI parsing.
+            let expected = std::env::var("KEITO_CAPTURE_CORE_SHA256").map_err(|_| ())?;
+            let original = executable(&core, &expected)?;
+            let core_fd = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+            if !(5..=1024).contains(&core_fd) {
+                if core_fd >= 0 {
+                    unsafe {
+                        libc::close(core_fd);
+                    }
+                }
                 return Err(());
             }
-        }
-        if unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
-            return Err(());
-        }
-        let write_fd = writer.as_raw_fd();
-        // Inventory this single-threaded process before fork; Command's own
-        // later error pipe is CLOEXEC. Never scan or allocate after fork.
-        let inventory = unsafe { libc::opendir(CString::new("/dev/fd").unwrap().as_ptr()) };
-        if inventory.is_null() {
-            return Err(());
-        }
-        let inventory_fd = unsafe { libc::dirfd(inventory) };
-        let mut inherited = Vec::new();
-        loop {
-            set_errno(0);
-            let entry = unsafe { libc::readdir(inventory) };
-            if entry.is_null() {
-                if errno() != 0 {
-                    unsafe {
-                        libc::closedir(inventory);
-                    }
+            let core_file = unsafe { File::from_raw_fd(core_fd) };
+            drop(original);
+            let mut pipe = [-1; 2];
+            if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+                return Err(());
+            }
+            let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+            let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+            for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+                if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
                     return Err(());
                 }
-                break;
             }
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-            if let Some(fd) = name.to_str().ok().and_then(|name| name.parse::<i32>().ok()) {
-                if fd >= 4 && fd != inventory_fd {
-                    inherited.push(fd);
+            if unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+                return Err(());
+            }
+            let write_fd = writer.as_raw_fd();
+            // Inventory this single-threaded process before fork; Command's own
+            // later error pipe is CLOEXEC. Never scan or allocate after fork.
+            let inventory = unsafe { libc::opendir(CString::new("/dev/fd").unwrap().as_ptr()) };
+            if inventory.is_null() {
+                return Err(());
+            }
+            let inventory_fd = unsafe { libc::dirfd(inventory) };
+            let mut inherited = Vec::new();
+            loop {
+                set_errno(0);
+                let entry = unsafe { libc::readdir(inventory) };
+                if entry.is_null() {
+                    if errno() != 0 {
+                        unsafe {
+                            libc::closedir(inventory);
+                        }
+                        return Err(());
+                    }
+                    break;
+                }
+                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+                if let Some(fd) = name.to_str().ok().and_then(|name| name.parse::<i32>().ok()) {
+                    if fd >= 4 && fd != inventory_fd {
+                        inherited.push(fd);
+                    }
                 }
             }
-        }
-        unsafe {
-            libc::closedir(inventory);
-        }
-        #[cfg(target_os = "macos")]
-        let mut command = Command::new(&core);
-        #[cfg(not(target_os = "macos"))]
-        let mut command = Command::new(format!("/dev/fd/{core_fd}"));
-        let core_name = c(core.as_os_str())?;
-        let core_identity = core_file.metadata().map_err(|_| ())?;
-        command
-            .args([
-                "capture",
-                "hook",
-                "--agent",
-                agent,
-                "--event",
-                event,
-                "--harness-version",
-                version,
-            ])
-            .env("KEITO_CAPTURE_INVOCATION_NONCE", nonce)
-            .env("KEITO_CAPTURE_ACK_FD", "3")
-            .env("KEITO_CAPTURE_IMAGE_FD", core_fd.to_string())
-            .env("KEITO_CAPTURE_LEAF_END_NS", leaf_end.to_string())
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            command.pre_exec(move || {
-                // Darwin has no public exec-by-fd. Verify the fixed managed
-                // path immediately before exec; synchronous core bootstrap
-                // cross-checks its actual executable inode against imageFD.
-                let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
-                if libc::lstat(core_name.as_ptr(), current.as_mut_ptr()) != 0 {
-                    return Err(std::io::Error::last_os_error());
+            unsafe {
+                libc::closedir(inventory);
+            }
+            #[cfg(target_os = "macos")]
+            let mut command = Command::new(&core);
+            #[cfg(not(target_os = "macos"))]
+            let mut command = Command::new(format!("/dev/fd/{core_fd}"));
+            let core_name = c(core.as_os_str())?;
+            let core_identity = core_file.metadata().map_err(|_| ())?;
+            command
+                .args([
+                    "capture",
+                    "hook",
+                    "--agent",
+                    agent,
+                    "--event",
+                    event,
+                    "--harness-version",
+                    version,
+                ])
+                .env("KEITO_CAPTURE_INVOCATION_NONCE", nonce)
+                .env("KEITO_CAPTURE_ACK_FD", "3")
+                .env("KEITO_CAPTURE_IMAGE_FD", core_fd.to_string())
+                .env("KEITO_CAPTURE_LEAF_END_NS", leaf_end.to_string())
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            unsafe {
+                command.pre_exec(move || {
+                    // Darwin has no public exec-by-fd. Verify the fixed managed
+                    // path immediately before exec; synchronous core bootstrap
+                    // cross-checks its actual executable inode against imageFD.
+                    let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    if libc::lstat(core_name.as_ptr(), current.as_mut_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let current = current.assume_init();
+                    if current.st_dev as u128 != u128::from(core_identity.dev())
+                        || u128::from(current.st_ino) != u128::from(core_identity.ino())
+                        || current.st_mode & libc::S_IFMT != libc::S_IFREG
+                    {
+                        return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+                    }
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(write_fd, 3) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(core_fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for fd in &inherited {
+                        if *fd >= 4 && *fd != core_fd {
+                            libc::close(*fd);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            let child = scope.start_cooperative(command).map_err(|_| ())?;
+            drop(writer);
+            let mut reader = File::from(reader);
+            let mut bytes = Vec::with_capacity(ACK.len() + 1);
+            let mut eof = false;
+            let mut status = None;
+            loop {
+                let mut part = [0u8; 64];
+                match reader.read(&mut part) {
+                    Ok(0) => eof = true,
+                    Ok(n) => {
+                        bytes.extend_from_slice(&part[..n]);
+                        if bytes.len() > ACK.len() {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => break,
                 }
-                let current = current.assume_init();
-                if current.st_dev as u128 != u128::from(core_identity.dev())
-                    || u128::from(current.st_ino) != u128::from(core_identity.ino())
-                    || current.st_mode & libc::S_IFMT != libc::S_IFREG
+                scope.poll();
+                status = scope.slot_status(&child);
+                if scope.slot_complete(&child) && eof {
+                    break;
+                }
+                if scope.failed()
+                    || crate::process_ownership::signals::pending()
+                    || started.elapsed() >= Duration::from_millis(600)
                 {
-                    return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+                    break;
                 }
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::dup2(write_fd, 3) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(core_fd, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                for fd in &inherited {
-                    if *fd >= 4 && *fd != core_fd {
-                        libc::close(*fd);
-                    }
-                }
-                Ok(())
-            });
-        }
-        let child = scope.start_cooperative(command).map_err(|_| ())?;
-        drop(writer);
-        let mut reader = File::from(reader);
-        let mut bytes = Vec::with_capacity(ACK.len() + 1);
-        let mut eof = false;
-        let mut status = None;
-        loop {
-            let mut part = [0u8; 64];
-            match reader.read(&mut part) {
-                Ok(0) => eof = true,
-                Ok(n) => {
-                    bytes.extend_from_slice(&part[..n]);
-                    if bytes.len() > ACK.len() {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => break,
+                std::thread::sleep(Duration::from_millis(1));
             }
-            scope.poll();
-            status = scope.slot_status(&child);
-            if scope.slot_complete(&child) && eof {
-                break;
+            if !scope.slot_complete(&child) || !eof || bytes != ACK {
+                scope.begin_cancel(
+                    crate::process_ownership::protocol::ProtocolError("GUARD_CORE_INCOMPLETE"),
+                    scope.hard_end(),
+                );
             }
-            if scope.failed()
-                || crate::process_ownership::signals::pending()
-                || started.elapsed() >= Duration::from_millis(600)
+            let resources_clean = scope.finish().clean;
+            if resources_clean
+                && status.is_some_and(|s| s.success())
+                && eof
+                && bytes == ACK
+                && !crate::process_ownership::signals::pending()
+                && started.elapsed() < Duration::from_millis(600)
+                && lock(&publication)
             {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        if !scope.slot_complete(&child) || !eof || bytes != ACK {
-            scope.begin_cancel(
-                crate::process_ownership::protocol::ProtocolError("GUARD_CORE_INCOMPLETE"),
-                scope.hard_end(),
-            );
-        }
-        let resources_clean = scope.finish().clean;
-        if resources_clean
-            && status.is_some_and(|s| s.success())
-            && eof
-            && bytes == ACK
-            && !crate::process_ownership::signals::pending()
-            && started.elapsed() < Duration::from_millis(600)
-            && lock(&publication)
-        {
-            if let Ok(current) = open(&flags, &pending, libc::O_RDONLY) {
-                let m = current.metadata().map_err(|_| ())?;
-                let mut content = Vec::new();
-                current
-                    .take((PENDING.len() + 1) as u64)
-                    .read_to_end(&mut content)
-                    .map_err(|_| ())?;
-                if m.dev() == initial.dev()
-                    && m.ino() == initial.ino()
-                    && m.len() == PENDING.len() as u64
-                    && content == PENDING
-                    && unsafe {
-                        libc::unlinkat(
-                            flags.as_raw_fd(),
-                            CString::new(pending).unwrap().as_ptr(),
-                            0,
-                        )
-                    } == 0
-                {
-                    sync(&flags)?;
+                if let Ok(current) = open(&flags, &pending, libc::O_RDONLY) {
+                    let m = current.metadata().map_err(|_| ())?;
+                    let mut content = Vec::new();
+                    current
+                        .take((PENDING.len() + 1) as u64)
+                        .read_to_end(&mut content)
+                        .map_err(|_| ())?;
+                    if m.dev() == initial.dev()
+                        && m.ino() == initial.ino()
+                        && m.len() == PENDING.len() as u64
+                        && content == PENDING
+                        && unsafe {
+                            libc::unlinkat(
+                                flags.as_raw_fd(),
+                                CString::new(pending).unwrap().as_ptr(),
+                                0,
+                            )
+                        } == 0
+                    {
+                        sync(&flags)?;
+                    }
                 }
+                unlock(&publication);
             }
-            unlock(&publication);
-        }
-        Ok(())
+            Ok(())
         })();
         let clean = scope.finish().clean && result.is_ok();
         scope.publish_terminal(clean);

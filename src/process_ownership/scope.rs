@@ -217,7 +217,9 @@ impl Edge for GroupEdge {
             (2, Some(facts.keeper_pid), facts.keeper_status),
             (3, facts.workload_pid, facts.workload_status),
         ] {
-            let Some(pid) = pid else { continue; };
+            let Some(pid) = pid else {
+                continue;
+            };
             if !self.published[index] && (index < 2 || status.is_some()) {
                 self.published[index] = true;
                 let kind = if index < 2 { "REGISTER" } else { "WAITED" };
@@ -245,8 +247,10 @@ impl Edge for CooperativeEdge {
         if let Some(pipes) = &mut self.pipes {
             pipes.cancel_input();
         }
-        if self.status.is_none() && !self.endpoint.is_settled()
-            && self.cancel_sent.is_none_or(|previous| end < previous) {
+        if self.status.is_none()
+            && !self.endpoint.is_settled()
+            && self.cancel_sent.is_none_or(|previous| end < previous)
+        {
             self.cancel_sent = Some(end);
             // V1's cancellation grammar requires a positive absolute end.
             // Zero is an already-expired local end, never a fresh allowance.
@@ -693,7 +697,9 @@ impl Scope {
     /// Called on the entry thread after image bootstrap and before CLI parsing
     /// or runtime construction. Absence and malformed metadata are distinct.
     pub fn entry_from_environment(local_ns: u64) -> io::Result<Option<Self>> {
-        if !super::attachment::present() { return Ok(None); }
+        if !super::attachment::present() {
+            return Ok(None);
+        }
         let at = now()?;
         let end = at
             .checked_add(local_ns)
@@ -885,8 +891,8 @@ impl Scope {
         let capacity = plan.as_ref().map(IoPlan::capacity).unwrap_or(0);
         let mut clock_failed = false;
         let result = self.core.admit(at, capacity, |owner| {
-            let endpoint =
-                Endpoint::with_owner(parent, nonce.clone(), None, owner.clone()).map_err(|e| error(e.0))?;
+            let endpoint = Endpoint::with_owner(parent, nonce.clone(), None, owner.clone())
+                .map_err(|e| error(e.0))?;
             let pipes = plan.map(IoPlan::prepare).transpose()?;
             let fresh = match now() {
                 Ok(at) => at,
@@ -932,7 +938,10 @@ impl Scope {
         drop(mask);
         drop(inherited);
         drop(child_end);
-        if clock_failed { self.core.cancel(Some("SCOPE_CLOCK"), 0, 0); return result; }
+        if clock_failed {
+            self.core.cancel(Some("SCOPE_CLOCK"), 0, 0);
+            return result;
+        }
         self.poll();
         if result.is_err() {
             self.begin_cancel(ProtocolError("SCOPE_COOPERATIVE_SPAWN"), self.core.hard_end);
@@ -1091,7 +1100,9 @@ impl Scope {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             },
             &mut |core| {
-                if before { turn_start = core.cursor; }
+                if before {
+                    turn_start = core.cursor;
+                }
                 Self::pump(core, upstream, ledger, turn_start);
                 before = !before;
             },
@@ -1179,20 +1190,39 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         let mut core = Core::new(Rc::default(), 500_000_000);
         core.admit(1, 0, |_| Ok(fake("a", events.clone()))).unwrap();
-        assert!(core.admission_clock(&mut || Err(error("INERT_CLOCK"))).is_err());
+        assert!(core
+            .admission_clock(&mut || Err(error("INERT_CLOCK")))
+            .is_err());
         assert_eq!(core.cancel_end, Some(0));
         assert_eq!(core.slots[0].completion_end, Some(0));
-        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("SCOPE_CLOCK")));
+        assert_eq!(
+            core.owner.borrow().first_fault,
+            Some(ProtocolError("SCOPE_CLOCK"))
+        );
     }
     #[test]
     fn native_repair_unattached_entry_does_not_install_signal_handlers() {
-        let source = include_str!("scope.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
-        let entry = source.split("pub fn entry_from_environment").nth(1).unwrap().split("pub fn hard_end").next().unwrap();
-        assert!(entry.find("attachment::consume").unwrap() < entry.find("signals::install").unwrap());
+        let source = include_str!("scope.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let entry = source
+            .split("pub fn entry_from_environment")
+            .nth(1)
+            .unwrap()
+            .split("pub fn hard_end")
+            .next()
+            .unwrap();
+        assert!(
+            entry.find("attachment::consume").unwrap() < entry.find("signals::install").unwrap()
+        );
     }
     #[test]
     fn native_repair_public_metadata_turn_does_not_scan_all_history() {
-        let source = include_str!("scope.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
+        let source = include_str!("scope.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
         assert!(!source.contains("for slot in &mut core.slots"));
     }
     #[test]

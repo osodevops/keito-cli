@@ -38,11 +38,7 @@ fn main() {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let role = args.first().and_then(|a| a.to_str());
         let dispatch = role == Some(process_ownership::image::DISPATCH_ROLE);
-        let fields = if dispatch {
-            &args[1..]
-        } else {
-            &args[..]
-        };
+        let fields = if dispatch { &args[1..] } else { &args[..] };
         // Dispatch and guardian share one durable prelaunch entry. No image
         // hash/verification or child admission precedes marker publication.
         let _ = native_capture_guard::run(fields);

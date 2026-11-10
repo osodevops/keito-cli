@@ -12,7 +12,9 @@ fn native_repair_cancel_sender_forwards_strictly_decreasing_ends() {
     endpoint.send_cancel_tighter(1).unwrap();
     endpoint.send_cancel_tighter(10000).unwrap();
     let mut expected = String::new();
-    for end in [1000, 500, 1] { expected.push_str(&format!("{NONCE}|CANCEL|{}|{end}\n", std::process::id())); }
+    for end in [1000, 500, 1] {
+        expected.push_str(&format!("{NONCE}|CANCEL|{}|{end}\n", std::process::id()));
+    }
     peer.set_nonblocking(true).unwrap();
     let mut bytes = vec![0; expected.len() + 100];
     let count = peer.read(&mut bytes).unwrap();

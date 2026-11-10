@@ -210,7 +210,10 @@ pub(super) fn run(version: &'static str) -> i32 {
             let at = (clock.tv_sec as u64)
                 .saturating_mul(1_000_000_000)
                 .saturating_add(clock.tv_nsec as u64);
-            match Scope::local_entry(at.saturating_add(duration)) { Ok(scope) => scope, Err(_) => return 1 }
+            match Scope::local_entry(at.saturating_add(duration)) {
+                Ok(scope) => scope,
+                Err(_) => return 1,
+            }
         }
         Err(_) => return 1,
     };
