@@ -350,9 +350,7 @@ mod unix {
                             e.kind(),
                             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                         ) =>
-                    {
-                        ()
-                    }
+                    {}
                     Err(_) => return Err("READY_READ"),
                 }
             }
@@ -368,9 +366,7 @@ mod unix {
                             e.kind(),
                             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                         ) =>
-                    {
-                        ()
-                    }
+                    {}
                     Err(_) => return Err("LIVE_READ"),
                 }
             }
@@ -618,7 +614,7 @@ mod unix {
         private_role(&root)?;
         let image = std::env::current_exe().map_err(|_| "SELF")?;
         let keeper = root.join("bin/keeper");
-        if image != root.join("bin/actor") || PathBuf::from(&args[2]) != keeper {
+        if image != root.join("bin/actor") || Path::new(&args[2]) != keeper {
             return Err("IMAGE_PATH");
         }
         owned(&image, &root, false)?;
