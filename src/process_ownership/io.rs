@@ -407,4 +407,26 @@ mod tests {
         output.poll(&mut input);
         assert!(output.eof);
     }
+    #[test]
+    fn r38_unused_input_allocation_cannot_bypass_the_limit() {
+        let mut input = Vec::with_capacity(MAX_STREAM_BYTES + 1);
+        input.push(b'x');
+        assert_eq!(input.len(), 1);
+        assert!(input.capacity() > MAX_STREAM_BYTES);
+        assert!(IoPlan::new(input, 0, 0).is_err());
+        let empty = Vec::with_capacity(MAX_STREAM_BYTES + 1);
+        assert!(empty.is_empty());
+        assert!(IoPlan::new(empty, 0, 0).is_err());
+    }
+    #[test]
+    fn retained_input_capacity_is_charged_without_changing_bytes() {
+        let mut input = Vec::with_capacity(4096);
+        input.push(b'x');
+        let capacity = input.capacity();
+        let plan = IoPlan::new(input, 7, 11).unwrap();
+        assert_eq!(plan.capacity(), capacity + 18);
+        let pipes = plan.prepare().unwrap();
+        assert_eq!(pipes.input.bytes, b"x");
+        assert_eq!(pipes.input.bytes.capacity(), capacity);
+    }
 }
