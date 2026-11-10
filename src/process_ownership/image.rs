@@ -17,7 +17,9 @@ use std::{
 const MAX_IMAGE: u64 = 128 * 1024 * 1024;
 const IMAGE_ENV: &str = "KEITO_CAPTURE_KEEPER_IMAGE_FD";
 pub(crate) const KEEPER_ROLE: &str = "--internal-keeper-v1";
+#[allow(dead_code)] // Used by the standalone guard's shared-source inclusion.
 pub(crate) const DISPATCH_ROLE: &str = "--internal-dispatch-v2";
+#[allow(dead_code)]
 pub(crate) const GUARDIAN_ROLE: &str = "--internal-guardian-v2";
 fn refused() -> io::Error {
     io::Error::other("KEEPER_IMAGE")
@@ -120,6 +122,7 @@ pub(crate) struct VerifiedKeeperImage {
 impl VerifiedKeeperImage {
     /// Resource-only self-image authority in the already-running guard. This
     /// does not create a release/source/capture proof or accept another path.
+    #[allow(dead_code)]
     pub(crate) fn running_guard() -> io::Result<Self> {
         let path = std::env::current_exe()?;
         let mut file = open_path(&path)?;
@@ -206,6 +209,7 @@ impl VerifiedKeeperImage {
     pub(super) fn command(&self, control: i32) -> io::Result<(Command, OwnedFd)> {
         self.command_role(control, KEEPER_ROLE)
     }
+    #[allow(dead_code)]
     pub(crate) fn guardian_command(&self, control: i32) -> io::Result<(Command, OwnedFd)> {
         self.command_role(control, GUARDIAN_ROLE)
     }
@@ -254,7 +258,7 @@ impl VerifiedKeeperImage {
         }
         Ok((command, image))
     }
-    pub(super) fn image_env() -> &'static str {
+    pub(crate) fn image_env() -> &'static str {
         IMAGE_ENV
     }
 }

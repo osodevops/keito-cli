@@ -72,6 +72,11 @@ async fn run(cli: Cli, #[cfg(unix)] scope: Option<&mut keito_cli::process_owners
         cli::Command::Clients(cmd) => commands::clients::run(cmd, &cli.global, output_mode).await,
         cli::Command::Time(cmd) => commands::time::run(cmd, &cli.global, output_mode).await,
         cli::Command::Projects(cmd) => commands::projects::run(cmd, &cli.global, output_mode).await,
-        cli::Command::Skill(cmd) => commands::skill::run(cmd, &cli.global, output_mode).await,
+        cli::Command::Skill(cmd) => {
+            #[cfg(unix)]
+            { commands::skill::run_with_scope(cmd, &cli.global, output_mode, scope).await }
+            #[cfg(not(unix))]
+            { commands::skill::run(cmd, &cli.global, output_mode).await }
+        },
     }
 }

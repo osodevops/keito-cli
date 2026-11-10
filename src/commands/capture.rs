@@ -19,6 +19,17 @@ fn current_repo() -> Result<Repository, AppError> {
         .map_err(|_| AppError::Config("Cannot identify working directory".into()))?;
     Repository::resolve(&cwd)
 }
+#[cfg(unix)]
+fn current_repo_scoped(scope: &mut Option<&mut crate::process_ownership::scope::Scope>) -> Result<Repository, AppError> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let mut owner = crate::capture_command_owner::CommandOwner::with_scope(scope)?;
+            let cwd = std::env::current_dir().map_err(|_| AppError::Config("Cannot identify working directory".into()))?;
+            Repository::resolve_with(&cwd, &mut owner)
+        }
+        None => current_repo(),
+    }
+}
 fn print(value: Value, quiet: bool) -> Result<(), AppError> {
     if !quiet {
         println!(
@@ -190,7 +201,7 @@ pub async fn run_with_scope(
 }
 async fn run_inner(
     cmd: CaptureCommand, global: &GlobalFlags, _mode: OutputMode,
-    #[cfg(unix)] entry_scope: Option<&mut crate::process_ownership::scope::Scope>,
+    #[cfg(unix)] mut entry_scope: Option<&mut crate::process_ownership::scope::Scope>,
 ) -> Result<(), AppError> {
     if cfg!(not(unix)) {
         return Err(AppError::Config(
@@ -200,6 +211,9 @@ async fn run_inner(
     match cmd.command {
         CaptureSubcommand::Usage { command } => match command {
             CaptureUsageSubcommand::Status { agent, .. } => {
+                #[cfg(unix)]
+                let repository = current_repo_scoped(&mut entry_scope)?;
+                #[cfg(not(unix))]
                 let repository = current_repo()?;
                 let mut store = Store::open(&directory()?)?;
                 store.observe_repository(&repository)?;
@@ -209,6 +223,9 @@ async fn run_inner(
                 )
             }
             CaptureUsageSubcommand::Disable { agent, .. } => {
+                #[cfg(unix)]
+                let repository = current_repo_scoped(&mut entry_scope)?;
+                #[cfg(not(unix))]
                 let repository = current_repo()?;
                 let mut store = Store::open(&directory()?)?;
                 print(
@@ -226,12 +243,11 @@ async fn run_inner(
                 #[cfg(unix)]
                 {
                     let runtime = crate::capture_runtime_pair::current()?;
-                    let repository = current_repo()?;
+                    let repository = current_repo_scoped(&mut entry_scope)?;
                     let capture_directory = directory()?;
                     let mut store = Store::open(&capture_directory)?;
                     let binding = store.numeric_binding(&repository, agent.namespace())?;
-                    let prepared = crate::capture_usage_profile::approve(
-                        crate::capture_usage_profile::ProfileOptions {
+                    let options = crate::capture_usage_profile::ProfileOptions {
                             directory: &capture_directory,
                             binding: &binding,
                             namespace: agent.namespace(),
@@ -239,8 +255,13 @@ async fn run_inner(
                             launcher: &harness_executable,
                             native: native_executable.as_deref(),
                             runtime: &runtime,
-                        },
-                    )?;
+                        };
+                    let prepared = if let Some(scope) = entry_scope.as_deref_mut() {
+                        let mut owner = crate::capture_command_owner::CommandOwner::with_scope(scope)?;
+                        crate::capture_usage_profile::approve_with_runner(options, &mut owner)?
+                    } else {
+                        crate::capture_usage_profile::approve(options)?
+                    };
                     print(
                         store.enable_numeric(&repository, agent.namespace(), &prepared)?,
                         global.quiet,
@@ -447,6 +468,9 @@ async fn run_inner(
         }
         CaptureSubcommand::Status => {
             let mut store = Store::open(&directory()?)?;
+            #[cfg(unix)]
+            let repository = current_repo_scoped(&mut entry_scope);
+            #[cfg(not(unix))]
             let repository = current_repo();
             if let Ok(repository) = &repository {
                 store.observe_repository(repository)?;

@@ -74,6 +74,14 @@ impl CommandOwner<'static> {
     }
 }
 impl<'a> CommandOwner<'a> {
+    pub(crate) fn with_scope(scope: &'a mut Scope) -> Result<Self, AppError> {
+        let at = crate::process_ownership::scope::monotonic_now().map_err(|_| refused())?;
+        let end = scope.hard_end().min(at.saturating_add(STANDALONE_NS));
+        scope.tighten_end(end);
+        let identity = capture_runtime_pair::current()?;
+        let image = VerifiedKeeperImage::open(&identity.guard_path, &identity.guard_sha256).map_err(|_| refused())?;
+        Ok(Self { scope: ScopeRef::Borrowed(scope), image: Image::Owned(image), end })
+    }
     pub(crate) fn for_hook(
         runtime: &'a capture_runtime_pair::HookRuntime,
         scope: &'a mut Scope,

@@ -228,9 +228,11 @@ struct CooperativeEdge {
     registered: bool,
     waited: bool,
     first_fault: Option<&'static str>,
+    pipes: Option<PipeIo>,
 }
 impl Edge for CooperativeEdge {
     fn begin(&mut self, end: u64) -> io::Result<()> {
+        if let Some(pipes) = &mut self.pipes { pipes.cancel_input(); }
         if !self.cancel_sent && !self.endpoint.is_settled() {
             self.cancel_sent = true;
             // V1's cancellation grammar requires a positive absolute end.
@@ -243,6 +245,10 @@ impl Edge for CooperativeEdge {
         Ok(())
     }
     fn poll(&mut self) -> io::Result<()> {
+        if let Some(pipes) = &mut self.pipes {
+            pipes.poll();
+            if let Some(reason) = pipes.facts().first_fault { self.first_fault.get_or_insert(reason); }
+        }
         // Endpoint faults never skip the independently retained direct wait.
         if let Err(e) = self.endpoint.receive(false) {
             self.first_fault.get_or_insert(e.0);
@@ -262,10 +268,14 @@ impl Edge for CooperativeEdge {
             terminal_eof: self.endpoint.is_settled(),
             resource_proof: self.status.is_some() && self.endpoint.is_settled() && self.first_fault.is_none(),
             first_fault: self.first_fault,
+            io_required: self.pipes.is_some(),
+            io: self.pipes.as_ref().map(PipeIo::facts).unwrap_or_default(),
             ..Default::default()
         }
     }
-    fn take_output(&mut self) -> CommandOutput { CommandOutput { stdout: Vec::new(), stderr: Vec::new() } }
+    fn take_output(&mut self) -> CommandOutput {
+        self.pipes.as_mut().map(PipeIo::take_output).unwrap_or_else(|| CommandOutput { stdout: Vec::new(), stderr: Vec::new() })
+    }
     fn take_events(&mut self) -> Vec<String> {
         let mut events = Vec::new();
         let parent = std::process::id();
@@ -683,6 +693,13 @@ impl Scope {
     /// signals. Its own entry owner must settle descendants and close the wire.
     /// Caller-specified stdin/stdout/stderr and pre_exec are preserved.
     pub fn start_cooperative(&mut self, mut command: Command) -> io::Result<SlotId> {
+        self.start_cooperative_inner(&mut command, None)
+    }
+    pub fn start_cooperative_with_io(&mut self, mut command: Command, plan: IoPlan) -> io::Result<SlotId> {
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        self.start_cooperative_inner(&mut command, Some(plan))
+    }
+    fn start_cooperative_inner(&mut self, command: &mut Command, plan: Option<IoPlan>) -> io::Result<SlotId> {
         self.poll();
         let at = now()?;
         let mut random = [0u8; 16];
@@ -708,14 +725,19 @@ impl Scope {
             if fd != 4 { libc::close(fd); }
             Ok(())
         }); }
-        let mask = super::signals::AdmissionMask::block(&mut command)?;
+        let mask = super::signals::AdmissionMask::block(command)?;
         let admission_end = self.core.hard_end.saturating_sub(RESERVE_NS);
-        let result = self.core.admit(at, 0, |owner| {
+        let capacity = plan.as_ref().map(IoPlan::capacity).unwrap_or(0);
+        let result = self.core.admit(at, capacity, |owner| {
             let endpoint = Endpoint::with_owner(parent, nonce.clone(), None, owner).map_err(|e| error(e.0))?;
+            let pipes = plan.map(IoPlan::prepare).transpose()?;
             if now()? >= admission_end || super::signals::pending() { return Err(error("SCOPE_ADMISSION")); }
             let child = command.spawn()?;
             // The edge owns the actual handle before identity publication.
-            let mut edge = CooperativeEdge { child, endpoint, nonce, status: None, cancel_sent: false, registered: false, waited: false, first_fault: None };
+            let mut edge = CooperativeEdge { child, endpoint, nonce, status: None, cancel_sent: false, registered: false, waited: false, first_fault: None, pipes };
+            if let Some(pipes) = &mut edge.pipes {
+                if pipes.attach(edge.child.stdin.take(), edge.child.stdout.take(), edge.child.stderr.take()).is_err() { edge.first_fault = Some("SCOPE_IO_ATTACH"); }
+            }
             if let Err(e) = edge.endpoint.set_expected_child(edge.child.id()) { edge.first_fault = Some(e.0); }
             Ok(ProductEdge::Cooperative(edge))
         });

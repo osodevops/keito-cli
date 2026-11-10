@@ -184,6 +184,18 @@ pub async fn run(
     global: &GlobalFlags,
     mode: OutputMode,
 ) -> Result<(), AppError> {
+    #[cfg(unix)]
+    { run_with_scope(cmd, global, mode, None).await }
+    #[cfg(not(unix))]
+    { run_inner(cmd, global, mode).await }
+}
+#[cfg(unix)]
+pub async fn run_with_scope(cmd: SkillCommand, global: &GlobalFlags, mode: OutputMode,
+    scope: Option<&mut crate::process_ownership::scope::Scope>) -> Result<(), AppError> {
+    run_inner(cmd, global, mode, scope).await
+}
+async fn run_inner(cmd: SkillCommand, global: &GlobalFlags, mode: OutputMode,
+    #[cfg(unix)] scope: Option<&mut crate::process_ownership::scope::Scope>) -> Result<(), AppError> {
     match cmd.command {
         SkillSubcommand::Install {
             source,
@@ -198,6 +210,7 @@ pub async fn run(
                 selected_agents(agent)?,
                 skip_skills_add,
                 confirm_migration,
+                #[cfg(unix)] scope,
             )
             .await
         }
@@ -231,6 +244,7 @@ pub async fn install_defaults(global: &GlobalFlags, mode: OutputMode) -> Result<
         selected_agents(vec![])?,
         false,
         false,
+        #[cfg(unix)] None,
     )
     .await
 }
@@ -242,6 +256,7 @@ async fn install(
     agents: Vec<SkillAgent>,
     skip_skills_add: bool,
     confirm_migration: bool,
+    #[cfg(unix)] scope: Option<&mut crate::process_ownership::scope::Scope>,
 ) -> Result<(), AppError> {
     let source = source.trim();
     let use_bundled = source.is_empty() || source == BUNDLED_SKILL_SOURCE;
@@ -254,6 +269,11 @@ async fn install(
     // Qualification precedes every profile mutation, including external
     // skills downloads. An arbitrary adjacent binary cannot qualify capture.
     let runtime = crate::capture_runtime_pair::current()?;
+    #[cfg(unix)]
+    let mut probe_owner = match scope {
+        Some(scope) => crate::capture_command_owner::CommandOwner::with_scope(scope)?,
+        None => crate::capture_command_owner::CommandOwner::standalone()?,
+    };
     let home =
         dirs::home_dir().ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
     let bundled_skill = if !skip_skills_add && use_bundled {
@@ -272,15 +292,21 @@ async fn install(
                 .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
                 .ok_or_else(|| AppError::Config("Keito skill source is unavailable".into()))?
         };
-        crate::skill_adapter::install(crate::skill_adapter::InstallOptions {
+        let options = crate::skill_adapter::InstallOptions {
             source_root: &root,
             profile_home: &home,
             agent: *agent,
             runtime: &runtime,
             confirm_migration,
             harness_version: None,
-        })?;
+        };
+        #[cfg(unix)]
+        crate::skill_adapter::install_with_runner(options, &mut probe_owner)?;
+        #[cfg(not(unix))]
+        crate::skill_adapter::install(options)?;
     }
+    #[cfg(unix)]
+    probe_owner.finish(Ok(()))?;
 
     if global.quiet {
         return Ok(());

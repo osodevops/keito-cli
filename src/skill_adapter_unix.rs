@@ -617,6 +617,16 @@ pub fn install(options: InstallOptions<'_>) -> Result<InstallOutcome, AppError> 
             owner.finish(result)?
         }
     };
+    install_versioned(options, version)
+}
+pub(crate) fn install_with_runner(options: InstallOptions<'_>, runner: &mut impl crate::process_ownership::probes::LeafRunner) -> Result<InstallOutcome, AppError> {
+    let version = match options.harness_version {
+        Some(version) => version.to_owned(),
+        None => detect_version(options.agent, runner)?,
+    };
+    install_versioned(options, version)
+}
+fn install_versioned(options: InstallOptions<'_>, version: String) -> Result<InstallOutcome, AppError> {
     if !identifier(&version, 64) {
         return Err(AppError::InvalidInput("Harness version is incompatible with the capture identifier contract; review and qualify the exact version without truncating it.".into()));
     }

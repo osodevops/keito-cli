@@ -585,6 +585,11 @@ pub(crate) struct ProfileOptions<'a> {
 /// exact-native version probe and atomic private configuration publication.
 /// This returns no transcript capability and cannot bypass normal hook consent.
 pub(crate) fn approve(options: ProfileOptions<'_>) -> Result<PreparedProfile, AppError> {
+    let mut owner = crate::capture_command_owner::CommandOwner::standalone()?;
+    let result = approve_with_runner(options, &mut owner);
+    owner.finish(result)
+}
+pub(crate) fn approve_with_runner(options: ProfileOptions<'_>, runner: &mut impl crate::process_ownership::probes::LeafRunner) -> Result<PreparedProfile, AppError> {
     let (agent, host, source, version) = match options.namespace {
         "claude-code" => (SkillAgent::ClaudeCode, ".claude", "projects", "2.1.319"),
         "codex" => (SkillAgent::Codex, ".codex", "sessions", "0.167.0"),
@@ -694,9 +699,7 @@ pub(crate) fn approve(options: ProfileOptions<'_>) -> Result<PreparedProfile, Ap
     } else {
         ImagePin::observe(options.launcher, false)?
     };
-    let mut probe_owner = crate::capture_command_owner::CommandOwner::standalone()?;
-    let probe = observed_version(&native, options.home, version, &mut probe_owner);
-    probe_owner.finish(probe)?;
+    observed_version(&native, options.home, version, runner)?;
     if !receipt_stamp.matches(&receipt_path) || !config_stamp.matches(&config_path) {
         return Err(refused());
     }
