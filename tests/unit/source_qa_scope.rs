@@ -1,6 +1,41 @@
 use super::*;
 use std::cell::RefCell;
 
+#[test]
+fn process_ownership_command_probe_gateway_retains_original_and_inherited_end() {
+    let mut scope = crate::process_ownership::scope::Scope::with_owner(Default::default(), 4_000_000_000);
+    prepare_fixture_scope(&mut scope, || Ok(100_000_000)).unwrap();
+    assert_eq!(scope.hard_end(), 1_100_000_000);
+    prepare_fixture_scope(&mut scope, || Ok(500_000_000)).unwrap();
+    assert_eq!(scope.hard_end(), 1_100_000_000);
+    let mut inherited = crate::process_ownership::scope::Scope::with_owner(Default::default(), 180_000_000);
+    prepare_fixture_scope(&mut inherited, || Ok(100_000_000)).unwrap();
+    assert_eq!(inherited.hard_end(), 180_000_000);
+    scope.finish();
+    inherited.finish();
+}
+
+#[test]
+fn process_ownership_command_probe_gateway_clock_failure_zeros_and_keeps_first_fault() {
+    for original in [None, Some(ProtocolError("ORIGINAL"))] {
+        let mut scope = crate::process_ownership::scope::Scope::with_owner(Default::default(), 4_000_000_000);
+        if let Some(fault) = original { scope.owner_state().borrow_mut().poison(fault); }
+        assert!(prepare_fixture_scope(&mut scope, || Err(io::Error::other("inert clock"))).is_err());
+        assert_eq!(scope.hard_end(), 0);
+        assert_eq!(scope.first_fault(), original.or(Some(ProtocolError("SCOPE_CLOCK"))));
+        scope.finish();
+    }
+}
+
+#[test]
+fn process_ownership_command_probe_gateway_valid_zero_has_positive_original_budget() {
+    let mut scope = crate::process_ownership::scope::Scope::with_owner(Default::default(), 4_000_000_000);
+    prepare_fixture_scope(&mut scope, || Ok(0)).unwrap();
+    assert_eq!(scope.hard_end(), 1_000_000_000);
+    assert_eq!(scope.first_fault(), None);
+    scope.finish();
+}
+
 #[derive(Default)]
 struct Trace {
     calls: Vec<(&'static str, usize, u64)>,

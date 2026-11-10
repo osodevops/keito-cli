@@ -59,6 +59,22 @@ The existing batch registry still uses the legacy policy. None of these checks
 establishes an installed guard/core path, short-policy process acceptance or
 default latency.
 
+Ordinary verified command owners now select the closed `CommandProbe` policy.
+READY and PARK share the remaining original owner operation end (hard end minus
+50ms); they receive no new relative interval. The command-owner local bound
+remains one second, cleanup remains 50ms and TERM grace remains 15ms. Capture
+hooks retain `HookShort` and its 20ms setup cap. The public QA-owned image
+constructor refuses `CommandProbe`; only the crate-private verified-image path
+selects its fixed `command-probe-v1` keeper tag. This does not extend a hook cap,
+change latency acceptance or prove actual cold startup and cleanup.
+
+The one-second statement describes the constructor/owner lifetime. Installation
+and explicit usage approval have earlier pair verification outside that owner
+when unattached, so it is not a whole-command guarantee. The developer opaque
+gateway tightens its supplied Scope before its own pair/image verification;
+subsequent calls retain that original minimum. Stronger whole-command ownership
+would require acquiring and reusing one owner before those earlier caller steps.
+
 The shared Unix `Scope` now retains individual command slots and can settle one
 without closing the containing owner. It consumes the original prepared Command,
 returns pending keeper ownership, and progresses READY/PARK while bounded pipe

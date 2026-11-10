@@ -19,8 +19,7 @@ pub fn run_fixture_opaque(
     plan: crate::process_ownership::io::IoPlan,
     core: &Path,
 ) -> io::Result<crate::process_ownership::scope::CommandResult> {
-    let at = crate::process_ownership::scope::monotonic_now()?;
-    scope.tighten_end(scope.hard_end().min(at.saturating_add(1_000_000_000)));
+    prepare_fixture_scope(scope, crate::process_ownership::scope::monotonic_now)?;
     let anchor = option_env!("KEITO_RELEASE_GUARD_SHA256")
         .ok_or_else(|| io::Error::other("FIXTURE_PAIR_ANCHOR"))?;
     let runtime = crate::capture_runtime_pair::verify(
@@ -38,6 +37,21 @@ pub fn run_fixture_opaque(
         command, plan, &image,
         crate::process_ownership::group::CleanupPolicy::CommandProbe,
     )
+}
+
+fn prepare_fixture_scope(
+    scope: &mut crate::process_ownership::scope::Scope,
+    mut clock: impl FnMut() -> io::Result<u64>,
+) -> io::Result<()> {
+    match clock() {
+        Ok(at) => scope.tighten_end(scope.hard_end().min(at.saturating_add(1_000_000_000))),
+        Err(error) => {
+            scope.tighten_end(0);
+            scope.begin_cancel(ProtocolError("SCOPE_CLOCK"), 0);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn now() -> io::Result<u64> {

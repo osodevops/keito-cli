@@ -44,7 +44,9 @@ impl CleanupPolicy {
     fn setup_ns(self) -> u64 {
         match self {
             Self::Legacy => CLEANUP_NS,
-            Self::HookShort | Self::CommandProbe => 20_000_000,
+            Self::HookShort => 20_000_000,
+            // No independent relative setup interval; setup_end uses H-50ms.
+            Self::CommandProbe => 0,
         }
     }
     fn keeper_tag(tag: Option<&str>) -> io::Result<Self> {
@@ -56,8 +58,11 @@ impl CleanupPolicy {
         }
     }
     fn setup_end(self, at: u64, hard_end: u64) -> u64 {
-        at.saturating_add(self.setup_ns())
-            .min(hard_end.saturating_sub(self.reserve_ns()))
+        let operation_end = hard_end.saturating_sub(self.reserve_ns());
+        match self {
+            Self::CommandProbe => operation_end,
+            Self::Legacy | Self::HookShort => at.saturating_add(self.setup_ns()).min(operation_end),
+        }
     }
     fn observation_end(self, at: u64, inherited_end: u64) -> u64 {
         at.saturating_add(self.reserve_ns()).min(inherited_end)
@@ -625,6 +630,11 @@ impl GroupLease {
         lifetime_deadline_ns: u64,
         policy: CleanupPolicy,
     ) -> io::Result<Self> {
+        // The public QA-owned image API must not grant ordinary-command setup
+        // policy to an arbitrary caller-supplied lifetime or image.
+        if policy == CleanupPolicy::CommandProbe {
+            return Err(refused("GROUP_POLICY"));
+        }
         Self::spawn(
             owner,
             KeeperProgram::Owned {
@@ -636,6 +646,13 @@ impl GroupLease {
         )
     }
     pub(crate) fn spawn_verified_keeper(
+        owner: SharedOwner,
+        image: &super::image::VerifiedKeeperImage,
+        lifetime_deadline_ns: u64,
+    ) -> io::Result<Self> {
+        Self::spawn_verified_keeper_with_policy(owner, image, lifetime_deadline_ns, CleanupPolicy::HookShort)
+    }
+    pub(crate) fn spawn_verified_keeper_with_policy(
         owner: SharedOwner,
         image: &super::image::VerifiedKeeperImage,
         lifetime_deadline_ns: u64,
@@ -3246,5 +3263,35 @@ mod short_policy_tests {
         assert_eq!(CleanupPolicy::HookShort.setup_end(100_000_000, 550_000_000), 120_000_000);
         assert_eq!(CleanupPolicy::HookShort.reserve_ns(), 50_000_000);
         assert_eq!(CleanupPolicy::HookShort.term_ns(), 15_000_000);
+    }
+    #[test]
+    fn command_probe_is_refused_by_public_owned_image_gateway_before_preparation() {
+        let result = GroupLease::spawn_keeper_with_policy(
+            Default::default(), Path::new("not-an-absolute-root"), Path::new("not-an-image"),
+            1_000_000_000, CleanupPolicy::CommandProbe,
+        );
+        assert_eq!(result.err().unwrap().to_string(), "GROUP_POLICY");
+    }
+    #[test]
+    fn command_probe_ready_and_park_share_inherited_minimum_and_reject_equality() {
+        let policy = CleanupPolicy::CommandProbe;
+        assert_eq!(policy.setup_end(0, 180_000_000), 130_000_000);
+        assert_eq!(policy.setup_end(120_000_000, 180_000_000), 130_000_000);
+        assert_eq!(policy.setup_end(130_000_000, 180_000_000), 130_000_000);
+        assert!(Lifetime::with_policy(130_000_000, 180_000_000, policy).is_err());
+        assert_eq!(policy.setup_end(u64::MAX - 1, u64::MAX), u64::MAX - 50_000_000);
+        let mut session = KeeperSession::new(
+            Group { actions: vec![], absent: false },
+            Lifetime::with_policy(0, 1_000_000_000, policy).unwrap(),
+        );
+        session.parked = true;
+        session.step(&mut || Ok(950_000_000)).unwrap();
+        assert_eq!(session.end, 1_000_000_000);
+        assert_eq!(session.term_end, Some(965_000_000));
+        session.step(&mut || Ok(965_000_000)).unwrap();
+        let actions = session.group.actions.clone();
+        assert!(session.step(&mut || Ok(1_000_000_000)).is_err());
+        assert_eq!(session.group.actions, actions);
+        assert_eq!(session.first_fault, Some("KEEPER_LIFETIME"));
     }
 }

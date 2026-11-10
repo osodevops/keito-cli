@@ -16,6 +16,11 @@ use std::{io, process::Command};
 
 const STANDALONE_NS: u64 = 1_000_000_000;
 const HOOK_NS: u64 = 500_000_000;
+// This is the command-owner lifetime, not a whole-install/whole-usage wall-clock
+// guarantee: some high-level callers verify a pair before constructing it.
+fn probe_policy(hook: bool) -> CleanupPolicy {
+    if hook { CleanupPolicy::HookShort } else { CleanupPolicy::CommandProbe }
+}
 pub(crate) const LEAF_END_ENV: &str = "KEITO_CAPTURE_LEAF_END_NS";
 fn refused() -> AppError {
     AppError::Config("Capture command ownership unavailable; collection remains paused".into())
@@ -85,7 +90,7 @@ impl CommandOwner<'static> {
             scope: ScopeRef::Owned(Box::new(Scope::local_entry(end).map_err(|_| refused())?)),
             image: Image::Owned(image),
             end,
-            policy: CleanupPolicy::CommandProbe,
+            policy: probe_policy(false),
         })
     }
 }
@@ -101,7 +106,7 @@ impl<'a> CommandOwner<'a> {
             scope: ScopeRef::Borrowed(scope),
             image: Image::Owned(image),
             end,
-            policy: CleanupPolicy::CommandProbe,
+            policy: probe_policy(false),
         })
     }
     pub(crate) fn for_hook(
@@ -123,7 +128,7 @@ impl<'a> CommandOwner<'a> {
             scope: ScopeRef::Borrowed(scope),
             image: Image::Borrowed(runtime.keeper()),
             end,
-            policy: CleanupPolicy::HookShort,
+            policy: probe_policy(true),
         })
     }
     pub(crate) fn finish_clean(&mut self) -> bool {
@@ -220,6 +225,13 @@ impl LeafRunner for CommandOwner<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn process_ownership_command_probe_selection_keeps_hooks_short() {
+        assert_eq!(probe_policy(false), CleanupPolicy::CommandProbe);
+        assert_eq!(probe_policy(true), CleanupPolicy::HookShort);
+        assert_eq!(STANDALONE_NS, 1_000_000_000);
+        assert_eq!(HOOK_NS, 500_000_000);
+    }
     #[test]
     fn r40_any_partial_parent_requires_the_explicit_entry_owner() {
         assert!(!parent_present(|_| false));
