@@ -160,17 +160,6 @@ impl<'a> CommandOwner<'a> {
         }
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn r40_any_partial_parent_requires_the_explicit_entry_owner() {
-        assert!(!parent_present(|_| false));
-        for field in PARENT_KEYS {
-            assert!(parent_present(|key| key == field));
-        }
-    }
-}
 impl LeafRunner for CommandOwner<'_> {
     fn output(
         &mut self,
@@ -187,5 +176,28 @@ impl LeafRunner for CommandOwner<'_> {
             IoPlan::new(Vec::new(), stdout_cap, stderr_cap)?,
             image,
         )
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn r40_any_partial_parent_requires_the_explicit_entry_owner() {
+        assert!(!parent_present(|_| false));
+        for field in PARENT_KEYS {
+            assert!(parent_present(|key| key == field));
+        }
+    }
+    #[test]
+    fn r41_installed_owner_requires_the_new_guard_contract() {
+        assert_eq!(crate::capture_runtime_pair::GUARD_CONTRACT, 2);
+    }
+    #[test]
+    fn r41_dispatch_execs_the_native_owner_without_watchdog_children() {
+        let source = include_str!("../skills/keito-time-track/hooks/dispatch.sh");
+        assert!(source.contains("exec \"$guard_cmd\" --internal-dispatch-v2"));
+        assert!(!source.contains("sleep "));
+        assert!(!source.contains("watchdog="));
+        assert!(!source.contains("kill -"));
     }
 }
