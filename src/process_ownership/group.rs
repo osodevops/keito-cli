@@ -497,7 +497,9 @@ impl Settlement {
                     }
                     self.expected_ready = None;
                 } else if let Some(expected) = &self.expected_park {
-                    if body != *expected { return Err(refused("GROUP_PARK")); }
+                    if body != *expected {
+                        return Err(refused("GROUP_PARK"));
+                    }
                     self.expected_park = None;
                 } else {
                     if body != format!("GONE|{pid}") || self.progress.phase != Phase::Cleaning {
@@ -782,18 +784,26 @@ impl GroupLease {
             if self.settlement.progress.phase != Phase::AwaitReady {
                 return Err(refused("GROUP_STATE"));
             }
-            if now()? >= self.ready_end { return Err(refused("GROUP_DEADLINE")); }
+            if now()? >= self.ready_end {
+                return Err(refused("GROUP_DEADLINE"));
+            }
             let body = self.channel.receive()?;
-            if now()? >= self.ready_end { return Err(refused("GROUP_DEADLINE")); }
+            if now()? >= self.ready_end {
+                return Err(refused("GROUP_DEADLINE"));
+            }
             let Some(body) = body else {
-                if self.channel.eof { return Err(refused("GROUP_EOF")); }
+                if self.channel.eof {
+                    return Err(refused("GROUP_EOF"));
+                }
                 return Ok(false);
             };
             if Some(&body) != self.settlement.expected_ready.as_ref() {
                 return Err(refused("GROUP_READY"));
             }
             self.settlement.expected_ready = None;
-            self.settlement.progress.advance(Phase::AwaitReady, Phase::Ready)?;
+            self.settlement
+                .progress
+                .advance(Phase::AwaitReady, Phase::Ready)?;
             Ok(true)
         })();
         self.checked(result)
@@ -802,33 +812,33 @@ impl GroupLease {
     /// back to a caller for reuse after release. No argv/env/FD reconstruction.
     fn spawn_joined(&mut self, mut command: Command) -> io::Result<()> {
         self.check_admission()?;
-            if self.settlement.progress.phase != Phase::Ready || self.workload.is_some() {
-                return Err(refused("GROUP_START_STATE"));
-            }
-            if now()?
-                >= self
-                    .settlement
-                    .progress
-                    .deadline_ns
-                    .saturating_sub(self.settlement.policy.reserve_ns())
-            {
-                return Err(refused("GROUP_DEADLINE"));
-            }
-            let pgid = self.keeper_pid;
-            let sid = self.sid;
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::getsid(0) != sid || libc::setpgid(0, pgid) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            let child = command.spawn().map_err(|_| refused("GROUP_SPAWN"))?;
-            self.workload = Some(child);
-            self.settlement
+        if self.settlement.progress.phase != Phase::Ready || self.workload.is_some() {
+            return Err(refused("GROUP_START_STATE"));
+        }
+        if now()?
+            >= self
+                .settlement
                 .progress
-                .advance(Phase::Ready, Phase::Joined)?;
+                .deadline_ns
+                .saturating_sub(self.settlement.policy.reserve_ns())
+        {
+            return Err(refused("GROUP_DEADLINE"));
+        }
+        let pgid = self.keeper_pid;
+        let sid = self.sid;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::getsid(0) != sid || libc::setpgid(0, pgid) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().map_err(|_| refused("GROUP_SPAWN"))?;
+        self.workload = Some(child);
+        self.settlement
+            .progress
+            .advance(Phase::Ready, Phase::Joined)?;
         Ok(())
     }
     pub fn start(&mut self, command: Command) -> io::Result<()> {
@@ -864,11 +874,19 @@ impl GroupLease {
                 return Err(refused("GROUP_START_STATE"));
             }
             let at = now()?;
-            let end = self.settlement.policy.setup_end(at, self.settlement.progress.deadline_ns);
-            if at >= end { return Err(refused("GROUP_DEADLINE")); }
+            let end = self
+                .settlement
+                .policy
+                .setup_end(at, self.settlement.progress.deadline_ns);
+            if at >= end {
+                return Err(refused("GROUP_DEADLINE"));
+            }
             self.spawn_joined(command)?;
             self.park_end = Some(end);
-            self.settlement.expected_park = Some(format!("PARKED|{}|{}|{}", self.keeper_pid, self.owner_pgid, self.sid));
+            self.settlement.expected_park = Some(format!(
+                "PARKED|{}|{}|{}",
+                self.keeper_pid, self.owner_pgid, self.sid
+            ));
             self.check_admission()?;
             self.channel.send("PARK")
         })();
@@ -881,26 +899,44 @@ impl GroupLease {
                 return Err(refused("GROUP_STATE"));
             }
             let end = self.park_end.ok_or_else(|| refused("GROUP_STATE"))?;
-            if now()? >= end { return Err(refused("GROUP_DEADLINE")); }
+            if now()? >= end {
+                return Err(refused("GROUP_DEADLINE"));
+            }
             let body = self.channel.receive()?;
-            if now()? >= end { return Err(refused("GROUP_DEADLINE")); }
+            if now()? >= end {
+                return Err(refused("GROUP_DEADLINE"));
+            }
             let Some(body) = body else {
-                if self.channel.eof { return Err(refused("GROUP_EOF")); }
+                if self.channel.eof {
+                    return Err(refused("GROUP_EOF"));
+                }
                 return Ok(false);
             };
-            if body != format!("PARKED|{}|{}|{}", self.keeper_pid, self.owner_pgid, self.sid) {
+            if body
+                != format!(
+                    "PARKED|{}|{}|{}",
+                    self.keeper_pid, self.owner_pgid, self.sid
+                )
+            {
                 return Err(refused("GROUP_PARK"));
             }
             self.settlement.expected_park = None;
-            self.settlement.progress.advance(Phase::Joined, Phase::Parked)?;
+            self.settlement
+                .progress
+                .advance(Phase::Joined, Phase::Parked)?;
             Ok(true)
         })();
         self.checked(result)
     }
     pub(super) fn poll_workload(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.settlement.collect(&mut self.keeper, self.workload.as_mut());
-        if self.settlement.keeper_status.is_some() { self.fail("GROUP_KEEPER_FAILED"); }
-        if let Some(reason) = self.settlement.progress.first_fault { return Err(refused(reason)); }
+        self.settlement
+            .collect(&mut self.keeper, self.workload.as_mut());
+        if self.settlement.keeper_status.is_some() {
+            self.fail("GROUP_KEEPER_FAILED");
+        }
+        if let Some(reason) = self.settlement.progress.first_fault {
+            return Err(refused(reason));
+        }
         Ok(self.settlement.workload_status)
     }
     /// Transferred pipes MUST have a caller-scoped close/drain/EOF owner. Neither
@@ -1538,17 +1574,36 @@ mod tests {
             let (mut state, mut channel, mut peer) = parent_fixture();
             state.expected_park = Some("PARKED|42|7|7".to_owned());
             let mut keeper = FakeWait::default();
-            if !skip_parked { frame(&mut peer, "PARKED|42|7|7"); }
+            if !skip_parked {
+                frame(&mut peer, "PARKED|42|7|7");
+            }
             frame(&mut peer, "GONE|42");
-            let result = state.poll(&mut || Ok(1), 42, &mut channel, &mut keeper, None::<&mut FakeWait>);
+            let result = state.poll(
+                &mut || Ok(1),
+                42,
+                &mut channel,
+                &mut keeper,
+                None::<&mut FakeWait>,
+            );
             if skip_parked {
                 assert_eq!(result.unwrap_err().to_string(), "GROUP_PARK");
                 assert!(!state.group_absent);
             } else {
                 assert!(result.unwrap().is_none());
-                assert!(state.expected_park.is_none()); assert!(!state.group_absent);
-                assert!(state.poll(&mut || Ok(2), 42, &mut channel, &mut keeper, None::<&mut FakeWait>).unwrap().is_none());
-                assert!(state.group_absent); assert!(state.release_sent);
+                assert!(state.expected_park.is_none());
+                assert!(!state.group_absent);
+                assert!(state
+                    .poll(
+                        &mut || Ok(2),
+                        42,
+                        &mut channel,
+                        &mut keeper,
+                        None::<&mut FakeWait>
+                    )
+                    .unwrap()
+                    .is_none());
+                assert!(state.group_absent);
+                assert!(state.release_sent);
             }
         }
     }
