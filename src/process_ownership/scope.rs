@@ -465,20 +465,21 @@ impl Scope {
             }
         };
         let capacity = plan.capacity();
-        let pipes = match plan.prepare() {
-            Ok(pipes) => pipes,
-            Err(_) => {
-                self.core
-                    .cancel(Some("SCOPE_IO_PREPARE"), at, self.core.hard_end);
-                return Err(error("SCOPE_IO_PREPARE"));
-            }
-        };
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let hard_end = self.core.hard_end;
         let result = self.core.admit(at, capacity, |owner| {
+            // Scope capacity/slot admission precedes buffer allocation, and
+            // all buffers exist before spawning the first owned handle.
+            let pipes = match plan.prepare() {
+                Ok(pipes) => pipes,
+                Err(_) => {
+                    owner.borrow_mut().poison(ProtocolError("SCOPE_IO_PREPARE"));
+                    return Err(error("SCOPE_IO_PREPARE"));
+                }
+            };
             let lease = GroupLease::spawn_keeper_with_policy(
                 owner,
                 root,
@@ -506,9 +507,10 @@ impl Scope {
         }
         result
     }
-    pub fn poll(&mut self) -> ScopeReport {
+    /// A bounded hot-path turn. Full retained reports are explicit snapshots,
+    /// never an allocation/whole-registry scan on every command I/O poll.
+    pub fn poll(&mut self) {
         self.core.poll(&mut now);
-        self.report()
     }
     pub fn request_complete(&mut self, id: &SlotId) -> io::Result<()> {
         let result = match now() {
