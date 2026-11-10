@@ -125,3 +125,72 @@ fn slot_limit_refuses_before_factory_and_preserves_first_owner_fault() {
     assert_eq!(r.slots.len(), MAX_REGISTRATIONS);
     assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("SCOPE_SLOT_LIMIT")));
 }
+
+#[test]
+fn constructor_failure_cancels_already_retained_sibling_without_losing_original_error() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    r.slots.push(edge(&trace, 0));
+    let error = r.admit(10, |_| Err(io::Error::other("ORIGINAL_SPAWN")), |_, _| Ok(())).unwrap_err();
+    assert_eq!(error.to_string(), "ORIGINAL_SPAWN");
+    assert_eq!(r.slots.len(), 1);
+    assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("SCOPE_SPAWN")));
+    assert_eq!(trace.borrow().calls[0].0, "begin");
+}
+
+#[test]
+fn successful_finish_needs_proof_and_waits_under_the_same_fresh_bound() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    let mut first = edge(&trace, 0); first.waited = true;
+    r.slots.push(first);
+    r.begin(10, 500);
+    assert!(!r.finish_at(100));
+    r.slots[0].proof = true;
+    assert!(r.finish_at(101));
+    let before = trace.borrow().calls.clone();
+    r.begin(200, 900);
+    assert_eq!(trace.borrow().calls, before);
+    assert_eq!(r.cleanup_end, Some(500));
+    assert!(r.owner.borrow().first_fault.is_none());
+}
+
+#[test]
+fn expired_finish_retains_all_slots_and_never_upgrades_on_late_proof() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    r.slots.push(edge(&trace, 0));
+    r.begin(10, 500);
+    assert!(r.finish_at(500));
+    r.slots[0].waited = true;
+    r.slots[0].proof = true;
+    r.poll();
+    assert!(r.finish_at(501));
+    assert_eq!(r.slots.len(), 1);
+    assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("SCOPE_CLEANUP_DEADLINE")));
+}
+
+#[test]
+fn already_complete_group_facts_do_not_bypass_expired_scope_finish() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    let mut first = edge(&trace, 0); first.waited = true; first.proof = true;
+    r.slots.push(first);
+    r.begin(10, 500);
+    assert!(r.finish_at(501));
+    assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("SCOPE_CLEANUP_DEADLINE")));
+}
+
+#[test]
+fn prior_owner_cause_survives_all_cleanup_faults_and_secondary_codes_are_bounded() {
+    let mut r = registry();
+    let trace = Rc::new(RefCell::new(Trace::default()));
+    r.owner.borrow_mut().poison(ProtocolError("ORIGINAL_RECEIPT"));
+    let mut first = edge(&trace, 0); first.begin_error = true; first.poll_error = true;
+    r.slots.push(first);
+    r.begin(10, 500);
+    r.poll();
+    for _ in 0..20 { r.poison("LATER_CLEANUP"); }
+    assert_eq!(r.owner.borrow().first_fault, Some(ProtocolError("ORIGINAL_RECEIPT")));
+    assert_eq!(r.secondary_faults, [ProtocolError("SCOPE_BEGIN"), ProtocolError("SCOPE_POLL"), ProtocolError("LATER_CLEANUP")]);
+}

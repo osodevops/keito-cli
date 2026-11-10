@@ -748,7 +748,14 @@ impl GroupLease {
             child.stdin.take();
         }
         let result = now().and_then(|at| self.settlement.begin(deadline_ns, at, &mut self.channel));
-        self.checked(result)
+        let result = self.checked(result);
+        if result.is_err() {
+            // Scope's common failed-observation bound still applies when a
+            // poisoned/sending-failed lease cannot form a clean wire proof.
+            // This is local failure retention only, never a clean bound ACK.
+            self.settlement.progress.shorten(deadline_ns);
+        }
+        result
     }
     pub fn poll_cleanup(&mut self) -> io::Result<Option<GroupProof>> {
         // A sibling owner fault cannot be rehabilitated by this lease's trace.

@@ -72,14 +72,19 @@ struct Registry<E: Edge> {
     hard_end: u64,
     cleanup_end: Option<u64>,
     finished: bool,
+    secondary_faults: Vec<ProtocolError>,
 }
 impl<E: Edge> Registry<E> {
     fn new(owner: SharedOwner, hard_end: u64) -> Self {
         Self { owner, identity: Rc::new(()), slots: Vec::new(), hard_end,
-               cleanup_end: None, finished: false }
+               cleanup_end: None, finished: false, secondary_faults: Vec::new() }
     }
     fn poison(&mut self, reason: &'static str) {
         self.owner.borrow_mut().poison(ProtocolError(reason));
+        if self.owner.borrow().first_fault != Some(ProtocolError(reason))
+            && self.secondary_faults.len() < 8 && !self.secondary_faults.contains(&ProtocolError(reason)) {
+            self.secondary_faults.push(ProtocolError(reason));
+        }
     }
     fn admit(
         &mut self,
@@ -87,18 +92,36 @@ impl<E: Edge> Registry<E> {
         create: impl FnOnce(SharedOwner) -> io::Result<E>,
         publish: impl FnOnce(&SlotId, &[E]) -> io::Result<()>,
     ) -> io::Result<SlotId> {
-        self.owner.borrow().check_admission().map_err(|e| io::Error::other(e.0))?;
+        let admission = self.owner.borrow().check_admission();
+        if let Err(error) = admission {
+            self.begin(at, self.hard_end);
+            return Err(io::Error::other(error.0));
+        }
         if self.finished || self.cleanup_end.is_some() || at >= self.hard_end {
             return Err(io::Error::other("SCOPE_ADMISSION"));
         }
         if self.slots.len() >= MAX_REGISTRATIONS || self.slots.try_reserve(1).is_err() {
             self.poison("SCOPE_SLOT_LIMIT");
+            self.begin(at, self.hard_end);
             return Err(io::Error::other("SCOPE_SLOT_LIMIT"));
         }
-        let edge = create(self.owner.clone())?;
+        let edge = match create(self.owner.clone()) {
+            Ok(edge) => edge,
+            Err(error) => {
+                self.poison("SCOPE_SPAWN");
+                self.begin(at, self.hard_end);
+                return Err(error);
+            }
+        };
         let id = SlotId { index: self.slots.len(), registry: self.identity.clone() };
-        publish(&id, &self.slots)?;
+        // Capacity was reserved BEFORE creating the handle. No fallible I/O or
+        // publication occurs between factory return and local slot ownership.
         self.slots.push(edge);
+        if let Err(error) = publish(&id, &self.slots) {
+            self.poison("SCOPE_PUBLICATION");
+            self.begin(at, self.hard_end);
+            return Err(error);
+        }
         Ok(id)
     }
     fn slot(&mut self, id: &SlotId) -> io::Result<&mut E> {
@@ -110,26 +133,42 @@ impl<E: Edge> Registry<E> {
     }
     fn begin(&mut self, at: u64, requested: u64) {
         self.owner.borrow_mut().admission_closed = true;
-        let end = requested.min(self.hard_end).min(at.saturating_add(CLEANUP_NS));
+        if self.finished { return; }
+        let end = requested.min(self.hard_end).min(at.saturating_add(CLEANUP_NS))
+            .min(self.cleanup_end.unwrap_or(u64::MAX));
+        if self.cleanup_end == Some(end) { return; }
         self.cleanup_end = Some(end);
-        // Baseline migration of serial owner behavior; acceptance tests below
-        // require the integration's broadcast-before-poll and failure retention.
+        let mut fault = false;
         for edge in &mut self.slots {
             if edge.begin(end).is_err() {
-                self.owner.borrow_mut().poison(ProtocolError("SCOPE_BEGIN"));
-                return;
+                fault = true;
             }
-            let _ = edge.poll();
         }
+        // Broadcast EVERY known slot before any poll/wait, including when one
+        // begin fails. Individual edges may already have set a specific cause.
+        if fault { self.poison("SCOPE_BEGIN"); }
     }
     fn poll(&mut self) {
+        let mut fault = false;
         for edge in &mut self.slots {
             if edge.poll().is_err() {
-                self.owner.borrow_mut().poison(ProtocolError("SCOPE_POLL"));
-                break;
+                fault = true;
             }
         }
-        self.slots.retain(|edge| !edge.waits_known());
+        if fault { self.poison("SCOPE_POLL"); }
+        // Keep successful and failed slots alike. A wait is a fact, never a
+        // substitute for group proof or permission to erase a failed handle.
+    }
+    fn finish_at(&mut self, at: u64) -> bool {
+        if self.finished { return true; }
+        if at >= self.cleanup_end.unwrap_or(0) {
+            self.poison("SCOPE_CLEANUP_DEADLINE");
+            self.finished = true;
+        } else if self.slots.iter().all(Edge::waits_known)
+            && (self.slots.iter().all(Edge::proof) || self.owner.borrow().first_fault.is_some()) {
+            self.finished = true;
+        }
+        self.finished
     }
 }
 
@@ -137,6 +176,7 @@ impl<E: Edge> Registry<E> {
 #[derive(Clone, Debug)]
 pub struct RegistryReport {
     pub first_fault: Option<ProtocolError>,
+    pub secondary_faults: Vec<ProtocolError>,
     pub admission_closed: bool,
     pub retained_slots: usize,
     pub cleanup_end: Option<u64>,
@@ -159,7 +199,14 @@ impl GroupRegistry {
         keeper: &Path,
         publish: impl FnOnce(&SlotId, &GroupReport) -> io::Result<()>,
     ) -> io::Result<SlotId> {
-        let at = now()?;
+        let at = match now() {
+            Ok(at) => at,
+            Err(error) => {
+                self.inner.poison("SCOPE_CLOCK");
+                self.inner.begin(0, 0);
+                return Err(error);
+            }
+        };
         let hard_end = self.inner.hard_end;
         self.inner.admit(at, |owner| {
             GroupLease::spawn_keeper(owner, root, keeper, hard_end)
@@ -171,10 +218,26 @@ impl GroupRegistry {
         })
     }
     pub fn await_ready(&mut self, id: &SlotId) -> io::Result<()> {
-        self.inner.slot(id)?.lease.await_ready()
+        self.with_slot(id, |slot| slot.lease.await_ready())
     }
     pub fn start(&mut self, id: &SlotId, command: Command) -> io::Result<()> {
-        self.inner.slot(id)?.lease.start(command)
+        self.with_slot(id, |slot| slot.lease.start(command))
+    }
+    fn with_slot<T>(&mut self, id: &SlotId, action: impl FnOnce(&mut GroupSlot) -> io::Result<T>) -> io::Result<T> {
+        let admission = self.inner.owner.borrow().check_admission();
+        let result = admission.map_err(|e| io::Error::other(e.0))
+            .and_then(|()| self.inner.slot(id).and_then(action));
+        if result.is_err() {
+            self.inner.poison("SCOPE_EDGE_OPERATION");
+            self.begin_cleanup(self.inner.hard_end);
+        }
+        result
+    }
+    pub fn group_report(&self, id: &SlotId) -> io::Result<GroupReport> {
+        if !Rc::ptr_eq(&id.registry, &self.inner.identity) || id.index >= self.inner.slots.len() {
+            return Err(io::Error::other("SCOPE_SLOT_ID"));
+        }
+        Ok(self.inner.slots[id.index].lease.report())
     }
     pub fn begin_cleanup(&mut self, deadline: u64) {
         match now() {
@@ -189,19 +252,25 @@ impl GroupRegistry {
     pub fn report(&self) -> RegistryReport {
         let owner = self.inner.owner.borrow();
         RegistryReport { first_fault: owner.first_fault, admission_closed: owner.admission_closed,
+            secondary_faults: self.inner.secondary_faults.clone(),
             retained_slots: self.inner.slots.len(), cleanup_end: self.inner.cleanup_end,
             all_group_proofs: self.inner.slots.iter().all(Edge::proof),
             all_direct_waits_known: self.inner.slots.iter().all(Edge::waits_known),
             finish_called: self.inner.finished, output_eof_proven: false }
     }
     pub fn finish(&mut self) -> RegistryReport {
+        if self.inner.finished { return self.report(); }
         self.begin_cleanup(self.inner.hard_end);
-        while now().is_ok_and(|at| at < self.inner.cleanup_end.unwrap_or(0)) {
-            let report = self.poll_cleanup();
-            if report.all_direct_waits_known { break; }
+        loop {
+            // Always collect one round even if the proof bound already expired
+            // or the clock failed. Retain those late facts without upgrading it.
+            self.poll_cleanup();
+            match now() {
+                Ok(at) => { if self.inner.finish_at(at) { break; } },
+                Err(_) => { self.inner.poison("SCOPE_CLOCK"); self.inner.finished = true; break; }
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        self.inner.finished = true;
         self.report()
     }
 }
