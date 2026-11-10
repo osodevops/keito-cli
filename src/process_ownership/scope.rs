@@ -1105,7 +1105,8 @@ impl Scope {
         if self.terminal_sent {
             return false;
         }
-        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger, self.core.cursor);
+        let start = self.core.cursor;
+        Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger, start);
         self.terminal_sent = true;
         let clean = self.report().clean && operation_clean;
         if !clean {
