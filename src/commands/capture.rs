@@ -612,7 +612,7 @@ async fn run_inner(
             #[cfg(not(unix))]
             let repo = current_repo()?;
             #[cfg(unix)]
-            let clock = match entry_scope.as_deref_mut() {
+            let clock = match entry_scope {
                 Some(scope) => {
                     let mut owner = crate::capture_command_owner::CommandOwner::with_scope(scope)?;
                     Clock::now_with(&mut owner)?
