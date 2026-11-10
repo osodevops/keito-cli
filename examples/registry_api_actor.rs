@@ -32,6 +32,51 @@ mod unix {
         "api-edge-fault",
         "api-expired-bound",
     ];
+    #[derive(Clone, Copy)]
+    enum EntryStage {
+        Arguments,
+        PrivateRole,
+        Images,
+        Binding,
+        Canary,
+        EventOpen,
+        ControllerGroup,
+        Clock,
+        Run,
+        FiniteRole,
+    }
+    impl EntryStage {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Arguments => "ARGUMENTS",
+                Self::PrivateRole => "PRIVATE_ROLE",
+                Self::Images => "IMAGES",
+                Self::Binding => "BINDING",
+                Self::Canary => "CANARY",
+                Self::EventOpen => "EVENT_OPEN",
+                Self::ControllerGroup => "CONTROLLER_GROUP",
+                Self::Clock => "CLOCK",
+                Self::Run => "RUN",
+                Self::FiniteRole => "FINITE_ROLE",
+            }
+        }
+    }
+    fn entry_failure(stage: EntryStage, reason: &str) -> Value {
+        // No argv, path, environment value or arbitrary error text can enter
+        // this early packet. Unknown reasons remain unknown, not a diagnosis.
+        let safe = match reason {
+            "ARGS" | "PRIVATE_ENV" | "ENV_KEYS" | "POLICY_PREREQUISITE" | "PATH"
+            | "MODE" | "SELF" | "IMAGE_PATH" | "BINDING" | "BINDING_SCHEMA"
+            | "BINDING_MISMATCH" | "HASH_OPEN" | "HASH_META" | "HASH_READ"
+            | "HASH_LIMIT" | "HASH_DRIFT" | "CANARY" | "EVENT_OPEN"
+            | "CONTROLLER_GROUP" | "CLOCK" | "FIRST_FAILED" | "LEADER_ARGS"
+            | "ROLE_FD" | "ROLE_FD_BLOCKING" | "FORK" => reason,
+            _ => "UNCLASSIFIED",
+        };
+        json!({"actor_failure":true,"entry_phase":stage.label(),"reason":safe,
+            "resource_admission_may_have_started":matches!(stage,EntryStage::Run|EntryStage::FiniteRole),
+            "runtime_qualification":false})
+    }
     fn clock() -> R<u64> {
         let mut t = std::mem::MaybeUninit::<libc::timespec>::uninit();
         if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) } != 0 {
@@ -604,12 +649,15 @@ mod unix {
         Ok(b)
     }
 
-    fn controller(args: &[String]) -> R<()> {
+    fn controller(args: &[String], stage: &mut EntryStage) -> R<()> {
+        *stage = EntryStage::Arguments;
         if args.len() != 3 || !CASES.contains(&args[1].as_str()) {
             return Err("ARGS");
         }
         let root = PathBuf::from(&args[0]);
+        *stage = EntryStage::PrivateRole;
         private_role(&root)?;
+        *stage = EntryStage::Images;
         let image = std::env::current_exe().map_err(|_| "SELF")?;
         let keeper = root.join("bin/keeper");
         if image != root.join("bin/actor") || Path::new(&args[2]) != keeper {
@@ -617,13 +665,16 @@ mod unix {
         }
         owned(&image, &root, false)?;
         owned(&keeper, &root, false)?;
+        *stage = EntryStage::Binding;
         let bound = binding(&root, &image, &keeper)?;
         let scenario = args[1].as_str();
+        *stage = EntryStage::Canary;
         if scenario == "api-publication-fault"
             && fs::read(root.join("registration-1.json")).map_err(|_| "CANARY")? != b"CANARY\n"
         {
             return Err("CANARY");
         }
+        *stage = EntryStage::EventOpen;
         let log = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -631,11 +682,13 @@ mod unix {
             .custom_flags(libc::O_NOFOLLOW)
             .open(root.join("events.jsonl"))
             .map_err(|_| "EVENT_OPEN")?;
+        *stage = EntryStage::ControllerGroup;
         if unsafe { libc::getpid() } == unsafe { libc::getsid(0) }
             || unsafe { libc::setpgid(0, 0) } != 0
         {
             return Err("CONTROLLER_GROUP");
         }
+        *stage = EntryStage::Clock;
         let start = clock()?;
         let hard = start + 3 * NS;
         let safety = start + 4 * NS;
@@ -649,6 +702,7 @@ mod unix {
             first: None,
             secondary: Vec::new(),
         };
+        *stage = EntryStage::Run;
         let outcome = (|| -> R<Value> {
             let a = run.spawn(&root, &keeper, 0).map_err(|_| "SPAWN_0")?;
             run.registry.await_ready(&a).map_err(|_| "READY_0")?;
@@ -820,13 +874,39 @@ mod unix {
 
     pub fn main() {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut stage = EntryStage::Arguments;
         let result = if args.first().is_some_and(|s| s == "--finite-leader") {
+            stage = EntryStage::FiniteRole;
             finite_leader(&args[1..])
         } else {
-            controller(&args)
+            controller(&args, &mut stage)
         };
-        if result.is_err() {
+        if let Err(reason) = result {
+            // Existing private output sinks and bounded fallback, never a new
+            // path write or proof. A failed diagnostic cannot change exit1.
+            let _ = emit_fact_fallback(&entry_failure(stage, reason));
             std::process::exit(1);
+        }
+    }
+
+    #[cfg(test)]
+    mod entry_diagnostic_tests {
+        use super::*;
+
+        #[test]
+        fn preflight_diagnostic_has_no_arbitrary_text_or_resource_proof() {
+            for text in ["/private/secret", "TOKEN_VALUE", "ENV_KEYS\nsecret", ""] {
+                let packet = entry_failure(EntryStage::PrivateRole, text);
+                assert_eq!(packet["reason"], "UNCLASSIFIED");
+                assert_eq!(packet["entry_phase"], "PRIVATE_ROLE");
+                assert_eq!(packet["resource_admission_may_have_started"], false);
+                assert_eq!(packet["runtime_qualification"], false);
+                assert_eq!(packet.as_object().unwrap().len(), 5);
+            }
+            let packet = entry_failure(EntryStage::PrivateRole, "ENV_KEYS");
+            assert_eq!(packet["reason"], "ENV_KEYS");
+            assert!(serde_json::to_vec(&packet).unwrap().len() < 256);
+            assert_eq!(entry_failure(EntryStage::Run, "FIRST_FAILED")["resource_admission_may_have_started"], true);
         }
     }
 }
