@@ -368,12 +368,19 @@ class SourceOwner:
         self._collected_failed_managers = set()
         self._closed = False
         self.runtime_io_reserved = 0
+        self._clock_broadcasting = False
 
     def fail(self, reason):
         if self.first_fault is None:
             self.first_fault = reason
         self.budget.poison_owner(self.first_fault)
         self.unsettled = self.admission_closed = True
+
+    def fail_manager(self, manager, reason):
+        # Physical collection from a failed manager is never clean proof. The
+        # finalizer already retains/caches these two outcomes independently.
+        self._failed_managers.add(id(manager))
+        self.fail(reason)
 
     def __enter__(self):
         global CURRENT
@@ -390,7 +397,7 @@ class SourceOwner:
                 if descriptor != "4" or contract != "2" or integer(parent, 1, 2147483647) != os.getppid():
                     raise ProtocolError("OWNER_PARENT_IDENTITY")
                 self.deadline_ns = integer(end, 1, 18446744073709551615)
-                if self.deadline_ns <= time.monotonic_ns():
+                if self.deadline_ns <= self.now():
                     raise ProtocolError("OWNER_DEADLINE")
             if (descriptor is None) != (nonce is None):
                 raise ProtocolError("PARTIAL_ENVIRONMENT")
@@ -429,6 +436,16 @@ class SourceOwner:
         except BaseException:
             self.deadline_ns = 0
             self.fail("OWNER_CLOCK")
+            if not self._clock_broadcasting:
+                self._clock_broadcasting = True
+                try:
+                    for manager in self.managers:
+                        try: manager.begin_cleanup(0)
+                        except BaseException:
+                            self._failed_managers.add(id(manager))
+                            self.fail("MANAGER_CLEANUP_BEGIN")
+                finally:
+                    self._clock_broadcasting = False
             return 0
 
     def limit_end(self, end):
@@ -516,18 +533,18 @@ class SourceOwner:
                     try: manager.begin_cleanup(self.deadline_ns)
                     except BaseException:
                         self._failed_managers.add(id(manager)); self.fail("MANAGER_CLEANUP_BEGIN")
-            if time.monotonic_ns() >= self.deadline_ns:
+            if self.now() >= self.deadline_ns:
                 self.fail("MANAGER_CLEANUP_DEADLINE")
                 break
             remaining = []
             for manager in pending:
                 try:
-                    if time.monotonic_ns() >= self.deadline_ns:
+                    if self.now() >= self.deadline_ns:
                         self.fail("MANAGER_CLEANUP_DEADLINE")
                         remaining.append(manager)
                         continue
                     result = manager.poll_cleanup(self.deadline_ns)
-                    if time.monotonic_ns() >= self.deadline_ns:
+                    if self.now() >= self.deadline_ns:
                         self.fail("MANAGER_CLEANUP_DEADLINE")
                         remaining.append(manager)
                     elif result is False:
@@ -546,7 +563,7 @@ class SourceOwner:
                     self.fail("MANAGER_CLEANUP_POLL")
                     remaining.append(manager)
             pending = remaining
-            if pending and time.monotonic_ns() >= self.deadline_ns:
+            if pending and self.now() >= self.deadline_ns:
                 self.fail("MANAGER_CLEANUP_DEADLINE")
                 break
             if pending:
