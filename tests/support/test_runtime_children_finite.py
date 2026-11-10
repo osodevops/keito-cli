@@ -31,10 +31,12 @@ class Peer:
         self.settled = self.eof = False
         self.first_fault = None
         self.events = []
+        self.closed = False
     def send(self, tag, deadline_ns=None): self.trace.append((self.name, tag, deadline_ns))
     def receive(self, parent=False):
         self.trace.append((self.name, "poll"))
         if self.first_fault: raise ProtocolError(self.first_fault)
+    def close(self): self.closed = True
 
 
 def slot(name, pid, trace, end):
@@ -58,6 +60,81 @@ class RuntimeManagerTests(unittest.TestCase):
         self.manager.slots = [self.a, self.b]
         self.owner.forward([f"REGISTER|{os.getpid()}|101|{'a'*32}|0",
                             f"REGISTER|{os.getpid()}|102|{'b'*32}|0"])
+
+    def test_review_failed_endpoint_is_not_physical_eof(self):
+        self.a["endpoint"].first_fault = "INERT_ENDPOINT"
+        self.a["child"].returncode = 0
+        with patch("os.read", return_value=b""):
+            self.manager._poll_slot(self.a, False)
+        self.assertTrue(self.a["stdout_eof"] and self.a["stderr_eof"])
+        self.assertEqual(self.a["child"].returncode, 0)
+        self.assertFalse(self.a["endpoint"].eof)
+        self.assertFalse(self.a["collected"])
+
+    def test_review_known_fault_broadcasts_before_any_sibling_poll(self):
+        self.owner.fail("ORIGINAL")
+        def progress(slot, accepting): self.trace.append((slot["label"], "ordinary-poll"))
+        self.manager._poll_slot = progress
+        self.manager.poll()
+        cancel_indices = [i for i, event in enumerate(self.trace) if event[1] == "CANCEL"]
+        poll_indices = [i for i, event in enumerate(self.trace) if event[1] == "ordinary-poll"]
+        self.assertEqual(len(cancel_indices), 2)
+        self.assertLess(max(cancel_indices), min(poll_indices))
+
+    def test_review_close_error_cannot_skip_sibling_cancel(self):
+        def fail_close(): raise OSError("inert-close")
+        self.a["child"].stdin.close = fail_close
+        try:
+            self.manager.begin_cleanup(self.end)
+        except OSError:
+            pass
+        self.assertTrue(self.b["cancel_sent"])
+
+    def test_review_cancel_never_extends_original_slot_and_tightens(self):
+        self.a["end"] = 1000
+        self.b["end"] = 900
+        with patch("time.monotonic_ns", return_value=100):
+            self.manager.begin_cleanup(5000)
+            self.manager.begin_cleanup(500)
+            self.manager.begin_cleanup(6000)
+        a_ends = [event[2] for event in self.trace if event[:2] == ("a", "CANCEL")]
+        b_ends = [event[2] for event in self.trace if event[:2] == ("b", "CANCEL")]
+        self.assertEqual(a_ends, [900, 500])
+        self.assertEqual(b_ends, [900, 500])
+
+    def test_review_unconfigured_output_is_never_read(self):
+        self.a["stdout_configured"] = False
+        self.a["stderr_configured"] = True
+        with patch("os.read", return_value=b"") as read:
+            self.manager._poll_slot(self.a, False)
+        self.assertNotIn(101, [call.args[0] for call in read.call_args_list])
+        self.assertFalse(self.a["stdout_eof"])
+
+    def test_review_cached_owner_cannot_finish_clean_at_deadline(self):
+        owner = SourceOwner()
+        owner.deadline_ns = 100
+        with patch("time.monotonic_ns", return_value=100):
+            owner.finish_managers()
+        self.assertIsNotNone(owner.first_fault)
+
+    def test_review_completed_control_is_explicitly_closed(self):
+        self.a["endpoint"].settled = self.a["endpoint"].eof = True
+        self.a["child"].returncode = 0
+        with patch("os.read", return_value=b""):
+            self.manager._poll_slot(self.a, True)
+        self.assertTrue(self.a["endpoint"].closed)
+        self.assertTrue(self.a["collected"])
+
+    def test_review_poll_exception_does_not_starve_sibling_collection(self):
+        def progress(slot, accepting):
+            self.trace.append((slot["label"], "poll"))
+            if slot is self.a: raise OSError("inert-poll")
+        self.manager._poll_slot = progress
+        try:
+            self.manager.poll_cleanup(self.end)
+        except OSError:
+            pass
+        self.assertIn(("b", "poll"), self.trace)
 
     def test_broadcast_precedes_all_polls_and_sibling_cancel_survives_error(self):
         def fail(*args, **kwargs):
