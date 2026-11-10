@@ -76,13 +76,22 @@ struct Registry<E: Edge> {
 }
 impl<E: Edge> Registry<E> {
     fn new(owner: SharedOwner, hard_end: u64) -> Self {
-        Self { owner, identity: Rc::new(()), slots: Vec::new(), hard_end,
-               cleanup_end: None, finished: false, secondary_faults: Vec::new() }
+        Self {
+            owner,
+            identity: Rc::new(()),
+            slots: Vec::new(),
+            hard_end,
+            cleanup_end: None,
+            finished: false,
+            secondary_faults: Vec::new(),
+        }
     }
     fn poison(&mut self, reason: &'static str) {
         self.owner.borrow_mut().poison(ProtocolError(reason));
         if self.owner.borrow().first_fault != Some(ProtocolError(reason))
-            && self.secondary_faults.len() < 8 && !self.secondary_faults.contains(&ProtocolError(reason)) {
+            && self.secondary_faults.len() < 8
+            && !self.secondary_faults.contains(&ProtocolError(reason))
+        {
             self.secondary_faults.push(ProtocolError(reason));
         }
     }
@@ -115,7 +124,10 @@ impl<E: Edge> Registry<E> {
                 return Err(error);
             }
         };
-        let id = SlotId { index: self.slots.len(), registry: self.identity.clone() };
+        let id = SlotId {
+            index: self.slots.len(),
+            registry: self.identity.clone(),
+        };
         // Capacity was reserved BEFORE creating the handle. No fallible I/O or
         // publication occurs between factory return and local slot ownership.
         self.slots.push(edge);
@@ -141,9 +153,13 @@ impl<E: Edge> Registry<E> {
             }
             return;
         }
-        let end = requested.min(self.hard_end).min(at.saturating_add(CLEANUP_NS))
+        let end = requested
+            .min(self.hard_end)
+            .min(at.saturating_add(CLEANUP_NS))
             .min(self.cleanup_end.unwrap_or(u64::MAX));
-        if self.cleanup_end == Some(end) { return; }
+        if self.cleanup_end == Some(end) {
+            return;
+        }
         self.cleanup_end = Some(end);
         let mut fault = false;
         for edge in &mut self.slots {
@@ -153,7 +169,9 @@ impl<E: Edge> Registry<E> {
         }
         // Broadcast EVERY known slot before any poll/wait, including when one
         // begin fails. Individual edges may already have set a specific cause.
-        if fault { self.poison("SCOPE_BEGIN"); }
+        if fault {
+            self.poison("SCOPE_BEGIN");
+        }
     }
     fn poll(&mut self) {
         let mut fault = false;
@@ -162,17 +180,22 @@ impl<E: Edge> Registry<E> {
                 fault = true;
             }
         }
-        if fault { self.poison("SCOPE_POLL"); }
+        if fault {
+            self.poison("SCOPE_POLL");
+        }
         // Keep successful and failed slots alike. A wait is a fact, never a
         // substitute for group proof or permission to erase a failed handle.
     }
     fn finish_at(&mut self, at: u64) -> bool {
-        if self.finished { return true; }
+        if self.finished {
+            return true;
+        }
         if at >= self.cleanup_end.unwrap_or(0) {
             self.poison("SCOPE_CLEANUP_DEADLINE");
             self.finished = true;
         } else if self.slots.iter().all(Edge::waits_known)
-            && (self.slots.iter().all(Edge::proof) || self.owner.borrow().first_fault.is_some()) {
+            && (self.slots.iter().all(Edge::proof) || self.owner.borrow().first_fault.is_some())
+        {
             self.finished = true;
         }
         self.finished
@@ -206,7 +229,9 @@ pub struct GroupRegistry {
 }
 impl GroupRegistry {
     pub fn new(owner: SharedOwner, hard_end: u64) -> Self {
-        Self { inner: Registry::new(owner, hard_end) }
+        Self {
+            inner: Registry::new(owner, hard_end),
+        }
     }
     pub fn spawn_group(
         &mut self,
@@ -223,14 +248,22 @@ impl GroupRegistry {
             }
         };
         let hard_end = self.inner.hard_end;
-        self.inner.admit(at, |owner| {
-            GroupLease::spawn_keeper(owner, root, keeper, hard_end)
-                .map(|lease| GroupSlot { lease, proof: false })
-        }, |id, edges| {
-            // Publication sees only an actually retained lease's report.
-            let edge = edges.get(id.index).ok_or_else(|| io::Error::other("SCOPE_NOT_REGISTERED"))?;
-            publish(id, &edge.lease.report())
-        })
+        self.inner.admit(
+            at,
+            |owner| {
+                GroupLease::spawn_keeper(owner, root, keeper, hard_end).map(|lease| GroupSlot {
+                    lease,
+                    proof: false,
+                })
+            },
+            |id, edges| {
+                // Publication sees only an actually retained lease's report.
+                let edge = edges
+                    .get(id.index)
+                    .ok_or_else(|| io::Error::other("SCOPE_NOT_REGISTERED"))?;
+                publish(id, &edge.lease.report())
+            },
+        )
     }
     pub fn await_ready(&mut self, id: &SlotId) -> io::Result<()> {
         self.with_slot(id, |slot| slot.lease.await_ready())
@@ -238,9 +271,14 @@ impl GroupRegistry {
     pub fn start(&mut self, id: &SlotId, command: Command) -> io::Result<()> {
         self.with_slot(id, |slot| slot.lease.start(command))
     }
-    fn with_slot<T>(&mut self, id: &SlotId, action: impl FnOnce(&mut GroupSlot) -> io::Result<T>) -> io::Result<T> {
+    fn with_slot<T>(
+        &mut self,
+        id: &SlotId,
+        action: impl FnOnce(&mut GroupSlot) -> io::Result<T>,
+    ) -> io::Result<T> {
         let admission = self.inner.owner.borrow().check_admission();
-        let result = admission.map_err(|e| io::Error::other(e.0))
+        let result = admission
+            .map_err(|e| io::Error::other(e.0))
             .and_then(|()| self.inner.slot(id).and_then(action));
         if result.is_err() {
             self.inner.poison("SCOPE_EDGE_OPERATION");
@@ -257,7 +295,10 @@ impl GroupRegistry {
     pub fn begin_cleanup(&mut self, deadline: u64) {
         match now() {
             Ok(at) => self.inner.begin(at, deadline),
-            Err(_) => { self.inner.poison("SCOPE_CLOCK"); self.inner.begin(0, 0); }
+            Err(_) => {
+                self.inner.poison("SCOPE_CLOCK");
+                self.inner.begin(0, 0);
+            }
         }
     }
     pub fn poll_cleanup(&mut self) -> RegistryReport {
@@ -269,27 +310,55 @@ impl GroupRegistry {
     }
     pub fn report(&self) -> RegistryReport {
         let owner = self.inner.owner.borrow();
-        let groups: Vec<_> = self.inner.slots.iter().enumerate().map(|(slot, edge)|
-            RegisteredGroupReport { slot, facts: edge.lease.report(), group_proof: edge.proof }).collect();
+        let groups: Vec<_> = self
+            .inner
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(slot, edge)| RegisteredGroupReport {
+                slot,
+                facts: edge.lease.report(),
+                group_proof: edge.proof,
+            })
+            .collect();
         let all_group_proofs = groups.iter().all(|g| g.group_proof);
-        let all_direct_waits_known = groups.iter().all(|g| g.facts.keeper_status.is_some()
-            && (!g.facts.workload_spawned || g.facts.workload_status.is_some()));
-        RegistryReport { first_fault: owner.first_fault, admission_closed: owner.admission_closed,
+        let all_direct_waits_known = groups.iter().all(|g| {
+            g.facts.keeper_status.is_some()
+                && (!g.facts.workload_spawned || g.facts.workload_status.is_some())
+        });
+        RegistryReport {
+            first_fault: owner.first_fault,
+            admission_closed: owner.admission_closed,
             secondary_faults: self.inner.secondary_faults.clone(),
-            retained_slots: self.inner.slots.len(), cleanup_end: self.inner.cleanup_end,
-            groups, all_group_proofs, all_direct_waits_known,
-            finish_called: self.inner.finished, output_eof_proven: false }
+            retained_slots: self.inner.slots.len(),
+            cleanup_end: self.inner.cleanup_end,
+            groups,
+            all_group_proofs,
+            all_direct_waits_known,
+            finish_called: self.inner.finished,
+            output_eof_proven: false,
+        }
     }
     pub fn finish(&mut self) -> RegistryReport {
-        if self.inner.finished { return self.report(); }
+        if self.inner.finished {
+            return self.report();
+        }
         self.begin_cleanup(self.inner.hard_end);
         loop {
             // Always collect one round even if the proof bound already expired
             // or the clock failed. Retain those late facts without upgrading it.
             self.poll_cleanup();
             match now() {
-                Ok(at) => { if self.inner.finish_at(at) { break; } },
-                Err(_) => { self.inner.poison("SCOPE_CLOCK"); self.inner.finished = true; break; }
+                Ok(at) => {
+                    if self.inner.finish_at(at) {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    self.inner.poison("SCOPE_CLOCK");
+                    self.inner.finished = true;
+                    break;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
