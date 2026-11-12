@@ -268,7 +268,9 @@ pub async fn install_defaults(global: &GlobalFlags, mode: OutputMode) -> Result<
         let resources = ordinary_scope.finish().clean;
         let terminal = ordinary_scope.publish_terminal(resources && result.is_ok());
         if result.is_ok() && (!resources || !terminal) {
-            return Err(AppError::Config("Default installer ownership did not settle".into()));
+            return Err(AppError::Config(
+                "Default installer ownership did not settle".into(),
+            ));
         }
     }
     result
@@ -292,37 +294,51 @@ async fn install(
         ));
     }
     #[cfg(unix)]
-    return install_native(global, mode, source, agents, skip_skills_add, confirm_migration, scope);
+    return install_native(
+        global,
+        mode,
+        source,
+        agents,
+        skip_skills_add,
+        confirm_migration,
+        scope,
+    );
     #[cfg(not(unix))]
     {
-    let runtime = crate::capture_runtime_pair::current()?;
-    let home =
-        dirs::home_dir().ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
-    let bundled_skill = if !skip_skills_add && use_bundled {
-        Some(materialize_bundled_skill()?)
-    } else {
-        None
-    };
-    for agent in &agents {
-        let root = prepare_install_root(source, *agent,
-            bundled_skill.as_ref().map(|skill| skill.skill_root.as_path()),
-            !skip_skills_add && !use_bundled, !global.quiet && mode == OutputMode::Table)?;
-        let options = crate::skill_adapter::InstallOptions {
-            source_root: &root,
-            profile_home: &home,
-            agent: *agent,
-            runtime: &runtime,
-            confirm_migration,
-            harness_version: None,
+        let runtime = crate::capture_runtime_pair::current()?;
+        let home = dirs::home_dir()
+            .ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
+        let bundled_skill = if !skip_skills_add && use_bundled {
+            Some(materialize_bundled_skill()?)
+        } else {
+            None
         };
-        crate::skill_adapter::install(options)?;
-    }
+        for agent in &agents {
+            let root = prepare_install_root(
+                source,
+                *agent,
+                bundled_skill
+                    .as_ref()
+                    .map(|skill| skill.skill_root.as_path()),
+                !skip_skills_add && !use_bundled,
+                !global.quiet && mode == OutputMode::Table,
+            )?;
+            let options = crate::skill_adapter::InstallOptions {
+                source_root: &root,
+                profile_home: &home,
+                agent: *agent,
+                runtime: &runtime,
+                confirm_migration,
+                harness_version: None,
+            };
+            crate::skill_adapter::install(options)?;
+        }
 
-    if global.quiet {
-        return Ok(());
-    }
+        if global.quiet {
+            return Ok(());
+        }
 
-    print_install_status(collect_status(global), mode)
+        print_install_status(collect_status(global), mode)
     }
 }
 fn print_install_status(current: SkillStatus, mode: OutputMode) -> Result<(), AppError> {
@@ -342,10 +358,19 @@ fn print_install_status(current: SkillStatus, mode: OutputMode) -> Result<(), Ap
     Ok(())
 }
 
-fn prepare_install_root(source: &str, agent: SkillAgent, bundled: Option<&Path>,
-    download: bool, show_output: bool) -> Result<PathBuf, AppError> {
-    if download { run_skills_add(source, agent, show_output)?; }
-    if let Some(root) = bundled { return Ok(root.to_owned()); }
+fn prepare_install_root(
+    source: &str,
+    agent: SkillAgent,
+    bundled: Option<&Path>,
+    download: bool,
+    show_output: bool,
+) -> Result<PathBuf, AppError> {
+    if download {
+        run_skills_add(source, agent, show_output)?;
+    }
+    if let Some(root) = bundled {
+        return Ok(root.to_owned());
+    }
     hook_installer_path(agent)
         .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
         .ok_or_else(|| AppError::Config("Keito skill source is unavailable".into()))
@@ -357,16 +382,23 @@ pub(crate) trait InstallSteps {
     fn publish(&mut self, agent: SkillAgent, version: String) -> Result<(), AppError>;
 }
 #[cfg(unix)]
-pub(crate) fn selected_install(agents: &[SkillAgent], steps: &mut impl InstallSteps) -> Result<(), AppError> {
+pub(crate) fn selected_install(
+    agents: &[SkillAgent],
+    steps: &mut impl InstallSteps,
+) -> Result<(), AppError> {
     if !(1..=2).contains(&agents.len()) || (agents.len() == 2 && agents[0] == agents[1]) {
-        return Err(AppError::InvalidInput("Select one or two distinct installer targets".into()));
+        return Err(AppError::InvalidInput(
+            "Select one or two distinct installer targets".into(),
+        ));
     }
     let mut versions = Vec::with_capacity(agents.len());
     for agent in agents {
         versions.push((*agent, steps.probe(*agent)?));
     }
     steps.barrier()?;
-    for (agent, version) in versions { steps.publish(agent, version)?; }
+    for (agent, version) in versions {
+        steps.publish(agent, version)?;
+    }
     Ok(())
 }
 #[cfg(unix)]
@@ -385,46 +417,81 @@ struct CurrentInstallSteps<'a, 'scope> {
 #[cfg(unix)]
 impl InstallSteps for CurrentInstallSteps<'_, '_> {
     fn probe(&mut self, agent: SkillAgent) -> Result<String, AppError> {
-        let runner = self.preflight.as_mut()
+        let runner = self
+            .preflight
+            .as_mut()
             .ok_or_else(|| AppError::Config("Installer preflight already consumed".into()))?;
         crate::skill_adapter::detect_version(agent, runner)
     }
     fn barrier(&mut self) -> Result<(), AppError> {
-        let preflight = self.preflight.take()
+        let preflight = self
+            .preflight
+            .take()
             .ok_or_else(|| AppError::Config("Installer preflight already consumed".into()))?;
         self.publication = Some(preflight.seal()?);
         Ok(())
     }
     fn publish(&mut self, agent: SkillAgent, version: String) -> Result<(), AppError> {
-        let publication = self.publication.as_mut()
-            .ok_or_else(|| AppError::Config("Installer publication requires settled preflight".into()))?;
+        let publication = self.publication.as_mut().ok_or_else(|| {
+            AppError::Config("Installer publication requires settled preflight".into())
+        })?;
         publication.check_live()?;
         if self.materialize && self.bundled.is_none() {
             self.bundled = Some(materialize_bundled_skill()?);
         }
         publication.check_live()?;
-        let root = prepare_install_root(self.source, agent,
-            self.bundled.as_ref().map(|skill| skill.skill_root.as_path()), self.download, self.show_output)?;
+        let root = prepare_install_root(
+            self.source,
+            agent,
+            self.bundled
+                .as_ref()
+                .map(|skill| skill.skill_root.as_path()),
+            self.download,
+            self.show_output,
+        )?;
         publication.check_live()?;
-        crate::skill_adapter::install_prepared(crate::skill_adapter::InstallOptions {
-            source_root: &root, profile_home: &self.home, agent, runtime: &self.runtime,
-            confirm_migration: self.confirm_migration, harness_version: None,
-        }, version, &mut || publication.check_live())?;
+        crate::skill_adapter::install_prepared(
+            crate::skill_adapter::InstallOptions {
+                source_root: &root,
+                profile_home: &self.home,
+                agent,
+                runtime: &self.runtime,
+                confirm_migration: self.confirm_migration,
+                harness_version: None,
+            },
+            version,
+            &mut || publication.check_live(),
+        )?;
         Ok(())
     }
 }
 #[cfg(unix)]
-fn install_native(global: &GlobalFlags, mode: OutputMode, source: &str,
-    agents: Vec<SkillAgent>, skip_skills_add: bool, confirm_migration: bool,
-    scope: Option<&mut crate::process_ownership::scope::Scope>) -> Result<(), AppError> {
+fn install_native(
+    global: &GlobalFlags,
+    mode: OutputMode,
+    source: &str,
+    agents: Vec<SkillAgent>,
+    skip_skills_add: bool,
+    confirm_migration: bool,
+    scope: Option<&mut crate::process_ownership::scope::Scope>,
+) -> Result<(), AppError> {
     let preflight = crate::capture_command_owner::InstallerPreflight::new(scope, agents.len())?;
     let runtime = preflight.runtime().clone();
-    let home = dirs::home_dir().ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
     let use_bundled = source.is_empty() || source == BUNDLED_SKILL_SOURCE;
-    let mut steps = CurrentInstallSteps { preflight: Some(preflight), publication: None, runtime,
-        home, source, bundled: None, materialize: !skip_skills_add && use_bundled,
+    let mut steps = CurrentInstallSteps {
+        preflight: Some(preflight),
+        publication: None,
+        runtime,
+        home,
+        source,
+        bundled: None,
+        materialize: !skip_skills_add && use_bundled,
         download: !skip_skills_add && !use_bundled,
-        show_output: !global.quiet && mode == OutputMode::Table, confirm_migration };
+        show_output: !global.quiet && mode == OutputMode::Table,
+        confirm_migration,
+    };
     let result = (|| {
         selected_install(&agents, &mut steps)?;
         let publication = steps.publication.as_mut().unwrap();
@@ -446,12 +513,19 @@ fn install_native(global: &GlobalFlags, mode: OutputMode, source: &str,
 #[cfg(all(test, unix))]
 mod installer_order_tests {
     use super::*;
-    struct Recorder { events: Vec<String>, fail: Option<&'static str> }
+    struct Recorder {
+        events: Vec<String>,
+        fail: Option<&'static str>,
+    }
     impl Recorder {
         fn event(&mut self, event: String) -> Result<(), AppError> {
             let fail = self.fail == Some(event.as_str());
             self.events.push(event);
-            if fail { Err(AppError::Config("Injected installer step failure".into())) } else { Ok(()) }
+            if fail {
+                Err(AppError::Config("Injected installer step failure".into()))
+            } else {
+                Ok(())
+            }
         }
     }
     impl InstallSteps for Recorder {
@@ -459,13 +533,18 @@ mod installer_order_tests {
             self.event(format!("probe:{}", agent.skills_cli_name()))?;
             Ok("synthetic-version".into())
         }
-        fn barrier(&mut self) -> Result<(), AppError> { self.event("barrier".into()) }
+        fn barrier(&mut self) -> Result<(), AppError> {
+            self.event("barrier".into())
+        }
         fn publish(&mut self, agent: SkillAgent, _: String) -> Result<(), AppError> {
             self.event(format!("publish:{}", agent.skills_cli_name()))
         }
     }
     fn run(fail: Option<&'static str>) -> (Recorder, Result<(), AppError>) {
-        let mut recorder = Recorder { events: vec![], fail };
+        let mut recorder = Recorder {
+            events: vec![],
+            fail,
+        };
         let result = selected_install(&[SkillAgent::Codex, SkillAgent::ClaudeCode], &mut recorder);
         (recorder, result)
     }
@@ -473,7 +552,16 @@ mod installer_order_tests {
     fn installer_order_all_probes_and_barrier_precede_publication() {
         let (recorder, result) = run(None);
         assert!(result.is_ok());
-        assert_eq!(recorder.events, ["probe:codex", "probe:claude-code", "barrier", "publish:codex", "publish:claude-code"]);
+        assert_eq!(
+            recorder.events,
+            [
+                "probe:codex",
+                "probe:claude-code",
+                "barrier",
+                "publish:codex",
+                "publish:claude-code"
+            ]
+        );
     }
     #[test]
     fn installer_order_second_probe_refusal_publishes_nothing() {
@@ -485,7 +573,10 @@ mod installer_order_tests {
     fn installer_order_barrier_refusal_publishes_nothing() {
         let (recorder, result) = run(Some("barrier"));
         assert!(result.is_err());
-        assert_eq!(recorder.events, ["probe:codex", "probe:claude-code", "barrier"]);
+        assert_eq!(
+            recorder.events,
+            ["probe:codex", "probe:claude-code", "barrier"]
+        );
     }
     #[test]
     fn installer_order_first_probe_refusal_is_an_unchanged_control() {
@@ -724,12 +815,17 @@ fn collect_status(global: &GlobalFlags) -> SkillStatus {
 }
 #[cfg(unix)]
 fn collect_installed_status(global: &GlobalFlags) -> SkillStatus {
-    status_from_diagnostics(ResolvedAuth::resolve(global).ok(),
+    status_from_diagnostics(
+        ResolvedAuth::resolve(global).ok(),
         serde_json::json!({"status":"NOT_CHECKED_AFTER_INSTALL", "delivery_verified":false}),
-        serde_json::json!({"status":"NOT_CHECKED_AFTER_INSTALL"}))
+        serde_json::json!({"status":"NOT_CHECKED_AFTER_INSTALL"}),
+    )
 }
-fn status_from_diagnostics(auth: Option<ResolvedAuth>, capture: serde_json::Value,
-    worker: serde_json::Value) -> SkillStatus {
+fn status_from_diagnostics(
+    auth: Option<ResolvedAuth>,
+    capture: serde_json::Value,
+    worker: serde_json::Value,
+) -> SkillStatus {
     let delivery_verified = capture
         .get("delivery_verified")
         .and_then(serde_json::Value::as_bool)

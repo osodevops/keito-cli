@@ -48,10 +48,10 @@ mod implementation {
         Ok(false)
     }
 }
-#[cfg(unix)]
-pub(crate) use implementation::{detect_version, install_prepared};
 #[cfg(all(unix, test))]
 pub(crate) use implementation::tests;
+#[cfg(unix)]
+pub(crate) use implementation::{detect_version, install_prepared};
 pub use implementation::{inspect, install, uninstall};
 #[cfg(unix)]
 pub(crate) fn registration_words(command: &str) -> Option<Vec<String>> {

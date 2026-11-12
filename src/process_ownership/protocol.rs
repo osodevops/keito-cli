@@ -148,10 +148,15 @@ pub struct Endpoint {
 impl Endpoint {
     /// Nonterminal metadata predicate only; never sends proof or closes a peer.
     pub(super) fn sent_resources_complete(&self) -> bool {
-        self.sent_live && !self.sent_terminal && !self.cancelled
-            && self.first_fault.is_none() && self.owner.borrow().first_fault.is_none()
-            && self.pending.is_empty() && self.events.is_empty()
-            && self.last_poll.reads < MAX_READS && self.last_poll.parsed < MAX_PARSE
+        self.sent_live
+            && !self.sent_terminal
+            && !self.cancelled
+            && self.first_fault.is_none()
+            && self.owner.borrow().first_fault.is_none()
+            && self.pending.is_empty()
+            && self.events.is_empty()
+            && self.last_poll.reads < MAX_READS
+            && self.last_poll.parsed < MAX_PARSE
             && self.sent_registrations.values().all(|waited| *waited)
     }
     pub(super) fn set_expected_child(&mut self, pid: u32) -> Result<()> {
@@ -539,10 +544,15 @@ mod installer_metadata_tests {
         assert!(!endpoint.sent_resources_complete());
         endpoint.send_live().unwrap();
         assert!(endpoint.sent_resources_complete());
-        let root = std::process::id(); let child = if root == 42 { 43 } else { 42 };
-        endpoint.metadata(&format!("REGISTER|{root}|{child}|{}|0", "cd".repeat(16))).unwrap();
+        let root = std::process::id();
+        let child = if root == 42 { 43 } else { 42 };
+        endpoint
+            .metadata(&format!("REGISTER|{root}|{child}|{}|0", "cd".repeat(16)))
+            .unwrap();
         assert!(!endpoint.sent_resources_complete());
-        endpoint.metadata(&format!("WAITED|{root}|{child}|{}|0", "cd".repeat(16))).unwrap();
+        endpoint
+            .metadata(&format!("WAITED|{root}|{child}|{}|0", "cd".repeat(16)))
+            .unwrap();
         assert!(endpoint.sent_resources_complete());
         assert!(!endpoint.sent_terminal);
         endpoint.send_terminal(true).unwrap();

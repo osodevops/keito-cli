@@ -650,7 +650,8 @@ fn install_versioned(
     install_versioned_checked(options, version, &mut || Ok(()))
 }
 fn install_versioned_checked(
-    options: InstallOptions<'_>, version: String,
+    options: InstallOptions<'_>,
+    version: String,
     check: &mut impl FnMut() -> Result<(), AppError>,
 ) -> Result<InstallOutcome, AppError> {
     check()?;
@@ -1245,23 +1246,38 @@ pub(crate) mod tests {
     }
     #[test]
     fn installer_preflight_errors_reach_no_real_adapter_publication() {
-        use crate::commands::skill::{InstallSteps, selected_install};
-        struct Steps<'a> { fixture: &'a Fixture, fail_barrier: bool, published: usize }
+        use crate::commands::skill::{selected_install, InstallSteps};
+        struct Steps<'a> {
+            fixture: &'a Fixture,
+            fail_barrier: bool,
+            published: usize,
+        }
         impl InstallSteps for Steps<'_> {
             fn probe(&mut self, agent: SkillAgent) -> Result<String, AppError> {
-                if !self.fail_barrier && agent == SkillAgent::ClaudeCode { return Err(failure()); }
+                if !self.fail_barrier && agent == SkillAgent::ClaudeCode {
+                    return Err(failure());
+                }
                 Ok("0.167.0".into())
             }
-            fn barrier(&mut self) -> Result<(), AppError> { Err(failure()) }
+            fn barrier(&mut self) -> Result<(), AppError> {
+                Err(failure())
+            }
             fn publish(&mut self, agent: SkillAgent, version: String) -> Result<(), AppError> {
                 self.published += 1;
-                self.fixture.install(agent, &version, false)?; Ok(())
+                self.fixture.install(agent, &version, false)?;
+                Ok(())
             }
         }
         for fail_barrier in [false, true] {
             let fixture = Fixture::new();
-            let mut steps = Steps { fixture: &fixture, fail_barrier, published: 0 };
-            assert!(selected_install(&[SkillAgent::Codex, SkillAgent::ClaudeCode], &mut steps).is_err());
+            let mut steps = Steps {
+                fixture: &fixture,
+                fail_barrier,
+                published: 0,
+            };
+            assert!(
+                selected_install(&[SkillAgent::Codex, SkillAgent::ClaudeCode], &mut steps).is_err()
+            );
             assert_eq!(steps.published, 0);
             assert!(!fixture.home.join(".codex").exists());
             assert!(!fixture.home.join(".claude").exists());
@@ -1271,7 +1287,11 @@ pub(crate) mod tests {
     fn installer_config_guard_refusal_after_fsync_uses_existing_recovery() {
         use std::{cell::Cell, rc::Rc};
         struct Reset;
-        impl Drop for Reset { fn drop(&mut self) { set_hook(None); } }
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_hook(None);
+            }
+        }
         let fixture = Fixture::new();
         fixture.seed(serde_json::json!({"foreign": true}));
         let before = fs::read(fixture.config()).unwrap();
@@ -1279,12 +1299,28 @@ pub(crate) mod tests {
         let observe = Rc::clone(&reached);
         let _reset = Reset;
         set_hook(Some(Box::new(move |phase| {
-            if phase == "install-config-fsynced" { observe.set(true); }
+            if phase == "install-config-fsynced" {
+                observe.set(true);
+            }
         })));
-        let result = install_prepared(InstallOptions {
-            source_root: &fixture.source, profile_home: &fixture.home, agent: SkillAgent::Codex,
-            runtime: &fixture.runtime, confirm_migration: false, harness_version: None,
-        }, "0.167.0".into(), &mut || if reached.get() { Err(failure()) } else { Ok(()) });
+        let result = install_prepared(
+            InstallOptions {
+                source_root: &fixture.source,
+                profile_home: &fixture.home,
+                agent: SkillAgent::Codex,
+                runtime: &fixture.runtime,
+                confirm_migration: false,
+                harness_version: None,
+            },
+            "0.167.0".into(),
+            &mut || {
+                if reached.get() {
+                    Err(failure())
+                } else {
+                    Ok(())
+                }
+            },
+        );
         assert!(result.is_err());
         assert!(reached.get());
         assert_eq!(fs::read(fixture.config()).unwrap(), before);

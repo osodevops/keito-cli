@@ -245,8 +245,12 @@ impl Dir {
         self.atomic_checked(child, bytes, mode, expected, phase, &mut || Ok(()))
     }
     pub(crate) fn atomic_checked(
-        &self, child: &str, bytes: &[u8], mode: u32,
-        expected: Option<Option<&[u8]>>, phase: &str,
+        &self,
+        child: &str,
+        bytes: &[u8],
+        mode: u32,
+        expected: Option<Option<&[u8]>>,
+        phase: &str,
         check: &mut impl FnMut() -> Result<(), AppError>,
     ) -> Result<(), AppError> {
         self.verify()?;
