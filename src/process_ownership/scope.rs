@@ -503,6 +503,14 @@ impl<E: Edge> Core<E> {
             self.cancel(Some("SCOPE_INSTALLER_PHASE"), at, self.hard_end);
             return Err(error("SCOPE_INSTALLER_PHASE"));
         }
+        let Some(operation_end) = at.checked_add(INSTALL_OPERATION_NS) else {
+            self.cancel(Some("SCOPE_CLOCK"), 0, 0);
+            return Err(error("SCOPE_CLOCK"));
+        };
+        // Library callers may supply a more generous containing owner. This
+        // operation can only restrict it; main's earlier entry bound still wins.
+        self.hard_end = self.hard_end.min(operation_end);
+        self.unfinished_end = self.unfinished_end.min(self.hard_end);
         let Some(local_end) = at.checked_add(ORDINARY_OPERATION_NS) else {
             self.cancel(Some("SCOPE_CLOCK"), 0, 0);
             return Err(error("SCOPE_CLOCK"));
@@ -1694,6 +1702,18 @@ mod tests {
         let mut earlier: Core<Fake> = Core::new(Rc::default(), 350_000_000);
         earlier.begin_installer(100_000_000, 1).unwrap();
         assert_eq!(earlier.installer_end().unwrap(), 350_000_000);
+    }
+    #[test]
+    fn installer_borrowed_parent_cannot_grant_more_than_one_local_operation() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 900_000_000_000);
+        core.begin_installer(100_000_000, 2).unwrap();
+        assert_eq!(core.hard_end, 4_100_000_000);
+        assert_eq!(core.installer_end().unwrap(), 1_100_000_000);
+        assert!(core.begin_installer(500_000_000, 2).is_err());
+        assert_eq!(core.hard_end, 4_100_000_000);
+        let mut overflow: Core<Fake> = Core::new(Rc::default(), u64::MAX);
+        assert!(overflow.begin_installer(u64::MAX - 1, 1).is_err());
+        assert_eq!(overflow.cancel_end, Some(0));
     }
     #[test]
     fn installer_cohort_expiry_broadcasts_all_before_poll_and_keeps_first_fault() {

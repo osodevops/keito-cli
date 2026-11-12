@@ -397,6 +397,22 @@ impl LeafRunner for CommandOwner<'_> {
 mod tests {
     use super::*;
     #[test]
+    fn installer_dropped_unsealed_handle_keeps_its_borrowed_owner_failed() {
+        let end = crate::process_ownership::scope::monotonic_now().unwrap() + 4_000_000_000;
+        let mut scope = Scope::with_owner(Default::default(), end);
+        scope.begin_installer_preflight(1).unwrap();
+        {
+            // Actual partial-construction guard, before any image is prepared.
+            let _preflight = InstallerPreflight {
+                scope: Some(ScopeRef::Borrowed(&mut scope)), image: None, runtime: None,
+            };
+        }
+        assert_eq!(scope.first_fault(), Some(ProtocolError("SCOPE_PREFLIGHT_DROPPED")));
+        assert!(scope.report().admission_closed);
+        assert!(!scope.report().clean);
+        assert!(!scope.publish_terminal(true));
+    }
+    #[test]
     fn version_probe_failure_keeps_first_reason_when_finish_is_unproved() {
         let original: Result<(), AppError> = Err(version_probe_error(io::Error::other(
             ProtocolError("SCOPE_ADMISSION"),
