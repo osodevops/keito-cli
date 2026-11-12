@@ -504,7 +504,11 @@ fn install_native(
         }
         publication.check_live()
     })();
-    match steps.publication.take() {
+    let publication = steps.publication.take();
+    // Scratch cleanup is part of the operation, including standalone finality.
+    // A late cleanup cannot be hidden behind an earlier clean terminal.
+    drop(steps.bundled.take());
+    match publication {
         Some(publication) => publication.finish(result),
         None => result,
     }
