@@ -232,7 +232,9 @@ impl Dir {
         Ok(f)
     }
     pub(crate) fn sync(&self) -> Result<(), AppError> {
-        self.file.sync_all().map_err(|_| failure())
+        self.file.sync_all().map_err(|_| failure())?;
+        checkpoint("adapter-directory-fsynced");
+        Ok(())
     }
     pub(crate) fn atomic(
         &self,
@@ -307,6 +309,7 @@ impl Dir {
         {
             return Err(failure());
         }
+        checkpoint("adapter-entry-renamed");
         self.sync()?;
         dest.sync()
     }
@@ -440,4 +443,92 @@ fn publication_fault(phase: &str) -> Result<(), AppError> {
 #[cfg(test)]
 pub(crate) fn set_publication_fault(phase: Option<&str>) {
     FAILURE_PHASE.with(|p| *p.borrow_mut() = phase.map(str::to_owned));
+}
+
+#[cfg(test)]
+mod installer_flush_tests {
+    use super::*;
+    use std::{cell::RefCell, rc::Rc};
+
+    struct Observe(Rc<RefCell<Vec<String>>>);
+    impl Observe {
+        fn start() -> Self {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let copy = Rc::clone(&events);
+            set_hook(Some(Box::new(move |phase| {
+                copy.borrow_mut().push(phase.to_owned());
+            })));
+            Self(events)
+        }
+        fn events(&self) -> Vec<String> {
+            self.0.borrow().clone()
+        }
+    }
+    impl Drop for Observe {
+        fn drop(&mut self) {
+            set_hook(None);
+        }
+    }
+
+    #[test]
+    fn installer_flush_atomic_syncs_file_then_renamed_directory_once() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let observe = Observe::start();
+        dir.atomic("payload", b"new", 0o600, Some(None), "payload-file-fsynced")
+            .unwrap();
+        assert_eq!(
+            observe.events(),
+            ["payload-file-fsynced", "adapter-entry-renamed", "adapter-directory-fsynced"]
+        );
+        assert_eq!(dir.read("payload", 16).unwrap().unwrap(), b"new");
+    }
+
+    #[test]
+    fn installer_flush_cross_directory_rename_flushes_both_parents() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let destination = dir.child("destination", true).unwrap();
+        std::fs::write(root.path().join("payload"), b"new").unwrap();
+        let observe = Observe::start();
+        dir.rename("payload", &destination, "payload").unwrap();
+        assert_eq!(observe.events(), ["adapter-entry-renamed", "adapter-directory-fsynced", "adapter-directory-fsynced"]);
+        assert!(!dir.exists("payload").unwrap());
+        assert_eq!(destination.read("payload", 16).unwrap().unwrap(), b"new");
+    }
+
+    #[test]
+    fn installer_flush_distinct_handles_remain_conservative() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let second = Dir::anchor(root.path()).unwrap();
+        std::fs::write(root.path().join("old"), b"new").unwrap();
+        let observe = Observe::start();
+        dir.rename("old", &second, "new").unwrap();
+        assert_eq!(observe.events(), ["adapter-entry-renamed", "adapter-directory-fsynced", "adapter-directory-fsynced"]);
+    }
+
+    #[test]
+    fn installer_flush_guard_refusal_never_switches_existing_file() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        std::fs::write(root.path().join("payload"), b"old").unwrap();
+        let observe = Observe::start();
+        assert!(dir.atomic_checked("payload", b"new", 0o600, Some(Some(b"old")), "payload-file-fsynced", &mut || Err(failure())).is_err());
+        assert_eq!(observe.events(), ["payload-file-fsynced", "adapter-directory-fsynced"]);
+        assert_eq!(dir.read("payload", 16).unwrap().unwrap(), b"old");
+        assert_eq!(dir.entries().unwrap(), ["payload"]);
+    }
+
+    #[test]
+    fn installer_flush_cas_refusal_preserves_foreign_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        std::fs::write(root.path().join("payload"), b"foreign").unwrap();
+        let observe = Observe::start();
+        assert!(dir.atomic("payload", b"new", 0o600, Some(Some(b"old")), "payload-file-fsynced").is_err());
+        assert_eq!(observe.events(), ["payload-file-fsynced", "adapter-directory-fsynced"]);
+        assert_eq!(dir.read("payload", 16).unwrap().unwrap(), b"foreign");
+        assert_eq!(dir.entries().unwrap(), ["payload"]);
+    }
 }
