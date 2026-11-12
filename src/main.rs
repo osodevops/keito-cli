@@ -62,7 +62,7 @@ fn main() {
             Agent::None,
             scope.hard_end(),
             u8::from(result.is_err()),
-            diagnostic::fault_code(scope.first_fault().map(|e| e.0)),
+            diagnostic::fault_code(scope.report().first_fault.map(|e| e.0)),
         );
     }
     #[cfg(unix)]
