@@ -2,7 +2,7 @@
 //! qualified-source authority is constructed here.
 use crate::{
     capture_runtime_pair,
-    error::AppError,
+    error::{AppError, CaptureProbeReason},
     process_ownership::{
         group::CleanupPolicy,
         image::VerifiedKeeperImage,
@@ -28,6 +28,26 @@ fn probe_policy(hook: bool) -> CleanupPolicy {
 pub(crate) const LEAF_END_ENV: &str = "KEITO_CAPTURE_LEAF_END_NS";
 fn refused() -> AppError {
     AppError::Config("Capture command ownership unavailable; collection remains paused".into())
+}
+pub(crate) fn version_probe_error(error: io::Error) -> AppError {
+    let reason = match error.get_ref().and_then(|cause| cause.downcast_ref::<ProtocolError>()) {
+        Some(ProtocolError("SCOPE_ADMISSION")) => CaptureProbeReason::AdmissionRefused,
+        Some(ProtocolError("SCOPE_OPERATION_DEADLINE" | "SCOPE_PROOF_DEADLINE"
+            | "SCOPE_CLEANUP_DEADLINE" | "GROUP_DEADLINE" | "GROUP_LIFETIME")) => CaptureProbeReason::Deadline,
+        Some(ProtocolError("SCOPE_CLOCK")) => CaptureProbeReason::Clock,
+        Some(_) => CaptureProbeReason::Ownership,
+        None => CaptureProbeReason::Unavailable,
+    };
+    AppError::CaptureVersionProbe { reason, cleanup_unverified: false }
+}
+fn finish_result<T>(result: Result<T, AppError>, clean: bool) -> Result<T, AppError> {
+    if clean { return result; }
+    match result {
+        Err(AppError::CaptureVersionProbe { reason, .. }) => Err(AppError::CaptureVersionProbe {
+            reason, cleanup_unverified: true,
+        }),
+        _ => Err(refused()),
+    }
 }
 const PARENT_KEYS: [&str; 7] = [
     "KEITO_PROCESS_OWNER_FD",
@@ -139,10 +159,7 @@ impl<'a> CommandOwner<'a> {
         self.scope.finish().clean
     }
     pub(crate) fn finish<T>(&mut self, result: Result<T, AppError>) -> Result<T, AppError> {
-        if !self.finish_clean() {
-            return Err(refused());
-        }
-        result
+        finish_result(result, self.finish_clean())
     }
     pub(crate) fn fail_ack(&mut self) {
         self.scope
@@ -219,17 +236,36 @@ impl LeafRunner for CommandOwner<'_> {
             Image::Borrowed(image) => image,
         };
         let plan = IoPlan::new(Vec::new(), stdout_cap, stderr_cap)?;
-        if self.policy == CleanupPolicy::HookShort {
+        let result = if self.policy == CleanupPolicy::HookShort {
             self.scope.run_verified(command, plan, image)
         } else {
             self.scope
                 .run_verified_with_policy(command, plan, image, self.policy)
-        }
+        };
+        // Preserve only the owner's static fault type. Generic error bodies
+        // stay unexamined and cannot become public probe diagnostics.
+        result.map_err(|error| match self.scope.first_fault() {
+            Some(reason) => io::Error::new(error.kind(), reason),
+            None => error,
+        })
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn version_probe_failure_keeps_first_reason_when_finish_is_unproved() {
+        let original: Result<(), AppError> = Err(version_probe_error(io::Error::other(
+            ProtocolError("SCOPE_ADMISSION"),
+        )));
+        let error = finish_result(original, false).unwrap_err();
+        let value: serde_json::Value = serde_json::from_str(&error.to_json()).unwrap();
+        assert_eq!(value["details"]["reason"], "admission_refused");
+        assert_eq!(value["details"]["cleanup_status"], "unverified");
+        assert_eq!(value["details"]["cleanup_unverified"], true);
+        assert!(!error.to_json().contains("auth login"));
+        assert!(finish_result(Ok(()), false).is_err());
+    }
     #[test]
     fn process_ownership_command_probe_selection_keeps_hooks_short() {
         assert_eq!(probe_policy(false), CleanupPolicy::CommandProbe);

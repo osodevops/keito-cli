@@ -608,7 +608,8 @@ fn detect_version(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let result = runner.output(command, 8192, 8192).map_err(|_| failure())?;
+    let result = runner.output(command, 8192, 8192)
+        .map_err(crate::capture_command_owner::version_probe_error)?;
     if !result.status.success() {
         return Ok("unknown".into());
     }
