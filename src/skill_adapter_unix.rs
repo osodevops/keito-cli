@@ -1245,6 +1245,64 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn payload_directory_reuse_keeps_each_mutation_durable_without_noop_parent_flushes() {
+        use std::{cell::Cell, rc::Rc};
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) { set_hook(None); }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let payload: Payload = ["SKILL.md", "hooks/nested/a.sh", "hooks/nested/b.sh", "hooks/one.sh", "hooks/two.sh"]
+            .into_iter().map(|path| (path.to_owned(), path.as_bytes().to_vec())).collect();
+        let syncs = Rc::new(Cell::new(0));
+        let count = Rc::clone(&syncs);
+        let _reset = Reset;
+        set_hook(Some(Box::new(move |phase| {
+            if phase == "adapter-directory-fsynced" { count.set(count.get() + 1); }
+        })));
+        write_payload(&dir, &payload).unwrap();
+        assert_eq!(syncs.get(), 8, "five file renames, two directory creations, final root flush");
+        assert_eq!(tree(&dir).unwrap(), payload);
+        for path in payload.keys() {
+            let expected = if path.ends_with(".sh") { 0o700 } else { 0o600 };
+            assert_eq!(fs::metadata(root.path().join(path)).unwrap().permissions().mode() & 0o777, expected);
+        }
+        for path in ["hooks", "hooks/nested"] {
+            assert_eq!(fs::metadata(root.path().join(path)).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+    }
+    #[test]
+    fn payload_directory_reuse_refuses_a_replaced_parent_before_the_next_file() {
+        use std::{cell::Cell, rc::Rc};
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) { set_hook(None); }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let payload: Payload = ["hooks/a.sh", "hooks/b.sh"].into_iter()
+            .map(|path| (path.to_owned(), path.as_bytes().to_vec())).collect();
+        let replaced = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&replaced);
+        let base = root.path().to_owned();
+        let foreign = outside.path().to_owned();
+        let _reset = Reset;
+        set_hook(Some(Box::new(move |phase| {
+            if phase == "adapter-entry-renamed" && !observed.replace(true) {
+                fs::rename(base.join("hooks"), base.join("retained")).unwrap();
+                std::os::unix::fs::symlink(&foreign, base.join("hooks")).unwrap();
+            }
+        })));
+        assert!(write_payload(&dir, &payload).is_err());
+        assert!(replaced.get());
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+        assert!(root.path().join("retained/a.sh").is_file());
+        assert!(!root.path().join("retained/b.sh").exists());
+        assert!(fs::symlink_metadata(root.path().join("hooks")).unwrap().file_type().is_symlink());
+    }
+    #[test]
     fn installer_preflight_errors_reach_no_real_adapter_publication() {
         use crate::commands::skill::{selected_install, InstallSteps};
         struct Steps<'a> {
