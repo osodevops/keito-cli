@@ -7,6 +7,9 @@ the old one-second whole-install restriction; it is not a production latency
 SLA. Ordinary commands retain their original one-second entry restriction.
 Nested auth-offered installation cannot upgrade its ordinary parent, and a
 partial attachment cannot fall back to a fresh standalone installer.
+Library-supplied owners are additionally restricted once at the start of the
+installer preflight; a more generous caller cannot grant a longer installation.
+Any earlier entry or caller restriction still wins.
 
 Both selected version probes share one original one-second preflight deadline,
 including that preflight's pair preparation. Each retained slot and its actual

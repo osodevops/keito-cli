@@ -1328,6 +1328,82 @@ pub(crate) mod tests {
         assert!(!fixture.home.join(".codex/skills/keito-time-track").exists());
     }
     #[test]
+    fn installer_second_target_guard_failure_preserves_the_first_target() {
+        use crate::commands::skill::{selected_install, InstallSteps};
+        use std::{cell::Cell, rc::Rc};
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_hook(None);
+            }
+        }
+        struct Steps<'a> {
+            fixture: &'a Fixture,
+            barrier: bool,
+            first: Option<Vec<u8>>,
+        }
+        impl InstallSteps for Steps<'_> {
+            fn probe(&mut self, agent: SkillAgent) -> Result<String, AppError> {
+                Ok(match agent {
+                    SkillAgent::Codex => "0.167.0",
+                    SkillAgent::ClaudeCode => "2.1.319",
+                }
+                .into())
+            }
+            fn barrier(&mut self) -> Result<(), AppError> {
+                self.barrier = true;
+                Ok(())
+            }
+            fn publish(&mut self, agent: SkillAgent, version: String) -> Result<(), AppError> {
+                assert!(self.barrier);
+                if agent == SkillAgent::Codex {
+                    self.fixture.install(agent, &version, false)?;
+                    self.first = Some(fs::read(self.fixture.config()).unwrap());
+                    return Ok(());
+                }
+                let reached = Rc::new(Cell::new(false));
+                let observe = Rc::clone(&reached);
+                let _reset = Reset;
+                set_hook(Some(Box::new(move |phase| {
+                    if phase == "install-config-fsynced" {
+                        observe.set(true);
+                    }
+                })));
+                install_prepared(
+                    InstallOptions {
+                        source_root: &self.fixture.source,
+                        profile_home: &self.fixture.home,
+                        agent,
+                        runtime: &self.fixture.runtime,
+                        confirm_migration: false,
+                        harness_version: None,
+                    },
+                    version,
+                    &mut || {
+                        if reached.get() {
+                            Err(failure())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )?;
+                Ok(())
+            }
+        }
+        let fixture = Fixture::new();
+        let mut steps = Steps {
+            fixture: &fixture,
+            barrier: false,
+            first: None,
+        };
+        assert!(selected_install(&[SkillAgent::Codex, SkillAgent::ClaudeCode], &mut steps).is_err());
+        assert_eq!(fs::read(fixture.config()).unwrap(), steps.first.unwrap());
+        assert!(fixture.home.join(".codex/skills/keito-time-track").is_dir());
+        assert!(!fixture.home.join(".claude/settings.json").exists());
+        assert!(!fixture.home.join(".claude").join(JOURNAL).exists());
+        assert!(!fixture.home.join(".claude/skills/keito-time-track").exists());
+    }
+    #[test]
     fn native_install_is_immutable_idempotent_and_records_runtime_pair() {
         let f = Fixture::new();
         let first = f.install(SkillAgent::Codex, "0.167.0", false).unwrap();
