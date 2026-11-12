@@ -592,7 +592,7 @@ fn runtime_unchanged(runtime: &CaptureRuntimeIdentity) -> Result<(), AppError> {
     }
     Ok(())
 }
-fn detect_version(
+pub(crate) fn detect_version(
     agent: SkillAgent,
     runner: &mut impl crate::process_ownership::probes::LeafRunner,
 ) -> Result<String, AppError> {
@@ -636,14 +636,10 @@ pub fn install(options: InstallOptions<'_>) -> Result<InstallOutcome, AppError> 
     };
     install_versioned(options, version)
 }
-pub(crate) fn install_with_runner(
+pub(crate) fn install_prepared(
     options: InstallOptions<'_>,
-    runner: &mut impl crate::process_ownership::probes::LeafRunner,
+    version: String,
 ) -> Result<InstallOutcome, AppError> {
-    let version = match options.harness_version {
-        Some(version) => version.to_owned(),
-        None => detect_version(options.agent, runner)?,
-    };
     install_versioned(options, version)
 }
 fn install_versioned(

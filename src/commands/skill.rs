@@ -295,17 +295,19 @@ async fn install(
     } else {
         None
     };
+    #[cfg(unix)]
+    selected_install(&agents, &mut CurrentInstallSteps {
+        owner: &mut probe_owner, runtime: &runtime, home: &home, source,
+        bundled_root: bundled_skill.as_ref().map(|skill| skill.skill_root.as_path()),
+        download: !skip_skills_add && !use_bundled,
+        show_output: !global.quiet && mode == OutputMode::Table,
+        confirm_migration, pending_root: None,
+    })?;
+    #[cfg(not(unix))]
     for agent in &agents {
-        if !skip_skills_add && !use_bundled {
-            run_skills_add(source, *agent, !global.quiet && mode == OutputMode::Table)?;
-        }
-        let root = if let Some(skill) = bundled_skill.as_ref() {
-            skill.skill_root.clone()
-        } else {
-            hook_installer_path(*agent)
-                .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
-                .ok_or_else(|| AppError::Config("Keito skill source is unavailable".into()))?
-        };
+        let root = prepare_install_root(source, *agent,
+            bundled_skill.as_ref().map(|skill| skill.skill_root.as_path()),
+            !skip_skills_add && !use_bundled, !global.quiet && mode == OutputMode::Table)?;
         let options = crate::skill_adapter::InstallOptions {
             source_root: &root,
             profile_home: &home,
@@ -314,13 +316,8 @@ async fn install(
             confirm_migration,
             harness_version: None,
         };
-        #[cfg(unix)]
-        crate::skill_adapter::install_with_runner(options, &mut probe_owner)?;
-        #[cfg(not(unix))]
         crate::skill_adapter::install(options)?;
     }
-    #[cfg(unix)]
-    probe_owner.finish(Ok(()))?;
 
     if global.quiet {
         return Ok(());
@@ -341,6 +338,114 @@ async fn install(
     }
 
     Ok(())
+}
+
+fn prepare_install_root(source: &str, agent: SkillAgent, bundled: Option<&Path>,
+    download: bool, show_output: bool) -> Result<PathBuf, AppError> {
+    if download { run_skills_add(source, agent, show_output)?; }
+    if let Some(root) = bundled { return Ok(root.to_owned()); }
+    hook_installer_path(agent)
+        .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
+        .ok_or_else(|| AppError::Config("Keito skill source is unavailable".into()))
+}
+#[cfg(unix)]
+trait InstallSteps {
+    fn probe(&mut self, agent: SkillAgent) -> Result<String, AppError>;
+    fn barrier(&mut self) -> Result<(), AppError>;
+    fn publish(&mut self, agent: SkillAgent, version: String) -> Result<(), AppError>;
+}
+#[cfg(unix)]
+fn selected_install(agents: &[SkillAgent], steps: &mut impl InstallSteps) -> Result<(), AppError> {
+    // Retained interleaving baseline for the installer ordering regression.
+    for agent in agents {
+        let version = steps.probe(*agent)?;
+        steps.publish(*agent, version)?;
+    }
+    steps.barrier()
+}
+#[cfg(unix)]
+struct CurrentInstallSteps<'a, 'scope> {
+    owner: &'a mut crate::capture_command_owner::CommandOwner<'scope>,
+    runtime: &'a crate::capture_runtime_pair::CaptureRuntimeIdentity,
+    home: &'a Path,
+    source: &'a str,
+    bundled_root: Option<&'a Path>,
+    download: bool,
+    show_output: bool,
+    confirm_migration: bool,
+    pending_root: Option<(SkillAgent, PathBuf)>,
+}
+#[cfg(unix)]
+impl InstallSteps for CurrentInstallSteps<'_, '_> {
+    fn probe(&mut self, agent: SkillAgent) -> Result<String, AppError> {
+        let root = prepare_install_root(self.source, agent, self.bundled_root,
+            self.download, self.show_output)?;
+        self.pending_root = Some((agent, root));
+        crate::skill_adapter::detect_version(agent, self.owner)
+    }
+    fn barrier(&mut self) -> Result<(), AppError> { self.owner.finish(Ok(())) }
+    fn publish(&mut self, agent: SkillAgent, version: String) -> Result<(), AppError> {
+        let (prepared_agent, root) = self.pending_root.take()
+            .ok_or_else(|| AppError::Config("Installer preparation unavailable".into()))?;
+        if prepared_agent != agent { return Err(AppError::Config("Installer target mismatch".into())); }
+        crate::skill_adapter::install_prepared(crate::skill_adapter::InstallOptions {
+            source_root: &root, profile_home: self.home, agent, runtime: self.runtime,
+            confirm_migration: self.confirm_migration, harness_version: None,
+        }, version)?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod installer_order_tests {
+    use super::*;
+    struct Recorder { events: Vec<String>, fail: Option<&'static str> }
+    impl Recorder {
+        fn event(&mut self, event: String) -> Result<(), AppError> {
+            let fail = self.fail == Some(event.as_str());
+            self.events.push(event);
+            if fail { Err(AppError::Config("Injected installer step failure".into())) } else { Ok(()) }
+        }
+    }
+    impl InstallSteps for Recorder {
+        fn probe(&mut self, agent: SkillAgent) -> Result<String, AppError> {
+            self.event(format!("probe:{}", agent.skills_cli_name()))?;
+            Ok("synthetic-version".into())
+        }
+        fn barrier(&mut self) -> Result<(), AppError> { self.event("barrier".into()) }
+        fn publish(&mut self, agent: SkillAgent, _: String) -> Result<(), AppError> {
+            self.event(format!("publish:{}", agent.skills_cli_name()))
+        }
+    }
+    fn run(fail: Option<&'static str>) -> (Recorder, Result<(), AppError>) {
+        let mut recorder = Recorder { events: vec![], fail };
+        let result = selected_install(&[SkillAgent::Codex, SkillAgent::ClaudeCode], &mut recorder);
+        (recorder, result)
+    }
+    #[test]
+    fn installer_order_all_probes_and_barrier_precede_publication() {
+        let (recorder, result) = run(None);
+        assert!(result.is_ok());
+        assert_eq!(recorder.events, ["probe:codex", "probe:claude-code", "barrier", "publish:codex", "publish:claude-code"]);
+    }
+    #[test]
+    fn installer_order_second_probe_refusal_publishes_nothing() {
+        let (recorder, result) = run(Some("probe:claude-code"));
+        assert!(result.is_err());
+        assert_eq!(recorder.events, ["probe:codex", "probe:claude-code"]);
+    }
+    #[test]
+    fn installer_order_barrier_refusal_publishes_nothing() {
+        let (recorder, result) = run(Some("barrier"));
+        assert!(result.is_err());
+        assert_eq!(recorder.events, ["probe:codex", "probe:claude-code", "barrier"]);
+    }
+    #[test]
+    fn installer_order_first_probe_refusal_is_an_unchanged_control() {
+        let (recorder, result) = run(Some("probe:codex"));
+        assert!(result.is_err());
+        assert_eq!(recorder.events, ["probe:codex"]);
+    }
 }
 
 async fn status(

@@ -49,7 +49,7 @@ mod implementation {
     }
 }
 #[cfg(unix)]
-pub(crate) use implementation::install_with_runner;
+pub(crate) use implementation::{detect_version, install_prepared};
 #[cfg(all(unix, test))]
 pub(crate) use implementation::tests;
 pub use implementation::{inspect, install, uninstall};
