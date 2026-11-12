@@ -1116,6 +1116,46 @@ pub(crate) mod tests {
     use crate::adapter_files::set_hook;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    struct RefusedVersion(std::io::Error);
+    impl crate::process_ownership::probes::LeafRunner for RefusedVersion {
+        fn output(
+            &mut self,
+            _: std::process::Command,
+            _: usize,
+            _: usize,
+        ) -> std::io::Result<crate::process_ownership::scope::CommandResult> {
+            Err(std::mem::replace(&mut self.0, std::io::Error::other("used")))
+        }
+    }
+    #[test]
+    fn version_probe_failure_has_closed_category_and_no_file_or_login_diagnosis() {
+        let canary = "PRIVATE_PROBE_SECRET_/original/profile";
+        let error = detect_version(
+            SkillAgent::Codex,
+            &mut RefusedVersion(std::io::Error::other(canary)),
+        ).err().unwrap();
+        let serialized = error.to_json();
+        let value: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["details"]["kind"], "capture_version_probe");
+        assert_eq!(value["details"]["reason"], "unavailable");
+        assert!(!serialized.contains(canary));
+        assert!(!serialized.contains("adapter files"));
+        assert!(!serialized.contains("auth login"));
+        assert_eq!(error.exit_code(), 8);
+    }
+    #[test]
+    fn version_probe_failure_retains_closed_owner_admission_reason() {
+        let error = detect_version(
+            SkillAgent::ClaudeCode,
+            &mut RefusedVersion(std::io::Error::other(
+                crate::process_ownership::protocol::ProtocolError("SCOPE_ADMISSION"),
+            )),
+        ).err().unwrap();
+        let value: Value = serde_json::from_str(&error.to_json()).unwrap();
+        assert_eq!(value["details"]["kind"], "capture_version_probe");
+        assert_eq!(value["details"]["reason"], "admission_refused");
+        assert_eq!(value["details"]["cleanup_unverified"], false);
+    }
     struct Fixture {
         root: tempfile::TempDir,
         home: PathBuf,
