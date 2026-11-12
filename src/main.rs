@@ -10,11 +10,17 @@ fn main() {
     let mut parser_exit = None;
     let mut result = capture_runtime_pair::bootstrap_image().and_then(|()| {
         #[cfg(unix)]
+        let pending = keito_cli::process_entry::PendingEntry::attach()
+            .map_err(|_| AppError::Config("Command ownership attachment refused".into()))?;
+        let parsed = Cli::try_parse();
+        if let Err(error) = &parsed { parser_exit = Some(error.exit_code()); }
+        #[cfg(unix)]
         {
-            entry_scope = keito_cli::process_ownership::scope::Scope::entry_from_environment(1_000_000_000)
-                .map_err(|_| AppError::Config("Command ownership attachment refused".into()))?;
+            let (scope, selection) = pending.select(parsed.as_ref().ok().map(|cli| &cli.command));
+            entry_scope = scope;
+            selection.map_err(|_| AppError::Config("Command ownership policy refused".into()))?;
         }
-        let cli = match Cli::try_parse() {
+        let cli = match parsed {
             Ok(cli) => cli,
             Err(error) => { parser_exit = Some(error.exit_code()); let _ = error.print(); return Ok(()); }
         };

@@ -242,6 +242,13 @@ impl Dir {
         expected: Option<Option<&[u8]>>,
         phase: &str,
     ) -> Result<(), AppError> {
+        self.atomic_checked(child, bytes, mode, expected, phase, &mut || Ok(()))
+    }
+    pub(crate) fn atomic_checked(
+        &self, child: &str, bytes: &[u8], mode: u32,
+        expected: Option<Option<&[u8]>>, phase: &str,
+        check: &mut impl FnMut() -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
         self.verify()?;
         let temp = format!(".keito-publish-{}", nonce()?);
         let c = name(&temp)?;
@@ -271,6 +278,7 @@ impl Dir {
                     return Err(conflict());
                 }
             }
+            check()?;
             self.rename(&temp, self, child)?;
             self.sync()
         })();

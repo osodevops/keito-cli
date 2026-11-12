@@ -1,5 +1,41 @@
 # Developer ownership registry
 
+The direct native `skill install` operation now has a separate, closed
+four-second containing lifetime, restricted by any earlier inherited end and
+measured from the original pre-parse entry clock. This deliberately replaces
+the old one-second whole-install restriction; it is not a production latency
+SLA. Ordinary commands retain their original one-second entry restriction.
+Nested auth-offered installation cannot upgrade its ordinary parent, and a
+partial attachment cannot fall back to a fresh standalone installer.
+
+Both selected version probes share one original one-second preflight deadline,
+including that preflight's pair preparation. Each retained slot and its actual
+group lease receives that same tighter end. Every version result, physical
+resource fact and forwarded registration wait must be settled before the
+preflight runner is consumed. Only then may materialization and per-target
+publication begin. The containing owner remains live, retaining every slot and
+ledger through publication and final terminal handling. Its checks surround
+blocking filesystem work; they cannot preempt a filesystem syscall.
+
+Publication checks cancellation and the original operation end, including
+immediately before the config switch after its temporary file has been
+fsynced. Existing journals, recovery, compare-and-swap and fsyncs remain.
+This is not a transaction across both targets: a later target failure preserves
+an already published first target. Recovery may complete safety work after a
+deadline, but cannot make that failed operation successful. A later terminal
+also requires a fresh clock, rather than a cached clean finish.
+
+The nonquiet install summary preserves unknown trust/authentication/readiness
+and marks capture/worker diagnostics as `NOT_CHECKED_AFTER_INSTALL`; it does
+not launch another process cohort. Run a separate explicit doctor/status for
+those checks. External `npx` download ownership remains an open qualification
+concern; bundled-only checks do not certify that path. HookShort/Legacy policy,
+the hook timing limits and all outer acceptance limits are unchanged.
+
+These are implementation contracts pending acceptance, not claims that the
+four-second install, real harnesses, cold FIRST or p95 have passed. The retained
+instrumented failure and all earlier failed first attempts remain failed.
+
 `source_qa_scope::GroupRegistry` is the first integration layer above the reserved
 group lease. It is compiled only for Unix developer tools and is not installed
 with the CLI or capture payload. It currently manages opaque same-session group

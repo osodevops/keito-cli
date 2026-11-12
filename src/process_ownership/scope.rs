@@ -24,6 +24,8 @@ use std::{
 const RESERVE_NS: u64 = 50_000_000;
 const MAX_IO_BYTES: usize = 4 * 1024 * 1024;
 const SLOTS_PER_TURN: usize = 8;
+pub(crate) const INSTALL_OPERATION_NS: u64 = 4_000_000_000;
+const ORDINARY_OPERATION_NS: u64 = 1_000_000_000;
 fn error(reason: &'static str) -> io::Error {
     io::Error::other(reason)
 }
@@ -368,9 +370,17 @@ impl Edge for ProductEdge {
 }
 struct Slot<E> {
     edge: E,
+    hard_end: u64,
     completion_end: Option<u64>,
     accepted_at: Option<u64>,
     output_taken: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallerState { Preflight, Publishing }
+struct InstallerPhase {
+    end: u64,
+    expected: usize,
+    state: InstallerState,
 }
 struct Core<E: Edge> {
     owner: SharedOwner,
@@ -382,6 +392,9 @@ struct Core<E: Edge> {
     cursor: usize,
     finish_called: bool,
     finished: bool,
+    installer: Option<InstallerPhase>,
+    unfinished_end: u64,
+    entry_selected: bool,
 }
 impl<E: Edge> Core<E> {
     fn new(owner: SharedOwner, hard_end: u64) -> Self {
@@ -395,6 +408,9 @@ impl<E: Edge> Core<E> {
             cursor: 0,
             finish_called: false,
             finished: false,
+            installer: None,
+            unfinished_end: hard_end,
+            entry_selected: false,
         }
     }
     fn poison(&mut self, reason: &'static str) {
@@ -415,13 +431,24 @@ impl<E: Edge> Core<E> {
         capacity: usize,
         create: impl FnOnce(SharedOwner) -> io::Result<E>,
     ) -> io::Result<SlotId> {
+        if self.installer.is_some() {
+            self.poison("SCOPE_INSTALLER_PHASE");
+            return Err(error("SCOPE_INSTALLER_PHASE"));
+        }
+        self.admit_before(at, capacity, self.hard_end, |owner, _| create(owner))
+    }
+    fn admit_before(
+        &mut self, at: u64, capacity: usize, requested_end: u64,
+        create: impl FnOnce(SharedOwner, u64) -> io::Result<E>,
+    ) -> io::Result<SlotId> {
+        let hard_end = requested_end.min(self.hard_end);
         let admission = self.owner.borrow().check_admission();
         if let Err(reason) = admission {
             return Err(error(reason.0));
         }
         if self.finished
             || self.cancel_end.is_some()
-            || at >= self.hard_end.saturating_sub(RESERVE_NS)
+            || at >= hard_end.saturating_sub(RESERVE_NS)
         {
             self.poison("SCOPE_ADMISSION");
             return Err(error("SCOPE_ADMISSION"));
@@ -437,7 +464,7 @@ impl<E: Edge> Core<E> {
             self.poison("SCOPE_LIMIT");
             return Err(error("SCOPE_LIMIT"));
         }
-        let edge = match create(self.owner.clone()) {
+        let edge = match create(self.owner.clone(), hard_end) {
             Ok(edge) => edge,
             Err(_) => {
                 self.poison("SCOPE_SPAWN");
@@ -452,12 +479,117 @@ impl<E: Edge> Core<E> {
         // retained before any subsequent publication or flags operation.
         self.slots.push(Slot {
             edge,
+            hard_end,
             completion_end: None,
             accepted_at: None,
             output_taken: false,
         });
         self.io_reserved = reserved.unwrap();
+        self.unfinished_end = self.unfinished_end.min(hard_end);
         Ok(id)
+    }
+    fn begin_installer(&mut self, at: u64, expected: usize) -> io::Result<()> {
+        if self.installer.is_some() || !self.slots.is_empty() || !(1..=2).contains(&expected)
+            || self.finished || self.finish_called || self.cancel_end.is_some()
+            || self.owner.borrow().check_admission().is_err()
+        {
+            self.cancel(Some("SCOPE_INSTALLER_PHASE"), at, self.hard_end);
+            return Err(error("SCOPE_INSTALLER_PHASE"));
+        }
+        let Some(local_end) = at.checked_add(ORDINARY_OPERATION_NS) else {
+            self.cancel(Some("SCOPE_CLOCK"), 0, 0);
+            return Err(error("SCOPE_CLOCK"));
+        };
+        let end = self.hard_end.min(local_end);
+        self.installer = Some(InstallerPhase { end, expected, state: InstallerState::Preflight });
+        if at >= end.saturating_sub(RESERVE_NS) {
+            self.cancel(Some("SCOPE_ADMISSION"), at, end);
+            return Err(error("SCOPE_ADMISSION"));
+        }
+        Ok(())
+    }
+    fn installer_end(&self) -> io::Result<u64> {
+        self.installer.as_ref().filter(|phase| phase.state == InstallerState::Preflight
+            && self.slots.len() < phase.expected).map(|phase| phase.end)
+            .ok_or_else(|| error("SCOPE_INSTALLER_PHASE"))
+    }
+    fn admit_installer(&mut self, at: u64, capacity: usize,
+        create: impl FnOnce(SharedOwner, u64) -> io::Result<E>) -> io::Result<SlotId> {
+        let end = match self.installer_end() {
+            Ok(end) => end,
+            Err(error) => {
+                self.cancel(Some("SCOPE_INSTALLER_PHASE"), at, self.hard_end);
+                return Err(error);
+            }
+        };
+        self.admit_before(at, capacity, end, create)
+    }
+    fn refine_entry(&mut self, end: u64, at: u64) -> io::Result<()> {
+        self.hard_end = self.hard_end.min(end);
+        if self.entry_selected || !self.slots.is_empty() || self.installer.is_some()
+            || self.finished || self.cancel_end.is_some()
+            || self.owner.borrow().check_admission().is_err()
+            || at >= self.hard_end.saturating_sub(RESERVE_NS) {
+            self.cancel(Some("SCOPE_ENTRY_SELECTION"), at, self.hard_end);
+            return Err(error("SCOPE_ENTRY_SELECTION"));
+        }
+        self.entry_selected = true;
+        Ok(())
+    }
+    fn active_end(&self) -> u64 {
+        let mut end = self.hard_end;
+        if let Some(phase) = &self.installer {
+            if phase.state == InstallerState::Preflight { end = end.min(phase.end); }
+        }
+        end.min(self.unfinished_end)
+    }
+    fn seal_installer(&mut self, ledgers_complete: bool,
+        clock: &mut impl FnMut() -> io::Result<u64>) -> io::Result<()> {
+        let valid = self.installer.as_ref().is_some_and(|phase| {
+            phase.state == InstallerState::Preflight && self.slots.len() == phase.expected
+                && self.slots.iter().all(|slot| {
+                    let facts = slot.edge.facts();
+                    slot.output_taken && slot.accepted_at.is_some_and(|at| at < slot.hard_end && at < phase.end)
+                        && slot.hard_end <= phase.end && facts.resources_complete()
+                        && facts.status.is_some() && facts.group_absent && facts.terminal_eof
+                        && facts.first_fault.is_none() && facts.io.first_fault.is_none()
+                })
+        }) && ledgers_complete && !self.finished && !self.finish_called
+            && self.cancel_end.is_none() && self.owner.borrow().check_admission().is_ok();
+        let at = self.admission_clock(clock)?;
+        let end = self.active_end();
+        if !valid || at >= end || at >= self.hard_end.saturating_sub(RESERVE_NS) {
+            self.cancel(Some("SCOPE_PREFLIGHT"), at, end);
+            return Err(error("SCOPE_PREFLIGHT"));
+        }
+        self.installer.as_mut().unwrap().state = InstallerState::Publishing;
+        // No unaccepted cohort slot remains. Retain every immutable slot end;
+        // only its now-inactive timer stops restricting the parent operation.
+        self.unfinished_end = self.hard_end;
+        Ok(())
+    }
+    fn publication_live(&mut self, ledgers_complete: bool,
+        clock: &mut impl FnMut() -> io::Result<u64>) -> io::Result<()> {
+        let valid = self.installer.as_ref().is_some_and(|phase| phase.state == InstallerState::Publishing)
+            && ledgers_complete && self.all_resources() && !self.finished && !self.finish_called
+            && self.cancel_end.is_none() && self.owner.borrow().check_admission().is_ok();
+        let at = self.admission_clock(clock)?;
+        if !valid || at >= self.hard_end.saturating_sub(RESERVE_NS) {
+            self.cancel(Some("SCOPE_PUBLICATION"), at, self.hard_end);
+            return Err(error("SCOPE_PUBLICATION"));
+        }
+        Ok(())
+    }
+    fn terminal_fresh(&mut self, clock: &mut impl FnMut() -> io::Result<u64>) -> bool {
+        let at = match self.admission_clock(clock) { Ok(at) => at, Err(_) => return false };
+        let end = self.hard_end.min(self.cancel_end.unwrap_or(self.hard_end));
+        if at >= end {
+            self.cancel(Some("SCOPE_TERMINAL_DEADLINE"), at, end);
+            return false;
+        }
+        self.finished && self.finish_called && self.all_resources()
+            && self.owner.borrow().first_fault.is_none()
+            && self.installer.as_ref().is_some_and(|phase| phase.state == InstallerState::Publishing)
     }
     fn index(&mut self, id: &SlotId) -> io::Result<usize> {
         if !Rc::ptr_eq(&id.scope, &self.identity) || id.index >= self.slots.len() {
@@ -473,7 +605,7 @@ impl<E: Edge> Core<E> {
         }
         // Completing this slot must leave its containing owner open. Global
         // cancellation/final finish use cancel(), never this local transition.
-        let end = self.hard_end.min(at.saturating_add(RESERVE_NS));
+        let end = self.hard_end.min(self.slots[index].hard_end).min(at.saturating_add(RESERVE_NS));
         self.slots[index].completion_end = Some(end);
         let result = self.slots[index].edge.begin(end);
         if result.is_err() {
@@ -496,6 +628,7 @@ impl<E: Edge> Core<E> {
             .cancel_end
             .unwrap_or(u64::MAX)
             .min(self.hard_end)
+            .min(self.active_end())
             .min(requested)
             .min(at.saturating_add(RESERVE_NS));
         if self.cancel_end == Some(end) {
@@ -527,8 +660,8 @@ impl<E: Edge> Core<E> {
         if fault.is_some() && self.cancel_end.is_none() {
             self.cancel(None, at, self.hard_end);
         }
-        if at >= self.hard_end.saturating_sub(RESERVE_NS) && self.cancel_end.is_none() {
-            self.cancel(Some("SCOPE_OPERATION_DEADLINE"), at, self.hard_end);
+        if at >= self.active_end().saturating_sub(RESERVE_NS) && self.cancel_end.is_none() {
+            self.cancel(Some("SCOPE_OPERATION_DEADLINE"), at, self.active_end());
         }
         let len = self.slots.len();
         for _ in 0..len.min(SLOTS_PER_TURN) {
@@ -569,6 +702,7 @@ impl<E: Edge> Core<E> {
                 let end = self.slots[index]
                     .completion_end
                     .unwrap_or(0)
+                    .min(self.slots[index].hard_end)
                     .min(self.hard_end);
                 match clock() {
                     Ok(at) if at < end => self.slots[index].accepted_at = Some(at),
@@ -693,6 +827,7 @@ pub struct Scope {
     terminal_sent: bool,
     _signals: Option<super::signals::InstalledHandlers>,
 }
+
 impl Scope {
     /// Called on the entry thread after image bootstrap and before CLI parsing
     /// or runtime construction. Absence and malformed metadata are distinct.
@@ -704,6 +839,9 @@ impl Scope {
         let end = at
             .checked_add(local_ns)
             .ok_or_else(|| error("SCOPE_CLOCK"))?;
+        Self::attach_at(at, end)
+    }
+    pub(crate) fn attach_at(at: u64, end: u64) -> io::Result<Option<Self>> {
         let Some((attachment, stream)) = super::attachment::consume(at, end)? else {
             return Ok(None);
         };
@@ -724,6 +862,13 @@ impl Scope {
             terminal_sent: false,
             _signals: Some(signals),
         }))
+    }
+    pub(crate) fn refine_entry(&mut self, end: u64) -> io::Result<()> {
+        self.poll();
+        let at = self.core.admission_clock(&mut now)?;
+        self.core.refine_entry(end, at)?;
+        self.poll();
+        if self.failed() { Err(error("SCOPE_ENTRY_SELECTION")) } else { Ok(()) }
     }
     pub fn local_entry(hard_end: u64) -> io::Result<Self> {
         let signals = super::signals::install()?;
@@ -763,6 +908,28 @@ impl Scope {
     }
     pub(crate) fn first_fault(&self) -> Option<ProtocolError> {
         self.core.owner.borrow().first_fault
+    }
+    pub(crate) fn begin_installer_preflight(&mut self, expected: usize) -> io::Result<()> {
+        self.poll();
+        let at = self.core.admission_clock(&mut now)?;
+        self.core.begin_installer(at, expected)
+    }
+    fn ledgers_complete(&self) -> bool {
+        self.ledger.values().all(|waited| *waited)
+            && self.upstream.as_ref().is_none_or(Endpoint::sent_resources_complete)
+    }
+    pub(crate) fn seal_installer_preflight(&mut self) -> io::Result<()> {
+        self.poll();
+        if self.terminal_sent { self.begin_cancel(ProtocolError("SCOPE_PREFLIGHT"), 0); }
+        // A selected cohort has at most two slots; one fair turn visits all.
+        let complete = self.ledgers_complete();
+        self.core.seal_installer(complete, &mut now)
+    }
+    pub(crate) fn check_installer_publication(&mut self) -> io::Result<()> {
+        self.poll();
+        if self.terminal_sent { self.begin_cancel(ProtocolError("SCOPE_PUBLICATION"), 0); }
+        let complete = self.ledgers_complete();
+        self.core.publication_live(complete, &mut now)
     }
     pub fn with_owner(owner: SharedOwner, hard_end: u64) -> Self {
         Self {
@@ -957,7 +1124,7 @@ impl Scope {
         root: &Path,
         image: &Path,
     ) -> io::Result<SlotId> {
-        self.start_with_lease(command, plan, |owner, end| {
+        self.start_with_lease(command, plan, false, |owner, end| {
             GroupLease::spawn_keeper_with_policy(owner, root, image, end, CleanupPolicy::HookShort)
         })
     }
@@ -976,7 +1143,7 @@ impl Scope {
         image: &super::image::VerifiedKeeperImage,
         policy: CleanupPolicy,
     ) -> io::Result<SlotId> {
-        self.start_with_lease(command, plan, |owner, end| {
+        self.start_with_lease(command, plan, false, |owner, end| {
             if policy == CleanupPolicy::HookShort {
                 GroupLease::spawn_verified_keeper(owner, image, end)
             } else {
@@ -988,6 +1155,7 @@ impl Scope {
         &mut self,
         mut command: Command,
         plan: IoPlan,
+        installer: bool,
         create: impl FnOnce(SharedOwner, u64) -> io::Result<GroupLease>,
     ) -> io::Result<SlotId> {
         clear_parent_environment(&mut command);
@@ -1003,8 +1171,8 @@ impl Scope {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let hard_end = self.core.hard_end;
-        let result = self.core.admit(at, capacity, |owner| {
+        let hard_end = if installer { self.core.active_end() } else { self.core.hard_end };
+        let create_edge = |owner: SharedOwner, end| {
             // Scope capacity/slot admission precedes buffer allocation, and
             // all buffers exist before spawning the first owned handle.
             let pipes = match plan.prepare() {
@@ -1014,7 +1182,7 @@ impl Scope {
                     return Err(error("SCOPE_IO_PREPARE"));
                 }
             };
-            let lease = create(owner, hard_end)?;
+            let lease = create(owner, end)?;
             Ok(ProductEdge::Group(GroupEdge {
                 lease,
                 command: Some(command),
@@ -1024,7 +1192,12 @@ impl Scope {
                 first_fault: None,
                 published: [false; 4],
             }))
-        });
+        };
+        let result = if installer {
+            self.core.admit_installer(at, capacity, create_edge)
+        } else {
+            self.core.admit(at, capacity, |owner| create_edge(owner, hard_end))
+        };
         if result.is_err() {
             if self.core.owner.borrow().first_fault.is_none() {
                 self.core.poison("SCOPE_ADMISSION");
@@ -1056,6 +1229,17 @@ impl Scope {
         } else {
             self.start_verified_opaque_with_policy(command, plan, image, policy)
         };
+        self.run_started(started)
+    }
+    pub(crate) fn run_installer_verified(
+        &mut self, command: Command, plan: IoPlan, image: &super::image::VerifiedKeeperImage,
+    ) -> io::Result<CommandResult> {
+        let started = self.start_with_lease(command, plan, true, |owner, end| {
+            GroupLease::spawn_verified_keeper_with_policy(owner, image, end, CleanupPolicy::CommandProbe)
+        });
+        self.run_started(started)
+    }
+    fn run_started(&mut self, started: io::Result<SlotId>) -> io::Result<CommandResult> {
         let slot = match started {
             Ok(slot) => slot,
             Err(error) => {
@@ -1149,13 +1333,19 @@ impl Scope {
     /// Separate from finish so the existing durable ACK is written only after
     /// resources settle, and BEFORE the ownership terminal/physical EOF.
     pub fn publish_terminal(&mut self, operation_clean: bool) -> bool {
+        self.publish_terminal_with_clock(operation_clean, &mut now)
+    }
+    fn publish_terminal_with_clock(&mut self, operation_clean: bool,
+        clock: &mut impl FnMut() -> io::Result<u64>) -> bool {
         if self.terminal_sent {
             return false;
         }
         let start = self.core.cursor;
         Self::pump(&mut self.core, &mut self.upstream, &mut self.ledger, start);
         self.terminal_sent = true;
-        let clean = self.report().clean && operation_clean;
+        let timed_installer = self.core.installer.is_some();
+        let gate = !timed_installer || (self.ledgers_complete() && self.core.terminal_fresh(clock));
+        let clean = gate && self.report().clean && operation_clean;
         if !clean {
             self.core.poison("SCOPE_OPERATION_FAILED");
         }
@@ -1165,7 +1355,7 @@ impl Scope {
                 return false;
             }
         }
-        clean
+        clean && (!timed_installer || self.core.terminal_fresh(clock))
     }
     pub fn report(&self) -> ScopeReport {
         let first_fault = self.core.owner.borrow().first_fault;
@@ -1360,6 +1550,152 @@ mod tests {
             fail_begin: false,
             begin_ends: vec![],
         }
+    }
+    fn installer_ready() -> Core<Fake> {
+        let events = Rc::default();
+        let mut core: Core<Fake> = Core::new(Rc::default(), INSTALL_OPERATION_NS);
+        core.begin_installer(100_000_000, 2).unwrap();
+        for name in ["a", "b"] {
+            let id = core.admit_installer(200_000_000, 32, |_, end| {
+                assert_eq!(end, 1_100_000_000);
+                let mut edge = fake(name, Rc::clone(&events));
+                edge.facts = EdgeFacts { status: Some(ExitStatus::from_raw(0)), waits_known: true,
+                    group_absent: true, terminal_eof: true, resource_proof: true, io_required: true,
+                    io: IoFacts { stdin_closed: true, stdout_eof: true, stderr_eof: true,
+                        ..Default::default() }, first_fault: None };
+                Ok(edge)
+            }).unwrap();
+            core.slots[id.index].accepted_at = Some(250_000_000);
+            core.take_result(&id).unwrap();
+        }
+        core
+    }
+    #[test]
+    fn installer_cohort_uses_one_end_in_actual_factory_and_refuses_equality() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), INSTALL_OPERATION_NS);
+        core.begin_installer(100_000_000, 2).unwrap();
+        let parent = core.hard_end;
+        let events = Rc::default();
+        core.admit_installer(200_000_000, 1, |_, end| {
+            assert_eq!(end, 1_100_000_000); Ok(fake("a", Rc::clone(&events)))
+        }).unwrap();
+        let mut called = false;
+        assert!(core.admit_installer(1_050_000_000, 1, |_, _| {
+            called = true; Ok(fake("b", Rc::clone(&events)))
+        }).is_err());
+        assert!(!called);
+        assert_eq!(core.hard_end, parent);
+        assert_eq!(core.slots[0].hard_end, 1_100_000_000);
+        let mut earlier: Core<Fake> = Core::new(Rc::default(), 350_000_000);
+        earlier.begin_installer(100_000_000, 1).unwrap();
+        assert_eq!(earlier.installer_end().unwrap(), 350_000_000);
+    }
+    #[test]
+    fn installer_cohort_expiry_broadcasts_all_before_poll_and_keeps_first_fault() {
+        let events = Rc::default();
+        let mut core: Core<Fake> = Core::new(Rc::default(), INSTALL_OPERATION_NS);
+        core.begin_installer(0, 2).unwrap();
+        for name in ["a", "b"] {
+            core.admit_installer(100_000_000, 0, |_, _| {
+                let mut edge = fake(name, Rc::clone(&events)); edge.fail_begin = name == "a"; Ok(edge)
+            }).unwrap();
+        }
+        core.poll(&mut || Ok(950_000_000));
+        assert_eq!(&events.borrow()[..2], ["begin:a", "begin:b"]);
+        assert!(core.slots.iter().all(|slot| slot.completion_end.unwrap() <= 1_000_000_000));
+        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("SCOPE_OPERATION_DEADLINE")));
+        core.cancel(Some("LATER"), 970_000_000, 4_000_000_000);
+        assert!(core.cancel_end.unwrap() <= 1_000_000_000);
+        core.poll(&mut || Err(error("clock")));
+        assert_eq!(core.cancel_end, Some(0));
+        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("SCOPE_OPERATION_DEADLINE")));
+    }
+    #[test]
+    fn installer_barrier_requires_every_physical_fact_and_retrieved_result() {
+        for missing in 0..13 {
+            let mut core = installer_ready();
+            let slot = &mut core.slots[1];
+            match missing {
+                0 => slot.edge.facts.waits_known = false,
+                1 => slot.edge.facts.resource_proof = false,
+                2 => slot.edge.facts.group_absent = false,
+                3 => slot.edge.facts.terminal_eof = false,
+                4 => slot.edge.facts.io.stdin_closed = false,
+                5 => slot.edge.facts.io.stdout_eof = false,
+                6 => slot.edge.facts.io.stderr_eof = false,
+                7 => slot.edge.facts.status = None,
+                8 => slot.edge.facts.first_fault = Some("synthetic"),
+                9 => slot.edge.facts.io.first_fault = Some("synthetic"),
+                10 => slot.accepted_at = None,
+                11 => slot.output_taken = false,
+                _ => slot.accepted_at = Some(slot.hard_end),
+            }
+            assert!(core.seal_installer(true, &mut || Ok(300_000_000)).is_err(), "missing {missing}");
+            assert_eq!(core.slots.len(), 2);
+            assert_eq!(core.io_reserved, 64);
+            assert!(!core.finish_called);
+            assert!(core.owner.borrow().first_fault.is_some());
+        }
+    }
+    #[test]
+    fn installer_barrier_checks_attached_sent_ledger_even_with_empty_local_map() {
+        let (wire, _peer) = UnixStream::pair().unwrap();
+        let mut endpoint = Endpoint::new(wire, "ab".repeat(16), None).unwrap();
+        endpoint.send_live().unwrap();
+        let root = std::process::id(); let child = if root == 42 { 43 } else { 42 };
+        endpoint.metadata(&format!("REGISTER|{root}|{child}|{}|0", "cd".repeat(16))).unwrap();
+        let mut scope = Scope::with_owner(Rc::default(), now().unwrap() + INSTALL_OPERATION_NS);
+        scope.upstream = Some(endpoint);
+        assert!(scope.ledger.is_empty());
+        assert!(!scope.ledgers_complete());
+        let mut core = installer_ready();
+        assert!(core.seal_installer(scope.ledgers_complete(), &mut || Ok(300_000_000)).is_err());
+    }
+    #[test]
+    fn installer_barrier_is_fresh_nonterminal_and_never_reopens_a_runner() {
+        let mut late = installer_ready();
+        assert!(late.seal_installer(true, &mut || Ok(1_100_000_000)).is_err());
+        let mut broken = installer_ready();
+        assert!(broken.seal_installer(true, &mut || Err(error("clock"))).is_err());
+        assert_eq!(broken.cancel_end, Some(0));
+        assert!(broken.seal_installer(true, &mut || Ok(300_000_000)).is_err());
+        let mut core = installer_ready();
+        core.seal_installer(true, &mut || Ok(300_000_000)).unwrap();
+        assert_eq!(core.hard_end, INSTALL_OPERATION_NS);
+        assert!(!core.finish_called && !core.finished && !core.owner.borrow().admission_closed);
+        assert_eq!(core.slots.len(), 2);
+        assert_eq!(core.io_reserved, 64);
+        core.poll(&mut || Ok(1_500_000_000));
+        core.publication_live(true, &mut || Ok(1_500_000_000)).unwrap();
+        assert!(core.admit_installer(1_500_000_000, 0, |_, _| panic!("postseal spawn")).is_err());
+        assert!(core.begin_installer(1_500_000_000, 1).is_err());
+    }
+    #[test]
+    fn installer_entry_refinement_never_renews_reselects_or_reopens() {
+        let mut late: Core<Fake> = Core::new(Rc::default(), 4_100_000_000);
+        assert!(late.refine_entry(1_100_000_000, 1_100_000_000).is_err());
+        assert!(late.refine_entry(4_100_000_000, 1_100_000_000).is_err());
+        assert_eq!(late.hard_end, 1_100_000_000);
+        let mut earlier: Core<Fake> = Core::new(Rc::default(), 300_000_000);
+        earlier.refine_entry(4_100_000_000, 100_000_000).unwrap();
+        assert_eq!(earlier.hard_end, 300_000_000);
+        assert!(earlier.refine_entry(4_100_000_000, 100_000_001).is_err());
+        assert!(earlier.owner.borrow().admission_closed);
+    }
+    #[test]
+    fn installer_terminal_rechecks_after_an_earlier_clean_finish() {
+        let mut core = installer_ready();
+        core.seal_installer(true, &mut || Ok(300_000_000)).unwrap();
+        core.finish_with(&mut || Ok(INSTALL_OPERATION_NS - 60_000_000), &mut || panic!("no wait"));
+        assert!(core.finished && core.owner.borrow().first_fault.is_none());
+        assert!(!core.terminal_fresh(&mut || Ok(INSTALL_OPERATION_NS)));
+        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("SCOPE_TERMINAL_DEADLINE")));
+        let mut clock = installer_ready();
+        clock.seal_installer(true, &mut || Ok(300_000_000)).unwrap();
+        clock.finish_with(&mut || Ok(400_000_000), &mut || panic!("no wait"));
+        assert!(!clock.terminal_fresh(&mut || Err(error("clock"))));
+        assert_eq!(clock.cancel_end, Some(0));
+        assert!(!clock.terminal_fresh(&mut || Ok(400_000_001)));
     }
     #[test]
     fn normal_completion_retains_a_then_admits_b_in_same_owner() {

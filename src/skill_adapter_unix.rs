@@ -639,18 +639,27 @@ pub fn install(options: InstallOptions<'_>) -> Result<InstallOutcome, AppError> 
 pub(crate) fn install_prepared(
     options: InstallOptions<'_>,
     version: String,
+    check: &mut impl FnMut() -> Result<(), AppError>,
 ) -> Result<InstallOutcome, AppError> {
-    install_versioned(options, version)
+    install_versioned_checked(options, version, check)
 }
 fn install_versioned(
     options: InstallOptions<'_>,
     version: String,
 ) -> Result<InstallOutcome, AppError> {
+    install_versioned_checked(options, version, &mut || Ok(()))
+}
+fn install_versioned_checked(
+    options: InstallOptions<'_>, version: String,
+    check: &mut impl FnMut() -> Result<(), AppError>,
+) -> Result<InstallOutcome, AppError> {
+    check()?;
     if !identifier(&version, 64) {
         return Err(AppError::InvalidInput("Harness version is incompatible with the capture identifier contract; review and qualify the exact version without truncating it.".into()));
     }
     runtime_unchanged(options.runtime)?;
     let payload = tree(&Dir::anchor(options.source_root)?)?;
+    check()?;
     if payload.is_empty()
         || !payload.contains_key("SKILL.md")
         || !payload.contains_key("hooks/dispatch.sh")
@@ -728,6 +737,7 @@ fn install_versioned(
         serde_json::to_vec_pretty(&receipt).map_err(|_| failure())?,
     );
     write_payload(&staged, &complete)?;
+    check()?;
     if generations.exists(&key)? {
         let existing = generations.child(&key, false)?;
         let old = validate_receipt(&existing)?;
@@ -745,9 +755,11 @@ fn install_versioned(
     }
     let generation = generations.child(&key, false)?;
     validate_receipt(&generation)?;
+    check()?;
     let discovery_stage = format!(".keito-time-track-stage-{}", &nonce()?[..32]);
     let staged = skills.child(&discovery_stage, true)?;
     write_payload(&staged, &complete)?;
+    check()?;
     let hooks = data
         .as_object_mut()
         .unwrap()
@@ -792,28 +804,32 @@ fn install_versioned(
             Some(None),
             "install-journal-fsynced",
         )?;
+        check()?;
         runtime_unchanged(options.runtime)?;
         if let Some(receipt) = &original_receipt {
             validate_expected_receipt(&skills.child("keito-time-track", false)?, receipt)?;
         }
-        host.atomic(
+        host.atomic_checked(
             config,
             &serde_json::to_vec_pretty(&data).map_err(|_| failure())?,
             0o600,
             Some(original.as_deref()),
             "install-config-fsynced",
+            check,
         )?;
         checkpoint("install-config-published");
         if exists {
             if let Some(receipt) = &original_receipt {
                 validate_expected_receipt(&skills.child("keito-time-track", false)?, receipt)?;
             }
+            check()?;
             skills.rename("keito-time-track", &skills, &backup)?;
             checkpoint("install-payload-backup");
             if let Some(receipt) = &original_receipt {
                 validate_expected_receipt(&skills.child(&backup, false)?, receipt)?;
             }
         }
+        check()?;
         skills.rename(&discovery_stage, &skills, "keito-time-track")?;
         checkpoint("install-discovery-published");
         host.unlink(JOURNAL, false)
@@ -830,6 +846,7 @@ fn install_versioned(
             skills.remove_tree(&backup)?;
         }
     }
+    check()?;
     Ok(InstallOutcome {
         generation: key,
         hooks_registered: 5,
@@ -1225,6 +1242,54 @@ pub(crate) mod tests {
             fs::create_dir_all(self.home.join(".codex")).unwrap();
             fs::write(self.config(), serde_json::to_vec(&value).unwrap()).unwrap();
         }
+    }
+    #[test]
+    fn installer_preflight_errors_reach_no_real_adapter_publication() {
+        use crate::commands::skill::{InstallSteps, selected_install};
+        struct Steps<'a> { fixture: &'a Fixture, fail_barrier: bool, published: usize }
+        impl InstallSteps for Steps<'_> {
+            fn probe(&mut self, agent: SkillAgent) -> Result<String, AppError> {
+                if !self.fail_barrier && agent == SkillAgent::ClaudeCode { return Err(failure()); }
+                Ok("0.167.0".into())
+            }
+            fn barrier(&mut self) -> Result<(), AppError> { Err(failure()) }
+            fn publish(&mut self, agent: SkillAgent, version: String) -> Result<(), AppError> {
+                self.published += 1;
+                self.fixture.install(agent, &version, false)?; Ok(())
+            }
+        }
+        for fail_barrier in [false, true] {
+            let fixture = Fixture::new();
+            let mut steps = Steps { fixture: &fixture, fail_barrier, published: 0 };
+            assert!(selected_install(&[SkillAgent::Codex, SkillAgent::ClaudeCode], &mut steps).is_err());
+            assert_eq!(steps.published, 0);
+            assert!(!fixture.home.join(".codex").exists());
+            assert!(!fixture.home.join(".claude").exists());
+        }
+    }
+    #[test]
+    fn installer_config_guard_refusal_after_fsync_uses_existing_recovery() {
+        use std::{cell::Cell, rc::Rc};
+        struct Reset;
+        impl Drop for Reset { fn drop(&mut self) { set_hook(None); } }
+        let fixture = Fixture::new();
+        fixture.seed(serde_json::json!({"foreign": true}));
+        let before = fs::read(fixture.config()).unwrap();
+        let reached = Rc::new(Cell::new(false));
+        let observe = Rc::clone(&reached);
+        let _reset = Reset;
+        set_hook(Some(Box::new(move |phase| {
+            if phase == "install-config-fsynced" { observe.set(true); }
+        })));
+        let result = install_prepared(InstallOptions {
+            source_root: &fixture.source, profile_home: &fixture.home, agent: SkillAgent::Codex,
+            runtime: &fixture.runtime, confirm_migration: false, harness_version: None,
+        }, "0.167.0".into(), &mut || if reached.get() { Err(failure()) } else { Ok(()) });
+        assert!(result.is_err());
+        assert!(reached.get());
+        assert_eq!(fs::read(fixture.config()).unwrap(), before);
+        assert!(!fixture.home.join(".codex").join(JOURNAL).exists());
+        assert!(!fixture.home.join(".codex/skills/keito-time-track").exists());
     }
     #[test]
     fn native_install_is_immutable_idempotent_and_records_runtime_pair() {

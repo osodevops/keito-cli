@@ -146,6 +146,14 @@ pub struct Endpoint {
     pub last_poll: PollWork,
 }
 impl Endpoint {
+    /// Nonterminal metadata predicate only; never sends proof or closes a peer.
+    pub(super) fn sent_resources_complete(&self) -> bool {
+        self.sent_live && !self.sent_terminal && !self.cancelled
+            && self.first_fault.is_none() && self.owner.borrow().first_fault.is_none()
+            && self.pending.is_empty() && self.events.is_empty()
+            && self.last_poll.reads < MAX_READS && self.last_poll.parsed < MAX_PARSE
+            && self.sent_registrations.values().all(|waited| *waited)
+    }
     pub(super) fn set_expected_child(&mut self, pid: u32) -> Result<()> {
         if self.live || self.expected_pid.is_some() || pid == 0 || pid > i32::MAX as u32 {
             return Err(self.poison(ProtocolError("PEER_IDENTITY")));
@@ -518,6 +526,27 @@ impl Endpoint {
     }
     pub fn take_events(&mut self) -> Vec<String> {
         std::mem::take(&mut self.events)
+    }
+}
+
+#[cfg(test)]
+mod installer_metadata_tests {
+    use super::*;
+    #[test]
+    fn installer_sent_ledger_predicate_is_nonterminal_and_requires_every_wait() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut endpoint = Endpoint::new(socket, "ab".repeat(16), None).unwrap();
+        assert!(!endpoint.sent_resources_complete());
+        endpoint.send_live().unwrap();
+        assert!(endpoint.sent_resources_complete());
+        let root = std::process::id(); let child = if root == 42 { 43 } else { 42 };
+        endpoint.metadata(&format!("REGISTER|{root}|{child}|{}|0", "cd".repeat(16))).unwrap();
+        assert!(!endpoint.sent_resources_complete());
+        endpoint.metadata(&format!("WAITED|{root}|{child}|{}|0", "cd".repeat(16))).unwrap();
+        assert!(endpoint.sent_resources_complete());
+        assert!(!endpoint.sent_terminal);
+        endpoint.send_terminal(true).unwrap();
+        assert!(!endpoint.sent_resources_complete());
     }
 }
 

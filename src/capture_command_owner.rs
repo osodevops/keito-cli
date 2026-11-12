@@ -106,6 +106,93 @@ impl std::ops::DerefMut for ScopeRef<'_> {
         }
     }
 }
+fn local_install_scope(defaults: bool) -> Result<Scope, AppError> {
+    if parent_present(|key| std::env::var_os(key).is_some())
+        || [LEAF_END_ENV, "KEITO_CAPTURE_INVOCATION_NONCE"].iter().any(|key| std::env::var_os(key).is_some()) {
+        return Err(refused());
+    }
+    let at = crate::process_ownership::scope::monotonic_now().map_err(|_| refused())?;
+    let end = at.checked_add(if defaults { STANDALONE_NS } else {
+        crate::process_ownership::scope::INSTALL_OPERATION_NS
+    }).ok_or_else(refused)?;
+    Scope::local_entry(end).map_err(|_| refused())
+}
+pub(crate) fn defaults_install_scope() -> Result<Scope, AppError> { local_install_scope(true) }
+
+/// One consuming preflight on the containing operation; no second endpoint.
+pub(crate) struct InstallerPreflight<'a> {
+    scope: Option<ScopeRef<'a>>,
+    image: Option<VerifiedKeeperImage>,
+    runtime: Option<capture_runtime_pair::CaptureRuntimeIdentity>,
+}
+pub(crate) struct InstallerPublication<'a> {
+    scope: ScopeRef<'a>,
+    finished: bool,
+}
+impl<'a> InstallerPreflight<'a> {
+    pub(crate) fn new(scope: Option<&'a mut Scope>, expected: usize) -> Result<Self, AppError> {
+        let scope = match scope {
+            Some(scope) => ScopeRef::Borrowed(scope),
+            None => ScopeRef::Owned(Box::new(local_install_scope(false)?)),
+        };
+        // Construct the failure guard BEFORE the first cohort/pair work.
+        let mut preflight = Self { scope: Some(scope), image: None, runtime: None };
+        preflight.scope.as_mut().unwrap().begin_installer_preflight(expected).map_err(|_| refused())?;
+        let runtime = capture_runtime_pair::current()?;
+        let image = VerifiedKeeperImage::open(&runtime.guard_path, &runtime.guard_sha256)
+            .map_err(|_| refused())?;
+        preflight.image = Some(image);
+        preflight.runtime = Some(runtime);
+        Ok(preflight)
+    }
+    pub(crate) fn runtime(&self) -> &capture_runtime_pair::CaptureRuntimeIdentity {
+        self.runtime.as_ref().expect("constructed installer runtime")
+    }
+    pub(crate) fn seal(mut self) -> Result<InstallerPublication<'a>, AppError> {
+        self.scope.as_mut().unwrap().seal_installer_preflight().map_err(|_| refused())?;
+        Ok(InstallerPublication { scope: self.scope.take().unwrap(), finished: false })
+    }
+}
+impl LeafRunner for InstallerPreflight<'_> {
+    fn output(&mut self, command: Command, stdout_cap: usize, stderr_cap: usize) -> io::Result<CommandResult> {
+        let plan = IoPlan::new(Vec::new(), stdout_cap, stderr_cap)?;
+        let scope = self.scope.as_mut().unwrap();
+        let result = scope.run_installer_verified(command, plan, self.image.as_ref().unwrap());
+        result.map_err(|error| match scope.first_fault() {
+            Some(reason) => io::Error::new(error.kind(), reason), None => error,
+        })
+    }
+}
+impl Drop for InstallerPreflight<'_> {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.as_mut() {
+            let end = scope.hard_end();
+            scope.begin_cancel(ProtocolError("SCOPE_PREFLIGHT_DROPPED"), end);
+        }
+    }
+}
+impl InstallerPublication<'_> {
+    pub(crate) fn check_live(&mut self) -> Result<(), AppError> {
+        self.scope.check_installer_publication().map_err(|_| refused())
+    }
+    pub(crate) fn finish(mut self, result: Result<(), AppError>) -> Result<(), AppError> {
+        let result = if matches!(&self.scope, ScopeRef::Owned(_)) {
+            let resources = self.scope.finish().clean;
+            let terminal = self.scope.publish_terminal(resources && result.is_ok());
+            match result { Err(error) => Err(error), Ok(()) if resources && terminal => Ok(()), _ => Err(refused()) }
+        } else { result };
+        self.finished = true;
+        result
+    }
+}
+impl Drop for InstallerPublication<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let end = self.scope.hard_end();
+            self.scope.begin_cancel(ProtocolError("SCOPE_INSTALLER_DROPPED"), end);
+        }
+    }
+}
 impl CommandOwner<'static> {
     pub(crate) fn standalone() -> Result<Self, AppError> {
         // Never ignore an attached/partial parent in a convenience API. The
