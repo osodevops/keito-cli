@@ -22,6 +22,9 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod error;
+#[cfg(unix)]
+#[doc(hidden)]
+pub mod installer_lifetime_diagnostic;
 pub mod output;
 #[cfg(unix)]
 #[doc(hidden)]
