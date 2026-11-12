@@ -1,8 +1,6 @@
 use clap::Parser;
 use cli::Cli;
 use error::AppError;
-#[cfg(unix)]
-use keito_cli::installer_lifetime_diagnostic::{self as diagnostic, Agent, Stage};
 use keito_cli::{capture_runtime_pair, cli, commands, error, output};
 use std::io::IsTerminal;
 
@@ -15,8 +13,6 @@ fn main() {
         {
             entry_scope = keito_cli::process_ownership::scope::Scope::entry_from_environment(1_000_000_000)
                 .map_err(|_| AppError::Config("Command ownership attachment refused".into()))?;
-            diagnostic::record(Stage::EntryAttached, Agent::None,
-                entry_scope.as_ref().map_or(0, |scope| scope.hard_end()), 0, 0);
         }
         let cli = match Cli::try_parse() {
             Ok(cli) => cli,
@@ -40,16 +36,7 @@ fn main() {
     });
     #[cfg(unix)]
     if let Some(scope) = entry_scope.as_mut() {
-        diagnostic::record(Stage::MainFinishBegin, Agent::None, scope.hard_end(), 0, 0);
-        let report = scope.finish();
-        let resources = report.clean;
-        diagnostic::record(
-            Stage::MainFinishEnd,
-            Agent::None,
-            scope.hard_end(),
-            u8::from(resources) << 1,
-            diagnostic::fault_code(report.first_fault.map(|e| e.0)),
-        );
+        let resources = scope.finish().clean;
         if !scope.publish_terminal(resources && result.is_ok() && parser_exit.unwrap_or(0) == 0)
             && result.is_ok()
         {
@@ -57,16 +44,7 @@ fn main() {
                 "Command ownership did not settle; collection remains paused".into(),
             ));
         }
-        diagnostic::record(
-            Stage::TerminalDone,
-            Agent::None,
-            scope.hard_end(),
-            u8::from(result.is_err()),
-            diagnostic::fault_code(scope.report().first_fault.map(|e| e.0)),
-        );
     }
-    #[cfg(unix)]
-    let _ = diagnostic::flush();
     if let Some(code) = parser_exit {
         std::process::exit(code);
     }

@@ -273,13 +273,6 @@ async fn install(
     #[cfg(unix)] scope: Option<&mut crate::process_ownership::scope::Scope>,
 ) -> Result<(), AppError> {
     let source = source.trim();
-    #[cfg(unix)]
-    use crate::installer_lifetime_diagnostic::{self as diagnostic, Agent, Stage};
-    #[cfg(unix)]
-    {
-        diagnostic::arm();
-        diagnostic::record(Stage::InstallBegin, Agent::None, 0, 0, 0);
-    }
     let use_bundled = source.is_empty() || source == BUNDLED_SKILL_SOURCE;
 
     if !skip_skills_add && !use_bundled && find_in_path("npx").is_none() {
@@ -291,46 +284,17 @@ async fn install(
     // skills downloads. An arbitrary adjacent binary cannot qualify capture.
     let runtime = crate::capture_runtime_pair::current()?;
     #[cfg(unix)]
-    diagnostic::record(Stage::PairReady, Agent::None, 0, 0, 0);
-    #[cfg(unix)]
     let mut probe_owner = match scope {
         Some(scope) => crate::capture_command_owner::CommandOwner::with_scope(scope)?,
         None => crate::capture_command_owner::CommandOwner::standalone()?,
     };
-    #[cfg(unix)]
-    diagnostic::record(
-        Stage::OwnerReady,
-        Agent::None,
-        probe_owner.diagnostic_end(),
-        0,
-        0,
-    );
     let home =
         dirs::home_dir().ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
-    #[cfg(unix)]
-    diagnostic::record(
-        Stage::MaterializeBegin,
-        Agent::None,
-        probe_owner.diagnostic_end(),
-        0,
-        0,
-    );
-    let bundled_skill_result: Result<_, AppError> = (|| {
-        Ok(if !skip_skills_add && use_bundled {
-            Some(materialize_bundled_skill()?)
-        } else {
-            None
-        })
-    })();
-    #[cfg(unix)]
-    diagnostic::record(
-        Stage::MaterializeEnd,
-        Agent::None,
-        probe_owner.diagnostic_end(),
-        u8::from(bundled_skill_result.is_err()),
-        0,
-    );
-    let bundled_skill = bundled_skill_result?;
+    let bundled_skill = if !skip_skills_add && use_bundled {
+        Some(materialize_bundled_skill()?)
+    } else {
+        None
+    };
     for agent in &agents {
         if !skip_skills_add && !use_bundled {
             run_skills_add(source, *agent, !global.quiet && mode == OutputMode::Table)?;
@@ -356,24 +320,7 @@ async fn install(
         crate::skill_adapter::install(options)?;
     }
     #[cfg(unix)]
-    {
-        diagnostic::record(
-            Stage::OwnerFinishBegin,
-            Agent::None,
-            probe_owner.diagnostic_end(),
-            0,
-            0,
-        );
-        let result = probe_owner.finish(Ok(()));
-        diagnostic::record(
-            Stage::OwnerFinishEnd,
-            Agent::None,
-            probe_owner.diagnostic_end(),
-            u8::from(result.is_err()),
-            0,
-        );
-        result?;
-    }
+    probe_owner.finish(Ok(()))?;
 
     if global.quiet {
         return Ok(());

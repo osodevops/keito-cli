@@ -99,9 +99,6 @@ impl CommandOwner<'static> {
     }
 }
 impl<'a> CommandOwner<'a> {
-    pub(crate) fn diagnostic_end(&self) -> u64 {
-        self.end
-    }
     pub(crate) fn with_scope(scope: &'a mut Scope) -> Result<Self, AppError> {
         let at = crate::process_ownership::scope::monotonic_now().map_err(|_| refused())?;
         let end = scope.hard_end().min(at.saturating_add(STANDALONE_NS));
@@ -217,27 +214,17 @@ impl LeafRunner for CommandOwner<'_> {
         stdout_cap: usize,
         stderr_cap: usize,
     ) -> io::Result<CommandResult> {
-        use crate::installer_lifetime_diagnostic::{self as diagnostic, Agent, Stage};
-        diagnostic::record(Stage::LeafBegin, Agent::None, self.scope.hard_end(), 0, 0);
         let image = match &self.image {
             Image::Owned(image) => image,
             Image::Borrowed(image) => image,
         };
         let plan = IoPlan::new(Vec::new(), stdout_cap, stderr_cap)?;
-        let result = if self.policy == CleanupPolicy::HookShort {
+        if self.policy == CleanupPolicy::HookShort {
             self.scope.run_verified(command, plan, image)
         } else {
             self.scope
                 .run_verified_with_policy(command, plan, image, self.policy)
-        };
-        diagnostic::record(
-            Stage::LeafEnd,
-            Agent::None,
-            self.scope.hard_end(),
-            u8::from(result.is_err()),
-            diagnostic::fault_code(self.scope.first_fault().map(|e| e.0)),
-        );
-        result
+        }
     }
 }
 #[cfg(test)]
