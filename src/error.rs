@@ -100,7 +100,10 @@ impl AppError {
 
     pub fn details(&self) -> Option<serde_json::Value> {
         match self {
-            AppError::CaptureVersionProbe { reason, cleanup_unverified } => Some(json!({
+            AppError::CaptureVersionProbe {
+                reason,
+                cleanup_unverified,
+            } => Some(json!({
                 "kind": "capture_version_probe", "reason": reason,
                 "cleanup_unverified": cleanup_unverified,
                 "cleanup_status": if *cleanup_unverified { "unverified" } else { "not_reported" },

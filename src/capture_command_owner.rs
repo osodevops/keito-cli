@@ -30,21 +30,35 @@ fn refused() -> AppError {
     AppError::Config("Capture command ownership unavailable; collection remains paused".into())
 }
 pub(crate) fn version_probe_error(error: io::Error) -> AppError {
-    let reason = match error.get_ref().and_then(|cause| cause.downcast_ref::<ProtocolError>()) {
+    let reason = match error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<ProtocolError>())
+    {
         Some(ProtocolError("SCOPE_ADMISSION")) => CaptureProbeReason::AdmissionRefused,
-        Some(ProtocolError("SCOPE_OPERATION_DEADLINE" | "SCOPE_PROOF_DEADLINE"
-            | "SCOPE_CLEANUP_DEADLINE" | "GROUP_DEADLINE" | "GROUP_LIFETIME")) => CaptureProbeReason::Deadline,
+        Some(ProtocolError(
+            "SCOPE_OPERATION_DEADLINE"
+            | "SCOPE_PROOF_DEADLINE"
+            | "SCOPE_CLEANUP_DEADLINE"
+            | "GROUP_DEADLINE"
+            | "GROUP_LIFETIME",
+        )) => CaptureProbeReason::Deadline,
         Some(ProtocolError("SCOPE_CLOCK")) => CaptureProbeReason::Clock,
         Some(_) => CaptureProbeReason::Ownership,
         None => CaptureProbeReason::Unavailable,
     };
-    AppError::CaptureVersionProbe { reason, cleanup_unverified: false }
+    AppError::CaptureVersionProbe {
+        reason,
+        cleanup_unverified: false,
+    }
 }
 fn finish_result<T>(result: Result<T, AppError>, clean: bool) -> Result<T, AppError> {
-    if clean { return result; }
+    if clean {
+        return result;
+    }
     match result {
         Err(AppError::CaptureVersionProbe { reason, .. }) => Err(AppError::CaptureVersionProbe {
-            reason, cleanup_unverified: true,
+            reason,
+            cleanup_unverified: true,
         }),
         _ => Err(refused()),
     }

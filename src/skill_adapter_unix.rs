@@ -608,7 +608,8 @@ fn detect_version(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let result = runner.output(command, 8192, 8192)
+    let result = runner
+        .output(command, 8192, 8192)
         .map_err(crate::capture_command_owner::version_probe_error)?;
     if !result.status.success() {
         return Ok("unknown".into());
@@ -1125,7 +1126,10 @@ pub(crate) mod tests {
             _: usize,
             _: usize,
         ) -> std::io::Result<crate::process_ownership::scope::CommandResult> {
-            Err(std::mem::replace(&mut self.0, std::io::Error::other("used")))
+            Err(std::mem::replace(
+                &mut self.0,
+                std::io::Error::other("used"),
+            ))
         }
     }
     #[test]
@@ -1134,7 +1138,9 @@ pub(crate) mod tests {
         let error = detect_version(
             SkillAgent::Codex,
             &mut RefusedVersion(std::io::Error::other(canary)),
-        ).err().unwrap();
+        )
+        .err()
+        .unwrap();
         let serialized = error.to_json();
         let value: Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(value["details"]["kind"], "capture_version_probe");
@@ -1151,7 +1157,9 @@ pub(crate) mod tests {
             &mut RefusedVersion(std::io::Error::other(
                 crate::process_ownership::protocol::ProtocolError("SCOPE_ADMISSION"),
             )),
-        ).err().unwrap();
+        )
+        .err()
+        .unwrap();
         let value: Value = serde_json::from_str(&error.to_json()).unwrap();
         assert_eq!(value["details"]["kind"], "capture_version_probe");
         assert_eq!(value["details"]["reason"], "admission_refused");
