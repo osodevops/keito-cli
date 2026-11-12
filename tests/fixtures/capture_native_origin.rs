@@ -77,6 +77,83 @@ fn complete(scope: &mut Scope, slot: &SlotId) -> io::Result<ExitStatus> {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpaqueDiagnostic {
+    NoOp,
+    GitDirect,
+    GitShim,
+}
+impl OpaqueDiagnostic {
+    fn parse(value: &std::ffi::OsStr) -> io::Result<Self> {
+        match value.to_str() {
+            Some("no-op") => Ok(Self::NoOp),
+            Some("git-direct") => Ok(Self::GitDirect),
+            Some("git-shim") => Ok(Self::GitShim),
+            _ => Err(error()),
+        }
+    }
+    fn code(self) -> u8 {
+        match self { Self::NoOp => 1, Self::GitDirect => 2, Self::GitShim => 3 }
+    }
+    fn command(self) -> Command {
+        let mut command = Command::new(match self {
+            Self::NoOp => "/usr/bin/true",
+            Self::GitDirect => "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+            Self::GitShim => "/usr/bin/git",
+        });
+        if self != Self::NoOp { command.args(["init", "--quiet"]); }
+        command
+    }
+}
+fn diagnostic_clock() -> io::Result<u64> {
+    let mut value = unsafe { std::mem::zeroed::<libc::timespec>() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0
+        || !(0..1_000_000_000).contains(&value.tv_nsec) { return Err(error()); }
+    u64::try_from(value.tv_sec).ok().and_then(|s| s.checked_mul(1_000_000_000))
+        .and_then(|s| s.checked_add(value.tv_nsec as u64)).ok_or_else(error)
+}
+fn opaque_diagnostic(scope: &mut Scope, fields: &[std::ffi::OsString], case: &Path,
+                     home: &Path, capture: &Path, core: &Path) -> io::Result<i32> {
+    if fields.len() != 4 { return Err(error()); }
+    // No caller-selected executable, argv, environment or timeout.
+    let selected = OpaqueDiagnostic::parse(&fields[3])?;
+    let mut command = selected.command();
+    environment(&mut command, case, home, capture);
+    let before = diagnostic_clock()?;
+    let prior_end = scope.hard_end();
+    let result = keito_cli::source_qa_scope::run_fixture_opaque(
+        scope, command, IoPlan::new(Vec::new(), 8192, 8192)?, core,
+    );
+    let receipt = (|| -> io::Result<()> {
+        use std::os::unix::process::ExitStatusExt;
+        let after = diagnostic_clock()?;
+        let report = scope.report();
+        let slots: Vec<_> = report.slots.iter().map(|slot| serde_json::json!({
+            "slot":slot.slot, "status_code":slot.status.and_then(|s| s.code()),
+            "status_signal":slot.status.and_then(|s| s.signal()),
+            "status_raw":slot.status.map(|s| s.into_raw()),
+            "waits_known":slot.waits_known, "group_absent":slot.group_absent,
+            "terminal_eof":slot.terminal_eof, "io_required":slot.io_required,
+            "stdin_closed":slot.io.stdin_closed, "stdout_eof":slot.io.stdout_eof,
+            "stderr_eof":slot.io.stderr_eof, "accepted_at":slot.accepted_at,
+            "completion_end":slot.completion_end, "first_fault":slot.first_fault,
+        })).collect();
+        let value = serde_json::json!({"diagnostic_only":true, "selector_code":selected.code(),
+            "before_ns":before, "after_ns":after, "hard_end_before_ns":prior_end,
+            "hard_end_after_ns":scope.hard_end(), "operation_ok":result.is_ok(),
+            "first_fault":report.first_fault.map(|s| s.0), "finish_called":report.finish_called,
+            "all_resources":report.all_resources, "clean":report.clean, "slots":slots});
+        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW).open(case.join("opaque-diagnostic.json"))?;
+        serde_json::to_writer(&mut file, &value)?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    })();
+    match result {
+        Err(primary) => { let _ = receipt; Err(primary) }
+        Ok(value) => { receipt?; Ok(value.status.code().unwrap_or(125)) }
+    }
+}
 // Developer-only failure diagnosis. Never serialize argv, environment, command
 // output or arbitrary io::Error text; keep the original operation error primary.
 fn failure_receipt(
@@ -90,7 +167,7 @@ fn failure_receipt(
         .ok_or_else(error)?;
     let offset = match mode {
         "--chain" => 2,
-        "--cli" | "--run" | "--git-init" => 1,
+        "--cli" | "--run" | "--git-init" | "--opaque-diagnostic" => 1,
         _ => return Err(error()),
     };
     let fields = arguments.get(offset..offset + 3).ok_or_else(error)?;
@@ -159,7 +236,7 @@ fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i3
     } else {
         &arguments[1..]
     };
-    assert!(matches!(mode, "--cli" | "--run" | "--chain" | "--git-init"));
+    assert!(matches!(mode, "--cli" | "--run" | "--chain" | "--git-init" | "--opaque-diagnostic"));
     assert!(fields.len() >= 3);
     let root = owned(Path::new(&fields[0]));
     let case = owned(Path::new(&fields[1]));
@@ -188,6 +265,9 @@ fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i3
     assert_eq!(checked.capture, capture);
     for relative in [".codex", ".claude", "config", "state", "AppData"] {
         owned(&home.join(relative));
+    }
+    if mode == "--opaque-diagnostic" {
+        return opaque_diagnostic(scope, fields, &case, &home, &capture, &core);
     }
     if mode == "--git-init" {
         assert_eq!(fields.len(), 3);
@@ -301,4 +381,18 @@ pub(super) fn run(version: &'static str) -> i32 {
         return 1;
     }
     result.unwrap_or(1)
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn opaque_diagnostic_selector_refuses_programs_and_extra_arguments() {
+        for value in ["", "/bin/sh", "git", "git-direct --version", "git-shim;true", "NO-OP"] {
+            assert!(OpaqueDiagnostic::parse(std::ffi::OsStr::new(value)).is_err());
+        }
+        assert_eq!(OpaqueDiagnostic::parse(std::ffi::OsStr::new("no-op")).unwrap(), OpaqueDiagnostic::NoOp);
+        assert_eq!(OpaqueDiagnostic::parse(std::ffi::OsStr::new("git-direct")).unwrap(), OpaqueDiagnostic::GitDirect);
+        assert_eq!(OpaqueDiagnostic::parse(std::ffi::OsStr::new("git-shim")).unwrap(), OpaqueDiagnostic::GitShim);
+    }
 }
