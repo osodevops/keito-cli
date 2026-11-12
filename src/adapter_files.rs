@@ -285,8 +285,9 @@ impl Dir {
                 }
             }
             check()?;
-            self.rename(&temp, self, child)?;
-            self.sync()
+            // rename flushes every affected directory before returning. No
+            // namespace change here requires another flush of that same state.
+            self.rename(&temp, self, child)
         })();
         if self.exists(&temp).unwrap_or(false) {
             let _ = self.unlink(&temp, false);
@@ -311,7 +312,12 @@ impl Dir {
         }
         checkpoint("adapter-entry-renamed");
         self.sync()?;
-        dest.sync()
+        // Atomic replacement passes the identical anchored directory handle.
+        // Distinct handles conservatively keep both flushes, even for aliases.
+        if !Arc::ptr_eq(&self.file, &dest.file) {
+            dest.sync()?;
+        }
+        Ok(())
     }
     pub(crate) fn unlink(&self, child: &str, directory: bool) -> Result<(), AppError> {
         self.verify()?;
