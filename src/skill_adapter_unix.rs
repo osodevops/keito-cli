@@ -1396,12 +1396,17 @@ pub(crate) mod tests {
             barrier: false,
             first: None,
         };
-        assert!(selected_install(&[SkillAgent::Codex, SkillAgent::ClaudeCode], &mut steps).is_err());
+        assert!(
+            selected_install(&[SkillAgent::Codex, SkillAgent::ClaudeCode], &mut steps).is_err()
+        );
         assert_eq!(fs::read(fixture.config()).unwrap(), steps.first.unwrap());
         assert!(fixture.home.join(".codex/skills/keito-time-track").is_dir());
         assert!(!fixture.home.join(".claude/settings.json").exists());
         assert!(!fixture.home.join(".claude").join(JOURNAL).exists());
-        assert!(!fixture.home.join(".claude/skills/keito-time-track").exists());
+        assert!(!fixture
+            .home
+            .join(".claude/skills/keito-time-track")
+            .exists());
     }
     #[test]
     fn native_install_is_immutable_idempotent_and_records_runtime_pair() {
