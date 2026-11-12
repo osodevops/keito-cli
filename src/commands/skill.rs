@@ -298,11 +298,23 @@ async fn install(
         None => crate::capture_command_owner::CommandOwner::standalone()?,
     };
     #[cfg(unix)]
-    diagnostic::record(Stage::OwnerReady, Agent::None, probe_owner.diagnostic_end(), 0, 0);
+    diagnostic::record(
+        Stage::OwnerReady,
+        Agent::None,
+        probe_owner.diagnostic_end(),
+        0,
+        0,
+    );
     let home =
         dirs::home_dir().ok_or_else(|| AppError::Config("Cannot identify profile home".into()))?;
     #[cfg(unix)]
-    diagnostic::record(Stage::MaterializeBegin, Agent::None, probe_owner.diagnostic_end(), 0, 0);
+    diagnostic::record(
+        Stage::MaterializeBegin,
+        Agent::None,
+        probe_owner.diagnostic_end(),
+        0,
+        0,
+    );
     let bundled_skill_result: Result<_, AppError> = (|| {
         Ok(if !skip_skills_add && use_bundled {
             Some(materialize_bundled_skill()?)
@@ -311,8 +323,13 @@ async fn install(
         })
     })();
     #[cfg(unix)]
-    diagnostic::record(Stage::MaterializeEnd, Agent::None, probe_owner.diagnostic_end(),
-        u8::from(bundled_skill_result.is_err()), 0);
+    diagnostic::record(
+        Stage::MaterializeEnd,
+        Agent::None,
+        probe_owner.diagnostic_end(),
+        u8::from(bundled_skill_result.is_err()),
+        0,
+    );
     let bundled_skill = bundled_skill_result?;
     for agent in &agents {
         if !skip_skills_add && !use_bundled {
@@ -340,10 +357,21 @@ async fn install(
     }
     #[cfg(unix)]
     {
-        diagnostic::record(Stage::OwnerFinishBegin, Agent::None, probe_owner.diagnostic_end(), 0, 0);
+        diagnostic::record(
+            Stage::OwnerFinishBegin,
+            Agent::None,
+            probe_owner.diagnostic_end(),
+            0,
+            0,
+        );
         let result = probe_owner.finish(Ok(()));
-        diagnostic::record(Stage::OwnerFinishEnd, Agent::None, probe_owner.diagnostic_end(),
-            u8::from(result.is_err()), 0);
+        diagnostic::record(
+            Stage::OwnerFinishEnd,
+            Agent::None,
+            probe_owner.diagnostic_end(),
+            u8::from(result.is_err()),
+            0,
+        );
         result?;
     }
 

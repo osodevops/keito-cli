@@ -4,14 +4,17 @@ use crate::adapter_files::{checkpoint, digest, failure, hex, identifier, nonce, 
 use crate::capture_runtime_pair::CaptureRuntimeIdentity;
 use crate::cli::skill::SkillAgent;
 use crate::error::AppError;
+use crate::installer_lifetime_diagnostic::{self as diagnostic, Agent, Stage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use crate::installer_lifetime_diagnostic::{self as diagnostic, Agent, Stage};
 
 fn diagnostic_agent(agent: SkillAgent) -> Agent {
-    match agent { SkillAgent::Codex => Agent::Codex, SkillAgent::ClaudeCode => Agent::Claude }
+    match agent {
+        SkillAgent::Codex => Agent::Codex,
+        SkillAgent::ClaudeCode => Agent::Claude,
+    }
 }
 
 const RECEIPT: &str = "capture-install.json";
@@ -603,7 +606,13 @@ fn detect_version(
 ) -> Result<String, AppError> {
     diagnostic::record(Stage::DetectBegin, diagnostic_agent(agent), 0, 0, 0);
     let result = detect_version_inner(agent, runner);
-    diagnostic::record(Stage::DetectEnd, diagnostic_agent(agent), 0, u8::from(result.is_err()), 0);
+    diagnostic::record(
+        Stage::DetectEnd,
+        diagnostic_agent(agent),
+        0,
+        u8::from(result.is_err()),
+        0,
+    );
     result
 }
 fn detect_version_inner(
@@ -830,7 +839,13 @@ fn install_versioned_inner(
             "install-config-fsynced",
         )?;
         checkpoint("install-config-published");
-        diagnostic::record(Stage::ConfigPublished, diagnostic_agent(options.agent), 0, 0, 0);
+        diagnostic::record(
+            Stage::ConfigPublished,
+            diagnostic_agent(options.agent),
+            0,
+            0,
+            0,
+        );
         if exists {
             if let Some(receipt) = &original_receipt {
                 validate_expected_receipt(&skills.child("keito-time-track", false)?, receipt)?;
@@ -843,7 +858,13 @@ fn install_versioned_inner(
         }
         skills.rename(&discovery_stage, &skills, "keito-time-track")?;
         checkpoint("install-discovery-published");
-        diagnostic::record(Stage::DiscoveryPublished, diagnostic_agent(options.agent), 0, 0, 0);
+        diagnostic::record(
+            Stage::DiscoveryPublished,
+            diagnostic_agent(options.agent),
+            0,
+            0,
+            0,
+        );
         host.unlink(JOURNAL, false)
     })();
     if host.exists(JOURNAL)? {

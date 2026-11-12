@@ -18,7 +18,13 @@ struct Row {
     fault: u8,
 }
 const ZERO: Row = Row {
-    stage: 0, agent: 0, clock_ok: false, at_ns: 0, hard_end_ns: 0, flags: 0, fault: 0,
+    stage: 0,
+    agent: 0,
+    clock_ok: false,
+    at_ns: 0,
+    hard_end_ns: 0,
+    flags: 0,
+    fault: 0,
 };
 struct State {
     armed: bool,
@@ -28,7 +34,12 @@ struct State {
 }
 impl State {
     const fn new() -> Self {
-        Self { armed: false, used: 0, overflow: false, rows: [ZERO; CAPACITY] }
+        Self {
+            armed: false,
+            used: 0,
+            overflow: false,
+            rows: [ZERO; CAPACITY],
+        }
     }
     fn append(&mut self, row: Row) {
         if self.used == CAPACITY {
@@ -45,14 +56,33 @@ static STATE: Mutex<State> = Mutex::new(State::new());
 #[repr(u8)]
 #[derive(Clone, Copy)]
 pub enum Stage {
-    EntryAttached = 1, InstallBegin, PairReady, OwnerReady, MaterializeBegin,
-    MaterializeEnd, DetectBegin, DetectEnd, LeafBegin, LeafEnd, PublishBegin,
-    PublishEnd, ConfigPublished, DiscoveryPublished, OwnerFinishBegin,
-    OwnerFinishEnd, MainFinishBegin, MainFinishEnd, TerminalDone,
+    EntryAttached = 1,
+    InstallBegin,
+    PairReady,
+    OwnerReady,
+    MaterializeBegin,
+    MaterializeEnd,
+    DetectBegin,
+    DetectEnd,
+    LeafBegin,
+    LeafEnd,
+    PublishBegin,
+    PublishEnd,
+    ConfigPublished,
+    DiscoveryPublished,
+    OwnerFinishBegin,
+    OwnerFinishEnd,
+    MainFinishBegin,
+    MainFinishEnd,
+    TerminalDone,
 }
 #[repr(u8)]
 #[derive(Clone, Copy)]
-pub enum Agent { None = 0, Codex = 1, Claude = 2 }
+pub enum Agent {
+    None = 0,
+    Codex = 1,
+    Claude = 2,
+}
 
 /// Only source-derived static faults reach this whitelist. Unknown is numeric.
 pub fn fault_code(reason: Option<&str>) -> u8 {
@@ -74,33 +104,62 @@ pub fn fault_code(reason: Option<&str>) -> u8 {
 }
 pub fn arm() {
     if enabled() {
-        if let Ok(mut state) = STATE.lock() { state.armed = true; }
+        if let Ok(mut state) = STATE.lock() {
+            state.armed = true;
+        }
     }
 }
 /// flags bit0=Result::is_err; bit1=actual finish clean. No inferred proof.
 pub fn record(stage: Stage, agent: Agent, hard_end_ns: u64, flags: u8, fault: u8) {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let clock = crate::process_ownership::scope::monotonic_now();
     if let Ok(mut state) = STATE.lock() {
-        state.append(Row { stage: stage as u8, agent: agent as u8,
-            clock_ok: clock.is_ok(), at_ns: clock.unwrap_or(0), hard_end_ns, flags, fault });
+        state.append(Row {
+            stage: stage as u8,
+            agent: agent as u8,
+            clock_ok: clock.is_ok(),
+            at_ns: clock.unwrap_or(0),
+            hard_end_ns,
+            flags,
+            fault,
+        });
     }
 }
 /// Called once after original finish/terminal handling, before original stderr.
 /// Failure is diagnostic NONPASS and never changes the operation's Result.
 pub fn flush() -> bool {
-    if !enabled() { return false; }
-    let Ok(state) = STATE.lock() else { return false; };
-    if !state.armed { return false; }
+    if !enabled() {
+        return false;
+    }
+    let Ok(state) = STATE.lock() else {
+        return false;
+    };
+    if !state.armed {
+        return false;
+    }
     let value = serde_json::json!({"schema_version":1,"diagnostic_only":true,
         "not_qualification":true,"overflow":state.overflow,"rows":&state.rows[..state.used]});
-    let Ok(bytes) = serde_json::to_vec(&value) else { return false; };
-    if bytes.len() > 16384 { return false; }
-    let Ok(mut file) = OpenOptions::new().write(true).create_new(true).mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(EXPECTED)
-    else { return false; };
-    file.write_all(&bytes).and_then(|_| file.write_all(b"\n"))
-        .and_then(|_| file.sync_all()).is_ok()
+    let Ok(bytes) = serde_json::to_vec(&value) else {
+        return false;
+    };
+    if bytes.len() > 16384 {
+        return false;
+    }
+    let Ok(mut file) = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(EXPECTED)
+    else {
+        return false;
+    };
+    file.write_all(&bytes)
+        .and_then(|_| file.write_all(b"\n"))
+        .and_then(|_| file.sync_all())
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -120,7 +179,10 @@ mod tests {
     #[test]
     fn installer_diagnostic_faults_do_not_serialize_error_text() {
         let canary = "PRIVATE_SECRET_/original/profile";
-        let row = Row { fault: fault_code(Some(canary)), ..ZERO };
+        let row = Row {
+            fault: fault_code(Some(canary)),
+            ..ZERO
+        };
         let value = serde_json::to_string(&row).unwrap();
         assert_eq!(row.fault, 255);
         assert!(!value.contains(canary));

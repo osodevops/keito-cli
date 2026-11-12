@@ -230,8 +230,13 @@ impl LeafRunner for CommandOwner<'_> {
             self.scope
                 .run_verified_with_policy(command, plan, image, self.policy)
         };
-        diagnostic::record(Stage::LeafEnd, Agent::None, self.scope.hard_end(),
-            u8::from(result.is_err()), diagnostic::fault_code(self.scope.first_fault().map(|e| e.0)));
+        diagnostic::record(
+            Stage::LeafEnd,
+            Agent::None,
+            self.scope.hard_end(),
+            u8::from(result.is_err()),
+            diagnostic::fault_code(self.scope.first_fault().map(|e| e.0)),
+        );
         result
     }
 }
