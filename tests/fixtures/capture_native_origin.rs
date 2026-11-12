@@ -313,7 +313,11 @@ fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i3
     }
     if mode == "--git-init" {
         assert_eq!(fields.len(), 3);
-        let mut command = Command::new("/Applications/Xcode.app/Contents/Developer/usr/bin/git");
+        let mut command = Command::new(if cfg!(target_os = "macos") {
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/git"
+        } else {
+            "/usr/bin/git"
+        });
         environment(&mut command, &case, &home, &capture);
         command.args(["init", "--quiet"]);
         let result = keito_cli::source_qa_scope::run_fixture_opaque(
