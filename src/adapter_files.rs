@@ -485,7 +485,11 @@ mod installer_flush_tests {
             .unwrap();
         assert_eq!(
             observe.events(),
-            ["payload-file-fsynced", "adapter-entry-renamed", "adapter-directory-fsynced"]
+            [
+                "payload-file-fsynced",
+                "adapter-entry-renamed",
+                "adapter-directory-fsynced"
+            ]
         );
         assert_eq!(dir.read("payload", 16).unwrap().unwrap(), b"new");
     }
@@ -498,7 +502,14 @@ mod installer_flush_tests {
         std::fs::write(root.path().join("payload"), b"new").unwrap();
         let observe = Observe::start();
         dir.rename("payload", &destination, "payload").unwrap();
-        assert_eq!(observe.events(), ["adapter-entry-renamed", "adapter-directory-fsynced", "adapter-directory-fsynced"]);
+        assert_eq!(
+            observe.events(),
+            [
+                "adapter-entry-renamed",
+                "adapter-directory-fsynced",
+                "adapter-directory-fsynced"
+            ]
+        );
         assert!(!dir.exists("payload").unwrap());
         assert_eq!(destination.read("payload", 16).unwrap().unwrap(), b"new");
     }
@@ -511,7 +522,14 @@ mod installer_flush_tests {
         std::fs::write(root.path().join("old"), b"new").unwrap();
         let observe = Observe::start();
         dir.rename("old", &second, "new").unwrap();
-        assert_eq!(observe.events(), ["adapter-entry-renamed", "adapter-directory-fsynced", "adapter-directory-fsynced"]);
+        assert_eq!(
+            observe.events(),
+            [
+                "adapter-entry-renamed",
+                "adapter-directory-fsynced",
+                "adapter-directory-fsynced"
+            ]
+        );
     }
 
     #[test]
@@ -520,8 +538,20 @@ mod installer_flush_tests {
         let dir = Dir::anchor(root.path()).unwrap();
         std::fs::write(root.path().join("payload"), b"old").unwrap();
         let observe = Observe::start();
-        assert!(dir.atomic_checked("payload", b"new", 0o600, Some(Some(b"old")), "payload-file-fsynced", &mut || Err(failure())).is_err());
-        assert_eq!(observe.events(), ["payload-file-fsynced", "adapter-directory-fsynced"]);
+        assert!(dir
+            .atomic_checked(
+                "payload",
+                b"new",
+                0o600,
+                Some(Some(b"old")),
+                "payload-file-fsynced",
+                &mut || Err(failure())
+            )
+            .is_err());
+        assert_eq!(
+            observe.events(),
+            ["payload-file-fsynced", "adapter-directory-fsynced"]
+        );
         assert_eq!(dir.read("payload", 16).unwrap().unwrap(), b"old");
         assert_eq!(dir.entries().unwrap(), ["payload"]);
     }
@@ -532,8 +562,19 @@ mod installer_flush_tests {
         let dir = Dir::anchor(root.path()).unwrap();
         std::fs::write(root.path().join("payload"), b"foreign").unwrap();
         let observe = Observe::start();
-        assert!(dir.atomic("payload", b"new", 0o600, Some(Some(b"old")), "payload-file-fsynced").is_err());
-        assert_eq!(observe.events(), ["payload-file-fsynced", "adapter-directory-fsynced"]);
+        assert!(dir
+            .atomic(
+                "payload",
+                b"new",
+                0o600,
+                Some(Some(b"old")),
+                "payload-file-fsynced"
+            )
+            .is_err());
+        assert_eq!(
+            observe.events(),
+            ["payload-file-fsynced", "adapter-directory-fsynced"]
+        );
         assert_eq!(dir.read("payload", 16).unwrap().unwrap(), b"foreign");
         assert_eq!(dir.entries().unwrap(), ["payload"]);
     }
