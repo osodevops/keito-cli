@@ -404,10 +404,15 @@ mod tests {
         {
             // Actual partial-construction guard, before any image is prepared.
             let _preflight = InstallerPreflight {
-                scope: Some(ScopeRef::Borrowed(&mut scope)), image: None, runtime: None,
+                scope: Some(ScopeRef::Borrowed(&mut scope)),
+                image: None,
+                runtime: None,
             };
         }
-        assert_eq!(scope.first_fault(), Some(ProtocolError("SCOPE_PREFLIGHT_DROPPED")));
+        assert_eq!(
+            scope.first_fault(),
+            Some(ProtocolError("SCOPE_PREFLIGHT_DROPPED"))
+        );
         assert!(scope.report().admission_closed);
         assert!(!scope.report().clean);
         assert!(!scope.publish_terminal(true));
