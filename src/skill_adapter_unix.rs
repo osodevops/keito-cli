@@ -228,22 +228,37 @@ fn validate_modes(dir: &Dir, prefix: &str) -> Result<(), AppError> {
     Ok(())
 }
 fn write_payload(dir: &Dir, payload: &Payload) -> Result<(), AppError> {
+    // Payload is sorted. Retain only the common parent chain, never a growing
+    // path cache. Source traversal permits at most sixteen directory levels.
+    let mut directories = Vec::with_capacity(17);
+    directories.push(dir.clone());
+    let mut previous: Vec<&str> = Vec::new();
     for (relative, bytes) in payload {
-        let mut target = dir.clone();
-        let mut parts = relative.split('/').peekable();
-        while let Some(part) = parts.next() {
-            if parts.peek().is_none() {
-                target.atomic(
-                    part,
-                    bytes,
-                    if part.ends_with(".sh") { 0o700 } else { 0o600 },
-                    Some(None),
-                    "install-payload-file-fsynced",
-                )?;
-            } else {
-                target = target.child(part, true)?;
-            }
+        let parts: Vec<_> = relative.split('/').collect();
+        let (file, parents) = parts.split_last().ok_or_else(failure)?;
+        if parents.len() > 16 {
+            return Err(failure());
         }
+        let retained = previous
+            .iter()
+            .zip(parents)
+            .take_while(|(old, new)| old == new)
+            .count();
+        directories.truncate(retained + 1);
+        for component in parents.iter().skip(retained) {
+            let child = directories.last().ok_or_else(failure)?.child(component, true)?;
+            directories.push(child);
+        }
+        previous = parents.to_vec();
+        // atomic revalidates the entire anchored parent chain before opening
+        // and again after the file flush. Reuse never bypasses replacement checks.
+        directories.last().ok_or_else(failure)?.atomic(
+            file,
+            bytes,
+            if file.ends_with(".sh") { 0o700 } else { 0o600 },
+            Some(None),
+            "install-payload-file-fsynced",
+        )?;
     }
     dir.sync()
 }
