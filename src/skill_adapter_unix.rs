@@ -554,9 +554,18 @@ fn recovery_name(value: &str, prefix: &str, length: Option<usize>) -> bool {
     })
 }
 fn recover(host: &Dir, skills: &Dir) -> Result<(), AppError> {
+    recover_checked(host, skills, &mut || Ok(()))
+}
+fn recover_checked(
+    host: &Dir,
+    skills: &Dir,
+    check: &mut impl FnMut() -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    check()?;
     let Some(bytes) = host.read(JOURNAL, 512 * 1024)? else {
         return Ok(());
     };
+    check()?;
     let journal: Publication = serde_json::from_slice(&bytes).map_err(|_| failure())?;
     if journal.schema_version != 1
         || !recovery_name(&journal.backup, ".keito-time-track-backup-", Some(32))
@@ -567,20 +576,27 @@ fn recover(host: &Dir, skills: &Dir) -> Result<(), AppError> {
     {
         return Err(failure());
     }
+    check()?;
     if skills.exists(&journal.backup)? {
         skills.child(&journal.backup, false)?;
         if !skills.exists("keito-time-track")? {
+            check()?;
             skills.rename(&journal.backup, skills, "keito-time-track")?;
+            check()?;
         }
     }
+    check()?;
     if let Some(stage) = journal.stage {
         if skills.exists(&stage)? {
             let staged = skills.child(&stage, false)?;
+            check()?;
             validate_receipt(&staged)?;
-            skills.remove_tree(&stage)?;
+            skills.remove_tree_checked(&stage, check)?;
         }
     }
-    host.unlink(JOURNAL, false)
+    check()?;
+    host.unlink(JOURNAL, false)?;
+    check()
 }
 fn runtime_unchanged(runtime: &CaptureRuntimeIdentity) -> Result<(), AppError> {
     use sha2::{Digest, Sha256};
@@ -710,7 +726,7 @@ fn install_versioned_checked(
     let _lock = host.lock(&format!("{}.keito.lock", config_name(options.agent)))?;
     // Check each parent before publishing a generation or a configuration.
     let skills = host.child("skills", true)?;
-    recover(&host, &skills)?;
+    recover_checked(&host, &skills, check)?;
     let config = config_name(options.agent);
     let original = host.read(config, 1024 * 1024)?;
     let mut data = parse_config(original.as_deref())?;
@@ -868,16 +884,24 @@ fn install_versioned_checked(
         checkpoint("install-discovery-published");
         host.unlink(JOURNAL, false)
     })();
-    if host.exists(JOURNAL)? {
-        recover(&host, &skills)?;
-    } else if skills.exists(&discovery_stage)? {
-        skills.remove_tree(&discovery_stage)?;
-    }
+    // Refusal retains the journal/stage for a later operation rather than
+    // starting recursive recovery outside the original publication owner.
+    let cleanup: Result<(), AppError> = (|| {
+        check()?;
+        if host.exists(JOURNAL)? {
+            recover_checked(&host, &skills, check)?;
+        } else if skills.exists(&discovery_stage)? {
+            skills.remove_tree_checked(&discovery_stage, check)?;
+        }
+        Ok(())
+    })();
+    // A secondary cleanup refusal must not replace the original failure.
     result?;
+    cleanup?;
     if let Some(receipt) = &original_receipt {
         if skills.exists(&backup)? {
             validate_expected_receipt(&skills.child(&backup, false)?, receipt)?;
-            skills.remove_tree(&backup)?;
+            skills.remove_tree_checked(&backup, check)?;
         }
     }
     check()?;
