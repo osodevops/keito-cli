@@ -675,11 +675,12 @@ pub(crate) mod installer_phase_trace {
         initialize: impl FnOnce() -> io::Result<Guard>,
         run: impl FnOnce() -> Result<T, crate::error::AppError>,
     ) -> Result<T, crate::error::AppError> {
-        let mut guard = initialize().map_err(|_| crate::error::AppError::Config(
-            "Developer installer phase trace unavailable".into(),
-        ))?;
+        // Observation setup cannot decide whether the actual installer runs.
+        let mut guard = initialize().ok();
         let result = run();
-        guard.finish(result.is_ok());
+        if let Some(guard) = guard.as_mut() {
+            guard.finish(result.is_ok());
+        }
         result
     }
     impl Guard {
