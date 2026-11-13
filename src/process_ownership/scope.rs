@@ -89,6 +89,9 @@ trait Edge {
     fn begin(&mut self, end: u64) -> io::Result<()>;
     fn poll(&mut self) -> io::Result<()>;
     fn facts(&self) -> EdgeFacts;
+    fn setup_pending(&self) -> bool {
+        false
+    }
     fn take_output(&mut self) -> CommandOutput;
     fn take_events(&mut self) -> Vec<String> {
         Vec::new()
@@ -840,6 +843,11 @@ impl<E: Edge> Core<E> {
             pause();
         }
         self.finished = true;
+    }
+    // RED: the repository cohort currently admits siblings without a setup gate.
+    #[cfg(test)]
+    fn repository_admission_ready(&mut self) -> io::Result<bool> {
+        Ok(true)
     }
     // Validate the entire fixed cohort BEFORE consuming any result. An earlier
     // accepted sibling cannot leak output while another is pending or invalid.
@@ -1684,8 +1692,12 @@ mod tests {
         begun: bool,
         fail_begin: bool,
         begin_ends: Vec<u64>,
+        setup_pending: bool,
     }
     impl Edge for Fake {
+        fn setup_pending(&self) -> bool {
+            self.setup_pending
+        }
         fn take_events(&mut self) -> Vec<String> {
             self.events
                 .borrow_mut()
@@ -1733,6 +1745,50 @@ mod tests {
             begun: false,
             fail_begin: false,
             begin_ends: vec![],
+            setup_pending: false,
+        }
+    }
+    #[test]
+    fn repository_admission_pending_setup_blocks_without_waiting_for_workload_completion() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        assert!(core.repository_admission_ready().unwrap());
+        let slot = core.admit(1, 32, |_| Ok(fake("first", Rc::default()))).unwrap();
+        core.slots[slot.index].edge.setup_pending = true;
+        let original_end = core.hard_end;
+        assert!(!core.repository_admission_ready().unwrap());
+        assert_eq!(core.hard_end, original_end);
+        assert_eq!(core.slots.len(), 1);
+        assert!(!core.slots[0].output_taken);
+        assert!(core.owner.borrow().first_fault.is_none());
+        core.slots[slot.index].edge.setup_pending = false;
+        assert!(core.repository_admission_ready().unwrap());
+        assert!(core.slots[0].accepted_at.is_none());
+        assert!(core.slots[0].edge.facts.status.is_none());
+    }
+    #[test]
+    fn repository_admission_sticky_fault_never_reopens_for_a_ready_sibling() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        core.admit(1, 32, |_| Ok(fake("first", Rc::default()))).unwrap();
+        core.poison("ORIGINAL_FAULT");
+        assert!(core.repository_admission_ready().is_err());
+        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("ORIGINAL_FAULT")));
+        assert_eq!(core.slots.len(), 1);
+        assert!(!core.slots[0].output_taken);
+    }
+    #[test]
+    fn repository_admission_cancelled_and_finished_owners_refuse_without_renewal() {
+        for kind in ["zero", "cancel", "finished"] {
+            let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+            let slot = core.admit(1, 32, |_| Ok(fake("first", Rc::default()))).unwrap();
+            if kind == "finished" {
+                core.finished = true;
+            } else {
+                core.cancel(None, 10, if kind == "zero" { 0 } else { 100 });
+            }
+            let end = core.slots[slot.index].completion_end;
+            assert!(core.repository_admission_ready().is_err());
+            assert_eq!(core.slots[slot.index].completion_end, end);
+            assert_eq!(core.slots.len(), 1);
         }
     }
     fn repository_cohort() -> (Core<Fake>, [SlotId; 3]) {
