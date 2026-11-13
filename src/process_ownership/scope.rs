@@ -841,13 +841,47 @@ impl<E: Edge> Core<E> {
         }
         self.finished = true;
     }
-    // Initial serial collection exposes the missing cohort barrier in the
-    // finite RED tests below. Replaced by the all-slot validation barrier.
-    #[cfg(test)]
+    // Validate the entire fixed cohort BEFORE consuming any result. An earlier
+    // accepted sibling cannot leak output while another is pending or invalid.
     fn take_repository_results(
         &mut self,
         slots: &[SlotId; 3],
     ) -> io::Result<Option<[CommandResult; 3]>> {
+        let fault = self.owner.borrow().first_fault;
+        if let Some(reason) = fault {
+            return Err(error(reason.0));
+        }
+        let mut pending = false;
+        for (position, id) in slots.iter().enumerate() {
+            let index = self.index(id)?;
+            if slots[..position].iter().any(|other| other.index == index) {
+                self.poison("SCOPE_RESULT");
+                return Err(error("SCOPE_RESULT"));
+            }
+            let slot = &self.slots[index];
+            if slot.output_taken {
+                self.poison("SCOPE_RESULT");
+                return Err(error("SCOPE_RESULT"));
+            }
+            if slot.accepted_at.is_none() {
+                pending = true;
+            } else {
+                let facts = slot.edge.facts();
+                if !facts.resources_complete()
+                    || !facts.group_absent
+                    || !facts.terminal_eof
+                    || facts.status.is_none()
+                    || facts.first_fault.is_some()
+                    || facts.io.first_fault.is_some()
+                {
+                    self.poison("SCOPE_RESULT");
+                    return Err(error("SCOPE_RESULT"));
+                }
+            }
+        }
+        if pending {
+            return Ok(None);
+        }
         Ok(Some([
             self.take_result(&slots[0])?,
             self.take_result(&slots[1])?,
@@ -1344,6 +1378,48 @@ impl Scope {
         });
         self.run_started(started)
     }
+    /// Fixed read-only repository cohort, used only by the HookShort owner.
+    /// Commands are the original three Git values; no shell or worker thread.
+    pub(crate) fn run_verified_repository(
+        &mut self,
+        commands: [Command; 3],
+        image: &super::image::VerifiedKeeperImage,
+    ) -> io::Result<[CommandResult; 3]> {
+        let result = (|| {
+            // All IO plans exist before the first child. Actual allocation and
+            // capacity reservation still precede each registered edge's spawn.
+            let plans = [
+                IoPlan::new(Vec::new(), 8192, 8192)?,
+                IoPlan::new(Vec::new(), 8192, 8192)?,
+                IoPlan::new(Vec::new(), 1024 * 1024, 8192)?,
+            ];
+            let mut slots = [None, None, None];
+            for ((command, plan), slot) in commands.into_iter().zip(plans).zip(&mut slots) {
+                // Existing children progress between admissions. Any observed
+                // fault closes admission before another child can be started.
+                self.poll();
+                *slot = Some(self.start_verified_opaque(command, plan, image)?);
+                self.poll();
+                if let Some(reason) = self.core.owner.borrow().first_fault {
+                    return Err(error(reason.0));
+                }
+            }
+            let slots = slots.map(|slot| slot.expect("three admitted repository slots"));
+            loop {
+                self.poll();
+                if let Some(results) = self.core.take_repository_results(&slots)? {
+                    return Ok(results);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })();
+        if result.is_err() {
+            // Includes partial admission and result validation faults. All
+            // returned handles remain retained in this same cancelled Scope.
+            self.finish();
+        }
+        result
+    }
     fn run_started(&mut self, started: io::Result<SlotId>) -> io::Result<CommandResult> {
         let slot = match started {
             Ok(slot) => slot,
@@ -1711,12 +1787,14 @@ mod tests {
     }
     #[test]
     fn repository_cohort_missing_proof_or_sticky_fault_never_yields_outputs() {
-        for missing in ["proof", "wait", "status", "fault"] {
+        for missing in ["proof", "wait", "status", "group", "terminal", "fault"] {
             let (mut core, slots) = repository_cohort();
             match missing {
                 "proof" => core.slots[2].edge.facts.resource_proof = false,
                 "wait" => core.slots[2].edge.facts.waits_known = false,
                 "status" => core.slots[2].edge.facts.status = None,
+                "group" => core.slots[2].edge.facts.group_absent = false,
+                "terminal" => core.slots[2].edge.facts.terminal_eof = false,
                 _ => core.poison("ORIGINAL_FAULT"),
             }
             assert!(core.take_repository_results(&slots).is_err());

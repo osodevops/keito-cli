@@ -368,6 +368,23 @@ impl<'a> CommandOwner<'a> {
     }
 }
 impl LeafRunner for CommandOwner<'_> {
+    fn repository_outputs(
+        &mut self,
+        commands: [Command; 3],
+    ) -> Option<io::Result<[CommandResult; 3]>> {
+        if self.policy != CleanupPolicy::HookShort {
+            return None;
+        }
+        let image = match &self.image {
+            Image::Owned(image) => image,
+            Image::Borrowed(image) => image,
+        };
+        let result = self.scope.run_verified_repository(commands, image);
+        Some(result.map_err(|error| match self.scope.first_fault() {
+            Some(reason) => io::Error::new(error.kind(), reason),
+            None => error,
+        }))
+    }
     fn output(
         &mut self,
         command: Command,

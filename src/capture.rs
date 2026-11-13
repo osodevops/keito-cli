@@ -152,25 +152,39 @@ pub struct Repository {
     pub disabled: bool,
 }
 #[cfg(unix)]
+fn repository_command(directory: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(directory).args(args);
+    command
+}
+#[cfg(unix)]
+fn repository_ownership_error(_: std::io::Error) -> AppError {
+    AppError::Config("Repository command ownership unavailable; capture paused".into())
+}
+#[cfg(unix)]
+fn repository_text(
+    result: crate::process_ownership::scope::CommandResult,
+    empty_no_match: bool,
+) -> Result<String, AppError> {
+    crate::process_ownership::probes::text(result, empty_no_match)
+        .map_err(|_| AppError::Config("Capture requires an identifiable Git repository".into()))
+}
+#[cfg(unix)]
 fn git_with(
     runner: &mut impl crate::process_ownership::probes::LeafRunner,
     directory: &Path,
     args: &[&str],
     empty_no_match: bool,
 ) -> Result<String, AppError> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(directory).args(args);
+    let command = repository_command(directory, args);
     let result = runner
         .output(
             command,
             if empty_no_match { 1024 * 1024 } else { 8192 },
             8192,
         )
-        .map_err(|_| {
-            AppError::Config("Repository command ownership unavailable; capture paused".into())
-        })?;
-    crate::process_ownership::probes::text(result, empty_no_match)
-        .map_err(|_| AppError::Config("Capture requires an identifiable Git repository".into()))
+        .map_err(repository_ownership_error)?;
+    repository_text(result, empty_no_match)
 }
 impl Repository {
     pub fn matches_binding(&self, binding: &Binding) -> bool {
@@ -196,31 +210,28 @@ impl Repository {
         directory: &Path,
         runner: &mut impl crate::process_ownership::probes::LeafRunner,
     ) -> Result<Self, AppError> {
-        let root = PathBuf::from(git_with(
-            runner,
-            directory,
-            &["rev-parse", "--show-toplevel"],
-            false,
-        )?)
+        let root_args = &["rev-parse", "--show-toplevel"];
+        let common_args = &["rev-parse", "--path-format=absolute", "--git-common-dir"];
+        let remotes_args = &["config", "--get-regexp", "^remote\\..*\\.url$"];
+        let mut cohort = runner.repository_outputs([
+            repository_command(directory, root_args),
+            repository_command(directory, common_args),
+            repository_command(directory, remotes_args),
+        ]).transpose().map_err(repository_ownership_error)?.map(IntoIterator::into_iter);
+        let mut git = |args: &[&str], empty_no_match| match &mut cohort {
+            Some(results) => repository_text(results.next().expect("fixed repository result count"), empty_no_match),
+            None => git_with(runner, directory, args, empty_no_match),
+        };
+        let root = PathBuf::from(git(root_args, false)?)
         .canonicalize()
         .map_err(storage_error)?;
-        let common = git_with(
-            runner,
-            directory,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            false,
-        )?;
+        let common = git(common_args, false)?;
         let common = PathBuf::from(common)
             .canonicalize()
             .map_err(storage_error)?;
         // All remotes participate in consent; adding/replacing one invalidates it.
         // Raw remotes may contain credentials. Only their digest is ever retained.
-        let remotes = git_with(
-            runner,
-            directory,
-            &["config", "--get-regexp", "^remote\\..*\\.url$"],
-            true,
-        )?;
+        let remotes = git(remotes_args, true)?;
         let mut remotes: Vec<_> = remotes.lines().collect();
         remotes.sort_unstable();
         let key = hash(common.to_string_lossy().as_bytes());
@@ -2907,5 +2918,80 @@ mod owned_probe_tests {
         };
         assert!(Repository::resolve_with(&root, &mut replies).is_err());
         assert_eq!(replies.calls, 3);
+    }
+    struct CohortReplies {
+        directory: PathBuf,
+        results: Option<io::Result<[CommandResult; 3]>>,
+    }
+    impl LeafRunner for CohortReplies {
+        fn repository_outputs(
+            &mut self,
+            commands: [Command; 3],
+        ) -> Option<io::Result<[CommandResult; 3]>> {
+            let expected: [&[&str]; 3] = [
+                &["rev-parse", "--show-toplevel"],
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                &["config", "--get-regexp", "^remote\\..*\\.url$"],
+            ];
+            for (command, args) in commands.into_iter().zip(expected) {
+                assert_eq!(command.get_program(), "git");
+                let actual: Vec<_> = command.get_args().collect();
+                assert_eq!(actual[0], "-C");
+                assert_eq!(actual[1], self.directory.as_os_str());
+                assert_eq!(actual[2..], args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>());
+                assert!(command.get_envs().next().is_none());
+            }
+            Some(self.results.take().expect("one repository cohort"))
+        }
+        fn output(&mut self, _: Command, _: usize, _: usize) -> io::Result<CommandResult> {
+            panic!("cohort must never fall back to another process");
+        }
+    }
+    #[test]
+    fn repository_cohort_resolver_preserves_commands_remote_sorting_and_empty_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.to_str().unwrap().as_bytes().to_vec();
+        for remotes in [reply(1, Vec::new()).unwrap(), reply(0, b"z url2\na url1\n".to_vec()).unwrap()] {
+            let expected = if remotes.status.code() == Some(1) { hash("") } else { hash("a url1\nz url2") };
+            let mut runner = CohortReplies {
+                directory: root.clone(),
+                results: Some(Ok([reply(0, path.clone()).unwrap(), reply(0, path.clone()).unwrap(), remotes])),
+            };
+            let result = Repository::resolve_with(&root, &mut runner).unwrap();
+            assert_eq!(result.key, hash(root.to_string_lossy().as_bytes()));
+            assert_eq!(result.remote_hash, expected);
+            assert!(runner.results.is_none());
+        }
+    }
+    #[test]
+    fn repository_cohort_resolver_retains_ownership_and_text_refusals() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.to_str().unwrap().as_bytes().to_vec();
+        for refusal in ["owner", "root", "common", "remote"] {
+            let mut results = [reply(0, path.clone()).unwrap(), reply(0, path.clone()).unwrap(), reply(1, Vec::new()).unwrap()];
+            match refusal {
+                "root" => results[0] = reply(128, Vec::new()).unwrap(),
+                "common" => results[1] = reply(0, vec![255]).unwrap(),
+                "remote" => results[2].output.stderr = b"private error never published".to_vec(),
+                _ => (),
+            }
+            let mut runner = CohortReplies {
+                directory: root.clone(),
+                results: Some(if refusal == "owner" { Err(io::Error::other("private owner error")) } else { Ok(results) }),
+            };
+            let error = Repository::resolve_with(&root, &mut runner).unwrap_err();
+            assert!(!error.to_string().contains("private"));
+        }
+    }
+    #[test]
+    fn repository_cohort_default_runner_still_short_circuits_invalid_root() {
+        let mut runner = Replies {
+            values: [reply(128, Vec::new())].into(),
+            calls: 0,
+        };
+        assert!(Repository::resolve_with(Path::new("/unused"), &mut runner).is_err());
+        assert_eq!(runner.calls, 1);
     }
 }

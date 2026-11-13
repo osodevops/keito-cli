@@ -3,6 +3,14 @@ use super::scope::CommandResult;
 use std::{io, process::Command};
 
 pub(crate) trait LeafRunner {
+    /// Optional fixed repository cohort. None preserves the original sequential
+    /// resolver, including short-circuiting before later commands are executed.
+    fn repository_outputs(
+        &mut self,
+        _commands: [Command; 3],
+    ) -> Option<io::Result<[CommandResult; 3]>> {
+        None
+    }
     fn output(
         &mut self,
         command: Command,
