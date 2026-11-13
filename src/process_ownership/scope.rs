@@ -841,6 +841,19 @@ impl<E: Edge> Core<E> {
         }
         self.finished = true;
     }
+    // Initial serial collection exposes the missing cohort barrier in the
+    // finite RED tests below. Replaced by the all-slot validation barrier.
+    #[cfg(test)]
+    fn take_repository_results(
+        &mut self,
+        slots: &[SlotId; 3],
+    ) -> io::Result<Option<[CommandResult; 3]>> {
+        Ok(Some([
+            self.take_result(&slots[0])?,
+            self.take_result(&slots[1])?,
+            self.take_result(&slots[2])?,
+        ]))
+    }
     fn take_result(&mut self, id: &SlotId) -> io::Result<CommandResult> {
         let index = self.index(id)?;
         let fault = self.owner.borrow().first_fault;
@@ -1644,6 +1657,73 @@ mod tests {
             begun: false,
             fail_begin: false,
             begin_ends: vec![],
+        }
+    }
+    fn repository_cohort() -> (Core<Fake>, [SlotId; 3]) {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        let slots = ["root", "common", "remotes"].map(|name| {
+            let id = core.admit(1, 32, |_| Ok(fake(name, Rc::default()))).unwrap();
+            core.slots[id.index].accepted_at = Some(2);
+            core.slots[id.index].edge.facts = EdgeFacts {
+                status: Some(ExitStatus::from_raw((id.index as i32) << 8)),
+                waits_known: true,
+                group_absent: true,
+                terminal_eof: true,
+                resource_proof: true,
+                ..Default::default()
+            };
+            id
+        });
+        (core, slots)
+    }
+    #[test]
+    fn repository_cohort_pending_sibling_consumes_no_outputs_or_authority() {
+        let (mut core, slots) = repository_cohort();
+        core.slots[2].accepted_at = None;
+        assert!(matches!(core.take_repository_results(&slots), Ok(None)));
+        assert!(core.slots.iter().all(|slot| !slot.output_taken));
+        assert!(core.owner.borrow().first_fault.is_none());
+        core.slots[2].accepted_at = Some(3);
+        assert!(core.take_repository_results(&slots).unwrap().is_some());
+    }
+    #[test]
+    fn repository_cohort_preserves_request_order_and_consumes_exactly_once() {
+        let (mut core, slots) = repository_cohort();
+        let reordered = [slots[2].clone(), slots[0].clone(), slots[1].clone()];
+        let results = core.take_repository_results(&reordered).unwrap().unwrap();
+        assert_eq!(results.map(|r| r.status.code()), [Some(2), Some(0), Some(1)]);
+        assert!(core.slots.iter().all(|slot| slot.output_taken));
+        assert!(core.take_repository_results(&slots).is_err());
+    }
+    #[test]
+    fn repository_cohort_foreign_duplicate_and_consumed_slots_take_nothing() {
+        for invalid in ["foreign", "duplicate", "consumed"] {
+            let (mut core, mut slots) = repository_cohort();
+            match invalid {
+                "foreign" => slots[2].scope = Rc::new(()),
+                "duplicate" => slots[2] = slots[1].clone(),
+                _ => core.slots[2].output_taken = true,
+            }
+            assert!(core.take_repository_results(&slots).is_err());
+            assert!(!core.slots[0].output_taken && !core.slots[1].output_taken);
+            assert!(core.owner.borrow().first_fault.is_some());
+        }
+    }
+    #[test]
+    fn repository_cohort_missing_proof_or_sticky_fault_never_yields_outputs() {
+        for missing in ["proof", "wait", "status", "fault"] {
+            let (mut core, slots) = repository_cohort();
+            match missing {
+                "proof" => core.slots[2].edge.facts.resource_proof = false,
+                "wait" => core.slots[2].edge.facts.waits_known = false,
+                "status" => core.slots[2].edge.facts.status = None,
+                _ => core.poison("ORIGINAL_FAULT"),
+            }
+            assert!(core.take_repository_results(&slots).is_err());
+            assert!(core.slots.iter().all(|slot| !slot.output_taken));
+            if missing == "fault" {
+                assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("ORIGINAL_FAULT")));
+            }
         }
     }
     fn installer_ready() -> Core<Fake> {
