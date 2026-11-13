@@ -227,7 +227,11 @@ fn validate_modes(dir: &Dir, prefix: &str) -> Result<(), AppError> {
     }
     Ok(())
 }
-fn write_payload(dir: &Dir, payload: &Payload) -> Result<(), AppError> {
+fn write_payload(
+    dir: &Dir,
+    payload: &Payload,
+    _check: &mut impl FnMut() -> Result<(), AppError>,
+) -> Result<(), AppError> {
     // Payload is sorted. Retain only the common parent chain, never a growing
     // path cache. Source traversal permits at most sixteen directory levels.
     let mut directories = Vec::with_capacity(17);
@@ -755,7 +759,7 @@ fn install_versioned_checked(
         RECEIPT.into(),
         serde_json::to_vec_pretty(&receipt).map_err(|_| failure())?,
     );
-    write_payload(&staged, &complete)?;
+    write_payload(&staged, &complete, check)?;
     check()?;
     if generations.exists(&key)? {
         let existing = generations.child(&key, false)?;
@@ -777,7 +781,7 @@ fn install_versioned_checked(
     check()?;
     let discovery_stage = format!(".keito-time-track-stage-{}", &nonce()?[..32]);
     let staged = skills.child(&discovery_stage, true)?;
-    write_payload(&staged, &complete)?;
+    write_payload(&staged, &complete, check)?;
     check()?;
     let hooks = data
         .as_object_mut()
@@ -1291,7 +1295,7 @@ pub(crate) mod tests {
                 count.set(count.get() + 1);
             }
         })));
-        write_payload(&dir, &payload).unwrap();
+        write_payload(&dir, &payload, &mut || Ok(())).unwrap();
         assert_eq!(
             syncs.get(),
             8,
@@ -1347,7 +1351,7 @@ pub(crate) mod tests {
                 std::os::unix::fs::symlink(&foreign, base.join("hooks")).unwrap();
             }
         })));
-        assert!(write_payload(&dir, &payload).is_err());
+        assert!(write_payload(&dir, &payload, &mut || Ok(())).is_err());
         assert!(replaced.get());
         assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
         assert!(root.path().join("retained/a.sh").is_file());
@@ -1356,6 +1360,83 @@ pub(crate) mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+    struct PayloadOwnerHookReset;
+    impl Drop for PayloadOwnerHookReset {
+        fn drop(&mut self) {
+            set_hook(None);
+        }
+    }
+    fn payload_owner_refusal() -> AppError {
+        AppError::Conflict("Original payload owner refusal".into())
+    }
+    #[test]
+    fn payload_owner_already_refused_creates_no_file_or_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let payload: Payload = [("hooks/a.sh".into(), b"a".to_vec())].into_iter().collect();
+        let result = write_payload(&dir, &payload, &mut || Err(payload_owner_refusal()));
+        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal"));
+        assert!(dir.entries().unwrap().is_empty());
+    }
+    #[test]
+    fn payload_owner_file_flush_refusal_prevents_rename_and_next_file() {
+        use std::{cell::Cell, rc::Rc};
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let payload: Payload = [("a".into(), b"a".to_vec()), ("b".into(), b"b".to_vec())].into_iter().collect();
+        let refused = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&refused);
+        let _reset = PayloadOwnerHookReset;
+        set_hook(Some(Box::new(move |phase| {
+            if phase == "install-payload-file-fsynced" {
+                observed.set(true);
+            }
+        })));
+        let result = write_payload(&dir, &payload, &mut || if refused.get() { Err(payload_owner_refusal()) } else { Ok(()) });
+        assert!(refused.get(), "actual payload file flush must be reached");
+        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal"));
+        assert!(dir.entries().unwrap().is_empty(), "refused temporary payload must not publish or leak");
+    }
+    #[test]
+    fn payload_owner_after_rename_preserves_first_file_and_refuses_second() {
+        use std::{cell::Cell, rc::Rc};
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let payload: Payload = [("a".into(), b"a".to_vec()), ("b".into(), b"b".to_vec())].into_iter().collect();
+        let refused = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&refused);
+        let _reset = PayloadOwnerHookReset;
+        set_hook(Some(Box::new(move |phase| {
+            if phase == "adapter-entry-renamed" {
+                observed.set(true);
+            }
+        })));
+        let result = write_payload(&dir, &payload, &mut || if refused.get() { Err(payload_owner_refusal()) } else { Ok(()) });
+        assert!(refused.get(), "actual rename must be reached");
+        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal"));
+        assert_eq!(fs::read(root.path().join("a")).unwrap(), b"a");
+        assert_eq!(dir.entries().unwrap(), vec!["a".to_owned()]);
+    }
+    #[test]
+    fn payload_owner_directory_flush_refusal_prevents_descending_or_writing() {
+        use std::{cell::Cell, rc::Rc};
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let payload: Payload = [("hooks/nested/a.sh".into(), b"a".to_vec())].into_iter().collect();
+        let refused = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&refused);
+        let _reset = PayloadOwnerHookReset;
+        set_hook(Some(Box::new(move |phase| {
+            if phase == "adapter-directory-fsynced" {
+                observed.set(true);
+            }
+        })));
+        let result = write_payload(&dir, &payload, &mut || if refused.get() { Err(payload_owner_refusal()) } else { Ok(()) });
+        assert!(refused.get(), "actual directory flush must be reached");
+        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal"));
+        assert!(dir.child("hooks", false).unwrap().entries().unwrap().is_empty());
+        assert!(!root.path().join("hooks/nested").exists());
     }
     #[test]
     fn installer_preflight_errors_reach_no_real_adapter_publication() {
