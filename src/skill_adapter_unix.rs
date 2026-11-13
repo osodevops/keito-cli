@@ -1703,6 +1703,67 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn recovery_owner_reinstall_preserves_remaining_redundant_stage_after_refusal() {
+        use std::{cell::{Cell, RefCell}, rc::Rc};
+        let fixture = Fixture::new();
+        let installed = fixture.install(SkillAgent::Codex, "0.167.0", false).unwrap();
+        let before = fs::read(fixture.config()).unwrap();
+        let generations = fixture.home.join(".codex/.keito-capture-generations");
+        let original = generations.join(&installed.generation);
+        let original_receipt = fs::read(original.join(RECEIPT)).unwrap();
+        let refused = Rc::new(Cell::new(false));
+        let stage = Rc::new(RefCell::new(None::<PathBuf>));
+        let observed_refusal = Rc::clone(&refused);
+        let observed_stage = Rc::clone(&stage);
+        let scan = generations.clone();
+        let _reset = PayloadOwnerHookReset;
+        set_hook(Some(Box::new(move |phase| {
+            if phase != "adapter-directory-fsynced" {
+                return;
+            }
+            for entry in fs::read_dir(&scan).unwrap() {
+                let path = entry.unwrap().path();
+                if path.file_name().unwrap().to_str().unwrap()
+                    .starts_with(".keito-time-track-stage-")
+                    && path.join(RECEIPT).is_file()
+                    && path.join("hooks/dispatch.sh").is_file()
+                    && !path.join("SKILL.md").exists()
+                {
+                    observed_refusal.set(true);
+                    *observed_stage.borrow_mut() = Some(path);
+                }
+            }
+        })));
+        let result = install_prepared(
+            InstallOptions {
+                source_root: &fixture.source,
+                profile_home: &fixture.home,
+                agent: SkillAgent::Codex,
+                runtime: &fixture.runtime,
+                confirm_migration: false,
+                harness_version: None,
+            },
+            "0.167.0".into(),
+            &mut || {
+                if refused.get() {
+                    Err(AppError::Conflict("Original reinstall owner refusal".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(refused.get(), "actual redundant-stage deletion must be reached");
+        assert!(matches!(result, Err(AppError::Conflict(message))
+            if message == "Original reinstall owner refusal"));
+        let stage = stage.borrow().clone().unwrap();
+        assert!(!stage.join("SKILL.md").exists());
+        assert!(stage.join(RECEIPT).is_file(), "refusal must stop later deletions");
+        assert!(stage.join("hooks/dispatch.sh").is_file());
+        assert_eq!(fs::read(fixture.config()).unwrap(), before);
+        assert_eq!(fs::read(original.join(RECEIPT)).unwrap(), original_receipt);
+        validate_receipt(&Dir::anchor(&original).unwrap()).unwrap();
+    }
+    #[test]
     fn native_install_is_immutable_idempotent_and_records_runtime_pair() {
         let f = Fixture::new();
         let first = f.install(SkillAgent::Codex, "0.167.0", false).unwrap();
