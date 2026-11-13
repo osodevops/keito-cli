@@ -967,7 +967,9 @@ fn await_repository_admission<E: Edge>(
         if core.repository_admission_ready()? {
             return Ok(());
         }
-        pause(std::time::Duration::from_millis(1));
+        // A fixed sleep can skip the remaining READY/PARK window. Yield the
+        // entry thread, then repeat the SAME bounded progress/fault checks.
+        pause(std::time::Duration::ZERO);
     }
 }
 
