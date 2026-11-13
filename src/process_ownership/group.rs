@@ -617,7 +617,7 @@ pub struct GroupLease {
     ready_end: u64,
     park_end: Option<u64>,
     #[cfg(feature = "dev-tools")]
-    setup_trace: SetupTrace,
+    setup_trace: Box<SetupTrace>,
 }
 #[derive(Clone, Copy)]
 enum KeeperProgram<'a> {
@@ -797,7 +797,26 @@ impl GroupLease {
         }
         // Verification/inventory cannot consume an old admission timestamp and
         // then start a keeper beyond its setup/operation end.
+        // Allocate developer metadata BEFORE the fresh pre-spawn check and
+        // BEFORE any Child exists; it does not extend the fixed setup end.
+        #[cfg(feature = "dev-tools")]
+        let mut setup_trace = Box::new(SetupTrace {
+            setup_start_ns: current,
+            ready_end_ns: policy.setup_end(current, lifetime_deadline_ns),
+            pre_spawn_ns: 0,
+            spawn_return_ns: None,
+            first_ready_poll_ns: None,
+            last_ready_before_ns: None,
+            last_ready_after_ns: None,
+            ready_frame_observed: false,
+            ready_eof_observed: false,
+            deadline_observed: None,
+        });
         let pre_spawn = now()?;
+        #[cfg(feature = "dev-tools")]
+        {
+            setup_trace.pre_spawn_ns = pre_spawn;
+        }
         if pre_spawn >= policy.setup_end(current, lifetime_deadline_ns) {
             return Err(refused("GROUP_DEADLINE"));
         }
@@ -823,18 +842,7 @@ impl GroupLease {
             ready_end: policy.setup_end(current, lifetime_deadline_ns),
             park_end: None,
             #[cfg(feature = "dev-tools")]
-            setup_trace: SetupTrace {
-                setup_start_ns: current,
-                ready_end_ns: policy.setup_end(current, lifetime_deadline_ns),
-                pre_spawn_ns: pre_spawn,
-                spawn_return_ns: None,
-                first_ready_poll_ns: None,
-                last_ready_before_ns: None,
-                last_ready_after_ns: None,
-                ready_frame_observed: false,
-                ready_eof_observed: false,
-                deadline_observed: None,
-            },
+            setup_trace,
         };
         // Diagnostic only: the actual Child is already retained in the lease.
         // An unavailable observation grants no new time and changes no check.
@@ -1176,7 +1184,7 @@ impl GroupLease {
     }
     #[cfg(feature = "dev-tools")]
     pub(super) fn setup_trace(&self) -> SetupTrace {
-        self.setup_trace
+        *self.setup_trace
     }
 }
 impl Drop for GroupLease {
