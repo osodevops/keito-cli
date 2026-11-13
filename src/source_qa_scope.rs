@@ -56,14 +56,91 @@ fn prepare_fixture_scope(
     Ok(())
 }
 
-#[cfg(test)]
 fn probe_observation<T>(
     scope: &mut crate::process_ownership::scope::Scope,
     result: io::Result<T>,
     publish: impl FnOnce(&crate::process_ownership::scope::ScopeReport) -> io::Result<()>,
 ) -> io::Result<T> {
-    publish(&scope.report())?;
+    if let Err(receipt) = publish(&scope.report()) {
+        scope.begin_cancel(ProtocolError("QA_PROBE_RECEIPT"), scope.hard_end());
+        return match result {
+            Err(primary) => Err(primary),
+            Ok(_) => Err(receipt),
+        };
+    }
     result
+}
+
+fn hook_probe_clock(scope: &mut crate::process_ownership::scope::Scope) -> io::Result<u64> {
+    match crate::process_ownership::scope::monotonic_now() {
+        Ok(at) => Ok(at),
+        Err(error) => {
+            scope.tighten_end(0);
+            scope.begin_cancel(ProtocolError("SCOPE_CLOCK"), 0);
+            Err(error)
+        }
+    }
+}
+
+/// Developer diagnosis of the actual repository/clock callers. Only metadata
+/// reaches the observer: never Command, arguments, environment or tool output.
+/// This is not default-artifact latency or capture/usage authority.
+pub fn diagnose_fixture_hook_probes(
+    scope: &mut crate::process_ownership::scope::Scope,
+    core: &Path,
+    repository: &Path,
+    mut observe: impl FnMut(u8, u64, Option<u64>, bool, &crate::process_ownership::scope::ScopeReport) -> io::Result<()>,
+) -> Result<(), crate::error::AppError> {
+    use crate::process_ownership::{image::VerifiedKeeperImage, probes::LeafRunner, scope::{CommandResult, Scope, ScopeReport}};
+    let refused = || crate::error::AppError::Config("Source hook probe diagnosis refused".into());
+    let at = hook_probe_clock(scope).map_err(|_| refused())?;
+    scope.tighten_end(scope.hard_end().min(at.saturating_add(500_000_000)));
+    let anchor = option_env!("KEITO_RELEASE_GUARD_SHA256").ok_or_else(refused)?;
+    let runtime = crate::capture_runtime_pair::verify(core, anchor, env!("CARGO_PKG_VERSION"), env!("KEITO_BUILD_TARGET"))
+        .map_err(|_| refused())?;
+    let image = VerifiedKeeperImage::open(&runtime.guard_path, &runtime.guard_sha256).map_err(|_| refused())?;
+    struct Runner<'a, F> {
+        scope: &'a mut Scope,
+        image: VerifiedKeeperImage,
+        ordinal: u8,
+        observe: &'a mut F,
+    }
+    impl<F: FnMut(u8, u64, Option<u64>, bool, &ScopeReport) -> io::Result<()>> LeafRunner for Runner<'_, F> {
+        fn output(&mut self, command: Command, stdout_cap: usize, stderr_cap: usize) -> io::Result<CommandResult> {
+            if self.ordinal >= 4 {
+                self.scope.begin_cancel(ProtocolError("QA_PROBE_COUNT"), self.scope.hard_end());
+                return Err(io::Error::other("QA_PROBE_COUNT"));
+            }
+            self.ordinal += 1;
+            let before = hook_probe_clock(self.scope)?;
+            let plan = crate::process_ownership::io::IoPlan::new(Vec::new(), stdout_cap, stderr_cap)?;
+            // SAME HookShort policy as CommandOwner::for_hook, not the
+            // ordinary-command diagnostic gateway's longer setup interval.
+            let result = self.scope.run_verified(command, plan, &self.image);
+            let after = hook_probe_clock(self.scope);
+            let finished = after.as_ref().ok().copied();
+            let result = match (result, after) {
+                (Err(primary), _) => Err(primary),
+                (Ok(_), Err(clock)) => Err(clock),
+                (Ok(value), Ok(_)) => Ok(value),
+            };
+            let ok = result.is_ok();
+            let ordinal = self.ordinal;
+            let observer = &mut self.observe;
+            probe_observation(self.scope, result, |report| observer(ordinal, before, finished, ok, report))
+        }
+    }
+    let mut runner = Runner { scope, image, ordinal: 0, observe: &mut observe };
+    // Do not duplicate/substitute the original fixed Git/sysctl commands or
+    // their text interpretation. The own repository is validated by native.
+    crate::capture::Repository::resolve_with(repository, &mut runner)?;
+    crate::capture::Clock::now_with(&mut runner)?;
+    let expected = if cfg!(target_os = "macos") { 4 } else { 3 };
+    if runner.ordinal != expected {
+        runner.scope.begin_cancel(ProtocolError("QA_PROBE_COUNT"), runner.scope.hard_end());
+        return Err(refused());
+    }
+    Ok(())
 }
 
 fn now() -> io::Result<u64> {
