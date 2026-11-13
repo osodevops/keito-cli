@@ -811,7 +811,9 @@ pub(crate) mod installer_phase_trace {
             );
             assert_eq!(bytes.len() % 24, 0);
             let codes: Vec<_> = bytes
-                .chunks_exact(24)
+                .as_chunks::<24>()
+                .0
+                .iter()
                 .enumerate()
                 .map(|(i, frame)| {
                     assert_eq!(&frame[..4], b"KIP1");
