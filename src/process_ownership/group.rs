@@ -922,7 +922,9 @@ impl GroupLease {
             }
             if before >= self.ready_end {
                 #[cfg(feature = "dev-tools")]
-                self.setup_trace.deadline_observed.get_or_insert(("READY_BEFORE_RECEIVE", before));
+                self.setup_trace
+                    .deadline_observed
+                    .get_or_insert(("READY_BEFORE_RECEIVE", before));
                 return Err(refused("GROUP_DEADLINE"));
             }
             let body = self.channel.receive()?;
@@ -935,7 +937,9 @@ impl GroupLease {
             }
             if after >= self.ready_end {
                 #[cfg(feature = "dev-tools")]
-                self.setup_trace.deadline_observed.get_or_insert(("READY_AFTER_RECEIVE", after));
+                self.setup_trace
+                    .deadline_observed
+                    .get_or_insert(("READY_AFTER_RECEIVE", after));
                 return Err(refused("GROUP_DEADLINE"));
             }
             let Some(body) = body else {
