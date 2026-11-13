@@ -197,26 +197,40 @@ fn hook_probe_diagnostic(scope: &mut Scope, case: &Path, core: &Path) -> io::Res
     let mut count = 0u8;
     let entry_end = scope.hard_end();
     let result = keito_cli::source_qa_scope::diagnose_fixture_hook_probes(
-        scope, core, &case.join("repo"),
+        scope,
+        core,
+        &case.join("repo"),
         |ordinal, before, after, operation_ok, report| {
-            if count >= 4 || ordinal != count + 1 { return Err(error()); }
+            if count >= 4 || ordinal != count + 1 {
+                return Err(error());
+            }
             count = ordinal;
-            let slots: Vec<_> = report.slots.iter().map(|slot| serde_json::json!({
-                "slot":slot.slot, "status":slot.status.and_then(|s| s.code()),
-                "waits_known":slot.waits_known, "group_absent":slot.group_absent,
-                "terminal_eof":slot.terminal_eof, "io_required":slot.io_required,
-                "stdin_closed":slot.io.stdin_closed, "stdout_eof":slot.io.stdout_eof,
-                "stderr_eof":slot.io.stderr_eof, "accepted_at":slot.accepted_at,
-                "completion_end":slot.completion_end, "first_fault":slot.first_fault,
-            })).collect();
+            let slots: Vec<_> = report
+                .slots
+                .iter()
+                .map(|slot| {
+                    serde_json::json!({
+                        "slot":slot.slot, "status":slot.status.and_then(|s| s.code()),
+                        "waits_known":slot.waits_known, "group_absent":slot.group_absent,
+                        "terminal_eof":slot.terminal_eof, "io_required":slot.io_required,
+                        "stdin_closed":slot.io.stdin_closed, "stdout_eof":slot.io.stdout_eof,
+                        "stderr_eof":slot.io.stderr_eof, "accepted_at":slot.accepted_at,
+                        "completion_end":slot.completion_end, "first_fault":slot.first_fault,
+                    })
+                })
+                .collect();
             let value = serde_json::json!({"diagnostic_only":true, "ordinal":ordinal,
                 "before_ns":before, "after_ns":after, "operation_ok":operation_ok,
                 "entry_end_ns":entry_end,
                 "first_fault":report.first_fault.map(|s| s.0),
                 "finish_called":report.finish_called, "all_resources":report.all_resources,
                 "clean":report.clean, "slots":slots});
-            let mut output = OpenOptions::new().write(true).create_new(true).mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW).open(case.join(format!("hook-probe-{ordinal:02}.json")))?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(case.join(format!("hook-probe-{ordinal:02}.json")))?;
             serde_json::to_writer(&mut output, &value)?;
             output.write_all(b"\n")?;
             output.sync_all()
@@ -228,8 +242,12 @@ fn hook_probe_diagnostic(scope: &mut Scope, case: &Path, core: &Path) -> io::Res
         "hard_end_ns":scope.hard_end(), "finish_called":report.finish_called,
         "all_resources":report.all_resources, "clean":report.clean});
     let saved = (|| -> io::Result<()> {
-        let mut output = OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW).open(case.join("hook-probe-summary.json"))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(case.join("hook-probe-summary.json"))?;
         serde_json::to_writer(&mut output, &summary)?;
         output.write_all(b"\n")?;
         output.sync_all()
@@ -239,7 +257,10 @@ fn hook_probe_diagnostic(scope: &mut Scope, case: &Path, core: &Path) -> io::Res
     }
     match result {
         Err(_) => Err(error()),
-        Ok(()) => { saved?; Ok(0) },
+        Ok(()) => {
+            saved?;
+            Ok(0)
+        }
     }
 }
 // Developer-only failure diagnosis. Never serialize argv, environment, command
@@ -326,7 +347,12 @@ fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i3
     };
     assert!(matches!(
         mode,
-        "--cli" | "--run" | "--chain" | "--git-init" | "--opaque-diagnostic" | "--hook-probe-diagnostic"
+        "--cli"
+            | "--run"
+            | "--chain"
+            | "--git-init"
+            | "--opaque-diagnostic"
+            | "--hook-probe-diagnostic"
     ));
     assert!(fields.len() >= 3);
     let root = owned(Path::new(&fields[0]));
@@ -441,9 +467,16 @@ pub(super) fn run(version: &'static str) -> i32 {
     let hook = arguments
         .first()
         .is_some_and(|mode| mode == "--run" || mode == "--chain");
-    let duration = if arguments.first().is_some_and(|mode| mode == "--hook-probe-diagnostic") {
+    let duration = if arguments
+        .first()
+        .is_some_and(|mode| mode == "--hook-probe-diagnostic")
+    {
         500_000_000
-    } else if hook { 1_000_000_000 } else { 4_000_000_000 };
+    } else if hook {
+        1_000_000_000
+    } else {
+        4_000_000_000
+    };
     let mut scope = match Scope::entry_from_environment(duration) {
         Ok(Some(scope)) => scope,
         Ok(None) => {
