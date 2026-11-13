@@ -608,7 +608,10 @@ pub struct SetupTrace {
 pub struct GroupLease {
     keeper: Child,
     workload: Option<Child>,
+    #[cfg(not(feature = "dev-tools"))]
     settlement: Settlement,
+    #[cfg(feature = "dev-tools")]
+    settlement: Box<Settlement>,
     channel: Channel,
     owner: SharedOwner,
     keeper_pid: libc::pid_t,
@@ -812,6 +815,12 @@ impl GroupLease {
             ready_eof_observed: false,
             deadline_observed: None,
         });
+        #[cfg(feature = "dev-tools")]
+        let mut settlement = Box::new(if policy == CleanupPolicy::Legacy {
+            Settlement::new(lifetime_deadline_ns)
+        } else {
+            Settlement::with_policy(lifetime_deadline_ns, policy)
+        });
         let pre_spawn = now()?;
         #[cfg(feature = "dev-tools")]
         {
@@ -824,6 +833,7 @@ impl GroupLease {
         let keeper = command.spawn()?;
         let keeper_pid = keeper.id() as libc::pid_t;
         // The real handle is owned before any fallible read or publication.
+        #[cfg(not(feature = "dev-tools"))]
         let mut settlement = if policy == CleanupPolicy::Legacy {
             Settlement::new(lifetime_deadline_ns)
         } else {
