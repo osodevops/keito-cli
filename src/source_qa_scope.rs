@@ -148,7 +148,9 @@ pub fn diagnose_fixture_repository_cohort(
                 (Ok(value), Ok(_)) => Ok(value),
             };
             let ok = result.is_ok();
-            probe_observation(scope, result, |report| observe(before, finished, ok, report))
+            probe_observation(scope, result, |report| {
+                observe(before, finished, ok, report)
+            })
         },
     };
     crate::capture::Repository::resolve_with(repository, &mut runner)?;

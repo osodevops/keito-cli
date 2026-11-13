@@ -275,23 +275,31 @@ fn repository_cohort_diagnostic(scope: &mut Scope, case: &Path, core: &Path) -> 
                 return Err(error());
             }
             observed = true;
-            let slots: Vec<_> = report.slots.iter().map(|slot| {
-                serde_json::json!({
-                    "slot":slot.slot, "status":slot.status.and_then(|s| s.code()),
-                    "waits_known":slot.waits_known, "group_absent":slot.group_absent,
-                    "terminal_eof":slot.terminal_eof, "io_required":slot.io_required,
-                    "stdin_closed":slot.io.stdin_closed, "stdout_eof":slot.io.stdout_eof,
-                    "stderr_eof":slot.io.stderr_eof, "accepted_at":slot.accepted_at,
-                    "completion_end":slot.completion_end, "first_fault":slot.first_fault,
+            let slots: Vec<_> = report
+                .slots
+                .iter()
+                .map(|slot| {
+                    serde_json::json!({
+                        "slot":slot.slot, "status":slot.status.and_then(|s| s.code()),
+                        "waits_known":slot.waits_known, "group_absent":slot.group_absent,
+                        "terminal_eof":slot.terminal_eof, "io_required":slot.io_required,
+                        "stdin_closed":slot.io.stdin_closed, "stdout_eof":slot.io.stdout_eof,
+                        "stderr_eof":slot.io.stderr_eof, "accepted_at":slot.accepted_at,
+                        "completion_end":slot.completion_end, "first_fault":slot.first_fault,
+                    })
                 })
-            }).collect();
+                .collect();
             let value = serde_json::json!({"diagnostic_only":true, "repository_cohort":true,
                 "before_ns":before, "after_ns":after, "operation_ok":operation_ok,
                 "entry_end_ns":entry_end, "first_fault":report.first_fault.map(|s| s.0),
                 "finish_called":report.finish_called, "all_resources":report.all_resources,
                 "clean":report.clean, "slots":slots});
-            let mut output = OpenOptions::new().write(true).create_new(true).mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW).open(case.join("repository-cohort.json"))?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(case.join("repository-cohort.json"))?;
             serde_json::to_writer(&mut output, &value)?;
             output.write_all(b"\n")?;
             output.sync_all()
@@ -304,8 +312,12 @@ fn repository_cohort_diagnostic(scope: &mut Scope, case: &Path, core: &Path) -> 
         "finish_called":report.finish_called, "all_resources":report.all_resources,
         "clean":report.clean});
     let saved = (|| -> io::Result<()> {
-        let mut output = OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW).open(case.join("repository-cohort-summary.json"))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(case.join("repository-cohort-summary.json"))?;
         serde_json::to_writer(&mut output, &summary)?;
         output.write_all(b"\n")?;
         output.sync_all()
@@ -335,7 +347,11 @@ fn failure_receipt(
         .ok_or_else(error)?;
     let offset = match mode {
         "--chain" => 2,
-        "--cli" | "--run" | "--git-init" | "--opaque-diagnostic" | "--hook-probe-diagnostic"
+        "--cli"
+        | "--run"
+        | "--git-init"
+        | "--opaque-diagnostic"
+        | "--hook-probe-diagnostic"
         | "--repository-cohort-diagnostic" => 1,
         _ => return Err(error()),
     };
@@ -532,10 +548,9 @@ pub(super) fn run(version: &'static str) -> i32 {
     let hook = arguments
         .first()
         .is_some_and(|mode| mode == "--run" || mode == "--chain");
-    let duration = if arguments
-        .first()
-        .is_some_and(|mode| mode == "--hook-probe-diagnostic" || mode == "--repository-cohort-diagnostic")
-    {
+    let duration = if arguments.first().is_some_and(|mode| {
+        mode == "--hook-probe-diagnostic" || mode == "--repository-cohort-diagnostic"
+    }) {
         500_000_000
     } else if hook {
         1_000_000_000
