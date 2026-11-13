@@ -500,7 +500,9 @@ mod installer_flush_tests {
         let result = dir.remove_tree_checked("stage", &mut || {
             Err(AppError::Conflict("Original recovery owner refusal".into()))
         });
-        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original recovery owner refusal"));
+        assert!(
+            matches!(result, Err(AppError::Conflict(message)) if message == "Original recovery owner refusal")
+        );
         assert_eq!(target.read("a", 16).unwrap().unwrap(), b"a");
         assert!(root.path().join("stage").is_dir());
     }
@@ -518,7 +520,9 @@ mod installer_flush_tests {
                 Err(AppError::Conflict("Original recovery owner refusal".into()))
             }
         });
-        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original recovery owner refusal"));
+        assert!(
+            matches!(result, Err(AppError::Conflict(message)) if message == "Original recovery owner refusal")
+        );
         assert!(!target.path.join("a").exists());
         assert_eq!(target.read("b", 16).unwrap().unwrap(), b"b");
         assert!(root.path().join("stage").is_dir());

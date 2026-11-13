@@ -1598,8 +1598,14 @@ pub(crate) mod tests {
         set_hook(None);
         let host = Dir::anchor(&fixture.home.join(".codex")).unwrap();
         let skills = host.child("skills", false).unwrap();
-        let journal: Publication = serde_json::from_slice(&host.read(JOURNAL, 4096).unwrap().unwrap()).unwrap();
-        validate_receipt(&skills.child(journal.stage.as_deref().unwrap(), false).unwrap()).unwrap();
+        let journal: Publication =
+            serde_json::from_slice(&host.read(JOURNAL, 4096).unwrap().unwrap()).unwrap();
+        validate_receipt(
+            &skills
+                .child(journal.stage.as_deref().unwrap(), false)
+                .unwrap(),
+        )
+        .unwrap();
         recover(&host, &skills).unwrap();
         assert!(!fixture.home.join(".codex").join(JOURNAL).exists());
         assert_eq!(fs::read(fixture.config()).unwrap(), before);
@@ -1676,7 +1682,10 @@ pub(crate) mod tests {
         assert!(
             selected_install(&[SkillAgent::Codex, SkillAgent::ClaudeCode], &mut steps).is_err()
         );
-        assert_eq!(&fs::read(fixture.config()).unwrap(), steps.first.as_ref().unwrap());
+        assert_eq!(
+            &fs::read(fixture.config()).unwrap(),
+            steps.first.as_ref().unwrap()
+        );
         assert!(fixture.home.join(".codex/skills/keito-time-track").is_dir());
         assert!(!fixture.home.join(".claude/settings.json").exists());
         assert!(fixture.home.join(".claude").join(JOURNAL).exists());
@@ -1688,7 +1697,10 @@ pub(crate) mod tests {
         let skills = host.child("skills", false).unwrap();
         recover(&host, &skills).unwrap();
         assert!(!fixture.home.join(".claude").join(JOURNAL).exists());
-        assert_eq!(&fs::read(fixture.config()).unwrap(), steps.first.as_ref().unwrap());
+        assert_eq!(
+            &fs::read(fixture.config()).unwrap(),
+            steps.first.as_ref().unwrap()
+        );
     }
     #[test]
     fn native_install_is_immutable_idempotent_and_records_runtime_pair() {
