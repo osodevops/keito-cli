@@ -87,7 +87,10 @@ pub struct Clock {
 fn native_boot_identity_from(
     read: impl FnOnce(&mut libc::timeval, &mut usize) -> i32,
 ) -> Option<String> {
-    let mut value = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut value = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
     let mut length = std::mem::size_of::<libc::timeval>();
     if read(&mut value, &mut length) != 0
         || length != std::mem::size_of::<libc::timeval>()
@@ -98,7 +101,10 @@ fn native_boot_identity_from(
     }
     // Never hash ABI padding, localized dates or environment-controlled text.
     // A pre-upgrade active clock deliberately differs and closes incomplete.
-    Some(hash(format!("macos-kern-boottime-v1:{}:{}", value.tv_sec, value.tv_usec)))
+    Some(hash(format!(
+        "macos-kern-boottime-v1:{}:{}",
+        value.tv_sec, value.tv_usec
+    )))
 }
 #[cfg(target_os = "macos")]
 fn native_boot_identity() -> Option<String> {
@@ -145,9 +151,7 @@ impl Clock {
         #[cfg(target_os = "macos")]
         let boot = native_boot_identity();
         #[cfg(not(target_os = "macos"))]
-        let boot = {
-            fs::read("/proc/sys/kernel/random/boot_id").ok().map(hash)
-        };
+        let boot = { fs::read("/proc/sys/kernel/random/boot_id").ok().map(hash) };
         Ok(Self {
             wall: chrono::Utc::now().timestamp(),
             monotonic: time.tv_sec,
@@ -3067,7 +3071,8 @@ mod native_boot_clock_tests {
             value.tv_sec = seconds;
             value.tv_usec = micros;
             0
-        }).unwrap()
+        })
+        .unwrap()
     }
 
     #[test]
@@ -3097,14 +3102,23 @@ mod native_boot_clock_tests {
                 value.tv_usec = micros;
                 *size = length;
                 status
-            }).is_none());
+            })
+            .is_none());
         }
     }
 
     #[test]
     fn native_boot_clock_keeps_elapsed_boot_rollback_and_drift_refusals() {
-        let start = Clock { wall: 100, monotonic: 100, boot: sample(1_700_000_000, 0) };
-        let mut end = Clock { wall: 130, monotonic: 130, boot: start.boot.clone() };
+        let start = Clock {
+            wall: 100,
+            monotonic: 100,
+            boot: sample(1_700_000_000, 0),
+        };
+        let mut end = Clock {
+            wall: 130,
+            monotonic: 130,
+            boot: start.boot.clone(),
+        };
         assert_eq!(start.elapsed(&end), Some(30));
         end.boot = sample(1_700_000_001, 0);
         assert_eq!(start.elapsed(&end), None);
@@ -3117,16 +3131,37 @@ mod native_boot_clock_tests {
 
     #[test]
     fn native_boot_clock_legacy_identity_closes_zero_incomplete_with_attention() {
-        let before = Clock { wall: 100, monotonic: 100, boot: hash("legacy-formatted-sysctl-output") };
-        let after = Clock { wall: 130, monotonic: 130, boot: sample(1_700_000_000, 0) };
+        let before = Clock {
+            wall: 100,
+            monotonic: 100,
+            boot: hash("legacy-formatted-sysctl-output"),
+        };
+        let after = Clock {
+            wall: 130,
+            monotonic: 130,
+            boot: sample(1_700_000_000, 0),
+        };
         let binding = Binding {
-            repository_key: hash("repo"), remote_hash: hash(""), hint_hash: hash("hint"),
-            id: hash("binding"), version: 1, workspace_id: "co_synthetic".into(), owner_id: "owner_synthetic".into(),
-            origin_hash: hash("origin"), project_id: "project_synthetic".into(), task_id: "task_synthetic".into(),
-            agents: vec!["codex".into()], paused: false, revoked: false,
+            repository_key: hash("repo"),
+            remote_hash: hash(""),
+            hint_hash: hash("hint"),
+            id: hash("binding"),
+            version: 1,
+            workspace_id: "co_synthetic".into(),
+            owner_id: "owner_synthetic".into(),
+            origin_hash: hash("origin"),
+            project_id: "project_synthetic".into(),
+            task_id: "task_synthetic".into(),
+            agents: vec!["codex".into()],
+            paused: false,
+            revoked: false,
         };
         let mut session = Session::begin(&binding, "codex", "session", "0.167.0", &before);
-        session.active = Some(ActiveTurn { key: "turn".into(), part: 0, clock: Some(before) });
+        session.active = Some(ActiveTurn {
+            key: "turn".into(),
+            part: 0,
+            clock: Some(before),
+        });
         session.close(&after, true).unwrap();
         assert!(session.needs_attention);
         assert!(session.active.is_none());
