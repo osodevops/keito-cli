@@ -91,6 +91,12 @@ impl<F> crate::process_ownership::probes::LeafRunner for RepositoryCohortDiagnos
 where
     F: FnMut([Command; 3]) -> io::Result<[crate::process_ownership::scope::CommandResult; 3]>,
 {
+    fn repository_outputs(
+        &mut self,
+        commands: [Command; 3],
+    ) -> Option<io::Result<[crate::process_ownership::scope::CommandResult; 3]>> {
+        Some((self.run)(commands))
+    }
     fn output(
         &mut self,
         _: Command,
@@ -99,6 +105,54 @@ where
     ) -> io::Result<crate::process_ownership::scope::CommandResult> {
         Err(io::Error::other("QA_COHORT_SEQUENTIAL_REFUSED"))
     }
+}
+
+/// Observe the SAME staged repository cohort as the product hook. This is a
+/// separate developer diagnostic, never a default-artifact benchmark or ACK.
+pub fn diagnose_fixture_repository_cohort(
+    scope: &mut crate::process_ownership::scope::Scope,
+    core: &Path,
+    repository: &Path,
+    mut observe: impl FnMut(
+        u64,
+        Option<u64>,
+        bool,
+        &crate::process_ownership::scope::ScopeReport,
+    ) -> io::Result<()>,
+) -> Result<(), crate::error::AppError> {
+    let refused = || crate::error::AppError::Config("Source cohort diagnosis refused".into());
+    let at = hook_probe_clock(scope).map_err(|_| refused())?;
+    scope.tighten_end(scope.hard_end().min(at.saturating_add(500_000_000)));
+    let anchor = option_env!("KEITO_RELEASE_GUARD_SHA256").ok_or_else(refused)?;
+    let runtime = crate::capture_runtime_pair::verify(
+        core,
+        anchor,
+        env!("CARGO_PKG_VERSION"),
+        env!("KEITO_BUILD_TARGET"),
+    )
+    .map_err(|_| refused())?;
+    let image = crate::process_ownership::image::VerifiedKeeperImage::open(
+        &runtime.guard_path,
+        &runtime.guard_sha256,
+    )
+    .map_err(|_| refused())?;
+    let mut runner = RepositoryCohortDiagnostic {
+        run: |commands| {
+            let before = hook_probe_clock(scope)?;
+            let result = scope.run_verified_repository(commands, &image);
+            let after = hook_probe_clock(scope);
+            let finished = after.as_ref().ok().copied();
+            let result = match (result, after) {
+                (Err(primary), _) => Err(primary),
+                (Ok(_), Err(clock)) => Err(clock),
+                (Ok(value), Ok(_)) => Ok(value),
+            };
+            let ok = result.is_ok();
+            probe_observation(scope, result, |report| observe(before, finished, ok, report))
+        },
+    };
+    crate::capture::Repository::resolve_with(repository, &mut runner)?;
+    Ok(())
 }
 
 /// Developer diagnosis of the actual repository/clock callers. Only metadata
