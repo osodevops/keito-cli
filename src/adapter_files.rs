@@ -258,6 +258,12 @@ impl Dir {
         phase: &str,
         check: &mut impl FnMut() -> Result<(), AppError>,
     ) -> Result<(), AppError> {
+        match phase {
+            "install-payload-file-fsynced" => installer_phase_event(50),
+            "install-journal-fsynced" => installer_phase_event(52),
+            "install-config-fsynced" => installer_phase_event(53),
+            _ => {}
+        }
         self.verify()?;
         let temp = format!(".keito-publish-{}", nonce()?);
         let c = name(&temp)?;
@@ -650,7 +656,7 @@ pub(crate) fn installer_phase_event(code: u8) {
 #[cfg(feature = "dev-tools")]
 pub(crate) mod installer_phase_trace {
     use std::{cell::RefCell, io};
-    pub(super) const MAX_FRAMES: u32 = 1024;
+    pub(super) const MAX_FRAMES: u32 = 2048;
     struct State { fd: i32, sequence: u32, failed: bool }
     thread_local! {
         static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
@@ -698,8 +704,34 @@ pub(crate) mod installer_phase_trace {
             }
         }
     }
-    pub(super) fn emit(_: u8) {
-        // RED: deliberately omit the bounded metadata writer.
+    pub(super) fn emit(code: u8) {
+        STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            let Some(state) = state.as_mut() else { return; };
+            if state.failed { return; }
+            if state.sequence >= MAX_FRAMES
+                || !matches!(code, 1..=4 | 10..=12 | 20..=22 | 30..=32 | 40..=41 | 50 | 52..=53)
+            {
+                state.failed = true;
+                return;
+            }
+            let Ok(at) = crate::process_ownership::scope::monotonic_now() else {
+                state.failed = true;
+                return;
+            };
+            let mut frame = [0u8; 24];
+            frame[..4].copy_from_slice(b"KIP1");
+            frame[4] = code;
+            frame[8..12].copy_from_slice(&state.sequence.to_le_bytes());
+            frame[16..24].copy_from_slice(&at.to_le_bytes());
+            // One nonblocking write; no retry, formatting, path or content.
+            let count = unsafe { libc::write(state.fd, frame.as_ptr().cast(), frame.len()) };
+            if count == frame.len() as isize {
+                state.sequence += 1;
+            } else {
+                state.failed = true;
+            }
+        });
     }
     #[cfg(test)]
     mod tests {

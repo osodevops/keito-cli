@@ -358,6 +358,7 @@ fn failure_receipt(
     let offset = match mode {
         "--chain" => 2,
         "--cli"
+        | "--installer-phases-diagnostic"
         | "--run"
         | "--git-init"
         | "--opaque-diagnostic"
@@ -434,6 +435,7 @@ fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i3
     assert!(matches!(
         mode,
         "--cli"
+        | "--installer-phases-diagnostic"
             | "--run"
             | "--chain"
             | "--git-init"
@@ -498,12 +500,18 @@ fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i3
         )?;
         return Ok(result.status.code().unwrap_or(125));
     }
-    if mode == "--cli" {
-        assert!(fields.len() >= 4);
+    if mode == "--cli" || mode == "--installer-phases-diagnostic" {
         let mut command = Command::new(&checked.core);
         environment(&mut command, &case, &home, &capture);
+        if mode == "--installer-phases-diagnostic" {
+            assert_eq!(fields.len(), 3);
+            command.args(["--quiet", "skill", "install", "--source", "bundled", "--agent", "codex", "--agent", "claude-code"])
+                .env("KEITO_SOURCE_QA_INSTALL_PHASE_TRACE", "v1");
+        } else {
+            assert!(fields.len() >= 4);
+            command.args(&fields[3..]);
+        }
         command
-            .args(&fields[3..])
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
