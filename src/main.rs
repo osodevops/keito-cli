@@ -5,16 +5,32 @@ use keito_cli::{capture_runtime_pair, cli, commands, error, output};
 use std::io::IsTerminal;
 
 fn local_command(cli: &Cli) -> bool {
-    matches!(&cli.command, cli::Command::Capture(cli::capture::CaptureCommand {
-        command: cli::capture::CaptureSubcommand::Hook { .. },
-    }))
+    match &cli.command {
+        cli::Command::Capture(command) => matches!(
+            &command.command,
+            cli::capture::CaptureSubcommand::Hook { .. }
+                | cli::capture::CaptureSubcommand::Status
+                | cli::capture::CaptureSubcommand::Usage { .. }
+                | cli::capture::CaptureSubcommand::Pause { .. }
+                | cli::capture::CaptureSubcommand::Resume { .. }
+        ),
+        cli::Command::Skill(command) => match &command.command {
+            cli::skill::SkillSubcommand::Runtime => true,
+            cli::skill::SkillSubcommand::Install { source, agent, .. } => {
+                cli.global.quiet
+                    && !agent.is_empty()
+                    && matches!(source.trim(), "" | "bundled")
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn poll_local(
     future: impl std::future::Future<Output = Result<(), AppError>>,
     hook: bool,
 ) -> Result<(), AppError> {
-    use std::future::Future;
     let mut future = std::pin::pin!(future);
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     match future.as_mut().poll(&mut context) {
@@ -48,9 +64,9 @@ fn main() {
             Err(error) => { parser_exit = Some(error.exit_code()); let _ = error.print(); return Ok(()); }
         };
         if local_command(&cli) {
-            // Hook persistence is deliberately synchronous and network-free.
-            // Do not start the general command runtime's worker threads per
-            // lifecycle boundary. A future async dependency must fail closed.
+            // These reviewed handlers perform only synchronous local work.
+            // Avoid the general worker pool and refuse an unexpected Pending.
+            // Network and unclassified commands retain the normal runtime.
             let hook = matches!(&cli.command, cli::Command::Capture(cli::capture::CaptureCommand {
                 command: cli::capture::CaptureSubcommand::Hook { .. },
             }));
