@@ -597,8 +597,11 @@ mod hook_probe_diagnostic_tests {
                     vec!["config", "--get-regexp", "^remote\\..*\\.url$"],
                 ];
                 for (command, arguments) in commands.iter().zip(expected) {
-                    assert_eq!(command.get_current_dir(), Some(root.as_path()));
-                    assert_eq!(command.get_args().collect::<Vec<_>>(), arguments);
+                    assert_eq!(command.get_program(), "git");
+                    let actual = command.get_args().collect::<Vec<_>>();
+                    assert_eq!(actual[0], "-C");
+                    assert_eq!(actual[1], root.as_os_str());
+                    assert_eq!(actual[2..], arguments);
                 }
                 Ok([
                     cohort_reply(0, bytes.clone()),
@@ -628,7 +631,7 @@ mod hook_probe_diagnostic_tests {
                     assert_eq!(report.first_fault, Some(ProtocolError("GROUP_DEADLINE")));
                     Ok(())
                 });
-                assert_eq!(result.as_ref().unwrap_err().kind(), io::ErrorKind::TimedOut);
+                assert!(matches!(&result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
                 result
             },
         };
