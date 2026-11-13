@@ -488,16 +488,36 @@ fn install_native(
     #[cfg(feature = "dev-tools")]
     {
         crate::adapter_files::installer_phase_trace::with_trace(
-            || crate::adapter_files::installer_phase_trace::Guard::begin(
-                std::env::var_os("KEITO_SOURCE_QA_INSTALL_PHASE_TRACE").as_deref()
-                    == Some(std::ffi::OsStr::new("v1")),
-            ),
-            || install_native_body(global, mode, source, agents, skip_skills_add, confirm_migration, scope),
+            || {
+                crate::adapter_files::installer_phase_trace::Guard::begin(
+                    std::env::var_os("KEITO_SOURCE_QA_INSTALL_PHASE_TRACE").as_deref()
+                        == Some(std::ffi::OsStr::new("v1")),
+                )
+            },
+            || {
+                install_native_body(
+                    global,
+                    mode,
+                    source,
+                    agents,
+                    skip_skills_add,
+                    confirm_migration,
+                    scope,
+                )
+            },
         )
     }
     #[cfg(not(feature = "dev-tools"))]
     {
-        install_native_body(global, mode, source, agents, skip_skills_add, confirm_migration, scope)
+        install_native_body(
+            global,
+            mode,
+            source,
+            agents,
+            skip_skills_add,
+            confirm_migration,
+            scope,
+        )
     }
 }
 #[cfg(unix)]

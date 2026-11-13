@@ -819,12 +819,16 @@ pub(crate) mod installer_phase_trace {
                 || Guard::begin_fd(-1),
                 || {
                     called.set(called.get() + 1);
-                    Err(crate::error::AppError::Conflict("original installer failure".into()))
+                    Err(crate::error::AppError::Conflict(
+                        "original installer failure".into(),
+                    ))
                 },
             );
             assert_eq!(called.get(), 1, "trace setup may not bypass the installer");
-            assert!(matches!(result, Err(crate::error::AppError::Conflict(message))
-                if message == "original installer failure"));
+            assert!(
+                matches!(result, Err(crate::error::AppError::Conflict(message))
+                if message == "original installer failure")
+            );
             assert!(STATE.with(|state| state.borrow().is_none()));
         }
         #[test]
