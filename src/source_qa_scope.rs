@@ -82,6 +82,25 @@ fn hook_probe_clock(scope: &mut crate::process_ownership::scope::Scope) -> io::R
     }
 }
 
+// Developer-only adapter: cohort diagnostics must never silently exercise the
+// resolver's sequential fallback instead of the product repository cohort.
+struct RepositoryCohortDiagnostic<F> {
+    run: F,
+}
+impl<F> crate::process_ownership::probes::LeafRunner for RepositoryCohortDiagnostic<F>
+where
+    F: FnMut([Command; 3]) -> io::Result<[crate::process_ownership::scope::CommandResult; 3]>,
+{
+    fn output(
+        &mut self,
+        _: Command,
+        _: usize,
+        _: usize,
+    ) -> io::Result<crate::process_ownership::scope::CommandResult> {
+        Err(io::Error::other("QA_COHORT_SEQUENTIAL_REFUSED"))
+    }
+}
+
 /// Developer diagnosis of the actual repository/clock callers. Only metadata
 /// reaches the observer: never Command, arguments, environment or tool output.
 /// This is not default-artifact latency or capture/usage authority.
@@ -550,6 +569,72 @@ mod tests;
 mod hook_probe_diagnostic_tests {
     use super::*;
     use crate::process_ownership::scope::{monotonic_now, Scope};
+
+    fn cohort_reply(code: i32, stdout: Vec<u8>) -> crate::process_ownership::scope::CommandResult {
+        use std::os::unix::process::ExitStatusExt;
+        crate::process_ownership::scope::CommandResult {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            output: crate::process_ownership::io::CommandOutput {
+                stdout,
+                stderr: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn repository_cohort_diagnostic_routes_original_three_commands_once() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let bytes = root.to_str().unwrap().as_bytes().to_vec();
+        let mut calls = 0;
+        let mut runner = RepositoryCohortDiagnostic {
+            run: |commands: [Command; 3]| {
+                calls += 1;
+                assert_eq!(calls, 1);
+                let expected = [
+                    vec!["rev-parse", "--show-toplevel"],
+                    vec!["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    vec!["config", "--get-regexp", "^remote\\..*\\.url$"],
+                ];
+                for (command, arguments) in commands.iter().zip(expected) {
+                    assert_eq!(command.get_current_dir(), Some(root.as_path()));
+                    assert_eq!(command.get_args().collect::<Vec<_>>(), arguments);
+                }
+                Ok([
+                    cohort_reply(0, bytes.clone()),
+                    cohort_reply(0, bytes.clone()),
+                    cohort_reply(1, Vec::new()),
+                ])
+            },
+        };
+        let repository = crate::capture::Repository::resolve_with(&root, &mut runner).unwrap();
+        assert_eq!(repository.remote_hash, crate::capture::hash(""));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn repository_cohort_diagnostic_failure_is_observed_without_fallback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let end = monotonic_now().unwrap() + 1_000_000_000;
+        let mut scope = Scope::with_owner(Default::default(), end);
+        let mut called = false;
+        let mut runner = RepositoryCohortDiagnostic {
+            run: |_: [Command; 3]| {
+                called = true;
+                scope.begin_cancel(ProtocolError("GROUP_DEADLINE"), end);
+                let original: io::Result<[crate::process_ownership::scope::CommandResult; 3]> =
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "GROUP_DEADLINE"));
+                let result = probe_observation(&mut scope, original, |report| {
+                    assert_eq!(report.first_fault, Some(ProtocolError("GROUP_DEADLINE")));
+                    Ok(())
+                });
+                assert_eq!(result.as_ref().unwrap_err().kind(), io::ErrorKind::TimedOut);
+                result
+            },
+        };
+        assert!(crate::capture::Repository::resolve_with(temporary.path(), &mut runner).is_err());
+        assert!(called);
+    }
 
     #[test]
     fn hook_probe_diagnostic_receipt_failure_poison_same_scope() {
