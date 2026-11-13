@@ -56,6 +56,16 @@ fn prepare_fixture_scope(
     Ok(())
 }
 
+#[cfg(test)]
+fn probe_observation<T>(
+    scope: &mut crate::process_ownership::scope::Scope,
+    result: io::Result<T>,
+    publish: impl FnOnce(&crate::process_ownership::scope::ScopeReport) -> io::Result<()>,
+) -> io::Result<T> {
+    publish(&scope.report())?;
+    result
+}
+
 fn now() -> io::Result<u64> {
     let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, value.as_mut_ptr()) } != 0 {
@@ -423,3 +433,37 @@ impl Drop for GroupRegistry {
 #[cfg(test)]
 #[path = "../tests/unit/source_qa_scope.rs"]
 mod tests;
+
+#[cfg(test)]
+mod hook_probe_diagnostic_tests {
+    use super::*;
+    use crate::process_ownership::scope::{monotonic_now, Scope};
+
+    #[test]
+    fn hook_probe_diagnostic_receipt_failure_poison_same_scope() {
+        let end = monotonic_now().unwrap() + 1_000_000_000;
+        let mut scope = Scope::with_owner(Default::default(), end);
+        let result = probe_observation(&mut scope, Ok(()), |_| {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "QA_RECEIPT"))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(scope.report().first_fault, Some(ProtocolError("QA_PROBE_RECEIPT")));
+        assert!(scope.failed());
+    }
+
+    #[test]
+    fn hook_probe_diagnostic_primary_error_survives_failed_receipt() {
+        let end = monotonic_now().unwrap() + 1_000_000_000;
+        let mut scope = Scope::with_owner(Default::default(), end);
+        scope.begin_cancel(ProtocolError("SCOPE_OPERATION_DEADLINE"), end);
+        let original: io::Result<()> = Err(io::Error::new(
+            io::ErrorKind::TimedOut, ProtocolError("SCOPE_OPERATION_DEADLINE"),
+        ));
+        let result = probe_observation(&mut scope, original, |report| {
+            assert_eq!(report.first_fault, Some(ProtocolError("SCOPE_OPERATION_DEADLINE")));
+            Err(io::Error::other("QA_RECEIPT"))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(scope.report().first_fault, Some(ProtocolError("SCOPE_OPERATION_DEADLINE")));
+    }
+}
