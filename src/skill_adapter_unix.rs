@@ -1387,7 +1387,9 @@ pub(crate) mod tests {
         let dir = Dir::anchor(root.path()).unwrap();
         let payload: Payload = [("hooks/a.sh".into(), b"a".to_vec())].into_iter().collect();
         let result = write_payload(&dir, &payload, &mut || Err(payload_owner_refusal()));
-        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal"));
+        assert!(
+            matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal")
+        );
         assert!(dir.entries().unwrap().is_empty());
     }
     #[test]
@@ -1395,7 +1397,9 @@ pub(crate) mod tests {
         use std::{cell::Cell, rc::Rc};
         let root = tempfile::tempdir().unwrap();
         let dir = Dir::anchor(root.path()).unwrap();
-        let payload: Payload = [("a".into(), b"a".to_vec()), ("b".into(), b"b".to_vec())].into_iter().collect();
+        let payload: Payload = [("a".into(), b"a".to_vec()), ("b".into(), b"b".to_vec())]
+            .into_iter()
+            .collect();
         let refused = Rc::new(Cell::new(false));
         let observed = Rc::clone(&refused);
         let _reset = PayloadOwnerHookReset;
@@ -1404,17 +1408,30 @@ pub(crate) mod tests {
                 observed.set(true);
             }
         })));
-        let result = write_payload(&dir, &payload, &mut || if refused.get() { Err(payload_owner_refusal()) } else { Ok(()) });
+        let result = write_payload(&dir, &payload, &mut || {
+            if refused.get() {
+                Err(payload_owner_refusal())
+            } else {
+                Ok(())
+            }
+        });
         assert!(refused.get(), "actual payload file flush must be reached");
-        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal"));
-        assert!(dir.entries().unwrap().is_empty(), "refused temporary payload must not publish or leak");
+        assert!(
+            matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal")
+        );
+        assert!(
+            dir.entries().unwrap().is_empty(),
+            "refused temporary payload must not publish or leak"
+        );
     }
     #[test]
     fn payload_owner_after_rename_preserves_first_file_and_refuses_second() {
         use std::{cell::Cell, rc::Rc};
         let root = tempfile::tempdir().unwrap();
         let dir = Dir::anchor(root.path()).unwrap();
-        let payload: Payload = [("a".into(), b"a".to_vec()), ("b".into(), b"b".to_vec())].into_iter().collect();
+        let payload: Payload = [("a".into(), b"a".to_vec()), ("b".into(), b"b".to_vec())]
+            .into_iter()
+            .collect();
         let refused = Rc::new(Cell::new(false));
         let observed = Rc::clone(&refused);
         let _reset = PayloadOwnerHookReset;
@@ -1423,9 +1440,17 @@ pub(crate) mod tests {
                 observed.set(true);
             }
         })));
-        let result = write_payload(&dir, &payload, &mut || if refused.get() { Err(payload_owner_refusal()) } else { Ok(()) });
+        let result = write_payload(&dir, &payload, &mut || {
+            if refused.get() {
+                Err(payload_owner_refusal())
+            } else {
+                Ok(())
+            }
+        });
         assert!(refused.get(), "actual rename must be reached");
-        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal"));
+        assert!(
+            matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal")
+        );
         assert_eq!(fs::read(root.path().join("a")).unwrap(), b"a");
         assert_eq!(dir.entries().unwrap(), vec!["a".to_owned()]);
     }
@@ -1434,7 +1459,9 @@ pub(crate) mod tests {
         use std::{cell::Cell, rc::Rc};
         let root = tempfile::tempdir().unwrap();
         let dir = Dir::anchor(root.path()).unwrap();
-        let payload: Payload = [("hooks/nested/a.sh".into(), b"a".to_vec())].into_iter().collect();
+        let payload: Payload = [("hooks/nested/a.sh".into(), b"a".to_vec())]
+            .into_iter()
+            .collect();
         let refused = Rc::new(Cell::new(false));
         let observed = Rc::clone(&refused);
         let _reset = PayloadOwnerHookReset;
@@ -1443,10 +1470,23 @@ pub(crate) mod tests {
                 observed.set(true);
             }
         })));
-        let result = write_payload(&dir, &payload, &mut || if refused.get() { Err(payload_owner_refusal()) } else { Ok(()) });
+        let result = write_payload(&dir, &payload, &mut || {
+            if refused.get() {
+                Err(payload_owner_refusal())
+            } else {
+                Ok(())
+            }
+        });
         assert!(refused.get(), "actual directory flush must be reached");
-        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal"));
-        assert!(dir.child("hooks", false).unwrap().entries().unwrap().is_empty());
+        assert!(
+            matches!(result, Err(AppError::Conflict(message)) if message == "Original payload owner refusal")
+        );
+        assert!(dir
+            .child("hooks", false)
+            .unwrap()
+            .entries()
+            .unwrap()
+            .is_empty());
         assert!(!root.path().join("hooks/nested").exists());
     }
     #[test]
