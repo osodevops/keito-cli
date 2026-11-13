@@ -281,6 +281,16 @@ fn repository_cohort_diagnostic(scope: &mut Scope, case: &Path, core: &Path) -> 
                 .map(|slot| {
                     serde_json::json!({
                         "slot":slot.slot, "status":slot.status.and_then(|s| s.code()),
+                        "setup_trace":slot.setup_trace.map(|trace| serde_json::json!({
+                            "setup_start_ns":trace.setup_start_ns, "ready_end_ns":trace.ready_end_ns,
+                            "pre_spawn_ns":trace.pre_spawn_ns, "spawn_return_ns":trace.spawn_return_ns,
+                            "first_ready_poll_ns":trace.first_ready_poll_ns,
+                            "last_ready_before_ns":trace.last_ready_before_ns,
+                            "last_ready_after_ns":trace.last_ready_after_ns,
+                            "ready_frame_observed":trace.ready_frame_observed,
+                            "ready_eof_observed":trace.ready_eof_observed,
+                            "deadline_observed":trace.deadline_observed,
+                        })),
                         "waits_known":slot.waits_known, "group_absent":slot.group_absent,
                         "terminal_eof":slot.terminal_eof, "io_required":slot.io_required,
                         "stdin_closed":slot.io.stdin_closed, "stdout_eof":slot.io.stdout_eof,

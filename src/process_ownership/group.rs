@@ -587,6 +587,22 @@ fn safe_reason(error: &io::Error) -> &'static str {
     }
 }
 
+/// Developer-only observations, never a timing or cleanup capability.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug)]
+pub struct SetupTrace {
+    pub setup_start_ns: u64,
+    pub ready_end_ns: u64,
+    pub pre_spawn_ns: u64,
+    pub spawn_return_ns: Option<u64>,
+    pub first_ready_poll_ns: Option<u64>,
+    pub last_ready_before_ns: Option<u64>,
+    pub last_ready_after_ns: Option<u64>,
+    pub ready_frame_observed: bool,
+    pub ready_eof_observed: bool,
+    pub deadline_observed: Option<(&'static str, u64)>,
+}
+
 /// Register immediately after spawn_keeper, BEFORE await_ready/start/receipts.
 /// Failed objects retain both handles and expose actual wait facts via report.
 pub struct GroupLease {
@@ -600,6 +616,8 @@ pub struct GroupLease {
     sid: libc::pid_t,
     ready_end: u64,
     park_end: Option<u64>,
+    #[cfg(feature = "dev-tools")]
+    setup_trace: SetupTrace,
 }
 #[derive(Clone, Copy)]
 enum KeeperProgram<'a> {
@@ -779,7 +797,8 @@ impl GroupLease {
         }
         // Verification/inventory cannot consume an old admission timestamp and
         // then start a keeper beyond its setup/operation end.
-        if now()? >= policy.setup_end(current, lifetime_deadline_ns) {
+        let pre_spawn = now()?;
+        if pre_spawn >= policy.setup_end(current, lifetime_deadline_ns) {
             return Err(refused("GROUP_DEADLINE"));
         }
         let mask = super::signals::AdmissionMask::block(&mut command)?;
@@ -803,6 +822,27 @@ impl GroupLease {
             sid,
             ready_end: policy.setup_end(current, lifetime_deadline_ns),
             park_end: None,
+            #[cfg(feature = "dev-tools")]
+            setup_trace: SetupTrace {
+                setup_start_ns: current,
+                ready_end_ns: policy.setup_end(current, lifetime_deadline_ns),
+                pre_spawn_ns: pre_spawn,
+                spawn_return_ns: None,
+                first_ready_poll_ns: None,
+                last_ready_before_ns: None,
+                last_ready_after_ns: None,
+                ready_frame_observed: false,
+                ready_eof_observed: false,
+                deadline_observed: None,
+            },
+        };
+        // Diagnostic only: the actual Child is already retained in the lease.
+        // An unavailable observation grants no new time and changes no check.
+        #[cfg(feature = "dev-tools")]
+        let lease = {
+            let mut lease = lease;
+            lease.setup_trace.spawn_return_ns = now().ok();
+            lease
         };
         drop(mask);
         drop(image_descriptor);
@@ -874,11 +914,28 @@ impl GroupLease {
             if self.settlement.progress.phase != Phase::AwaitReady {
                 return Err(refused("GROUP_STATE"));
             }
-            if now()? >= self.ready_end {
+            let before = now()?;
+            #[cfg(feature = "dev-tools")]
+            {
+                self.setup_trace.first_ready_poll_ns.get_or_insert(before);
+                self.setup_trace.last_ready_before_ns = Some(before);
+            }
+            if before >= self.ready_end {
+                #[cfg(feature = "dev-tools")]
+                self.setup_trace.deadline_observed.get_or_insert(("READY_BEFORE_RECEIVE", before));
                 return Err(refused("GROUP_DEADLINE"));
             }
             let body = self.channel.receive()?;
-            if now()? >= self.ready_end {
+            let after = now()?;
+            #[cfg(feature = "dev-tools")]
+            {
+                self.setup_trace.last_ready_after_ns = Some(after);
+                self.setup_trace.ready_frame_observed |= body.is_some();
+                self.setup_trace.ready_eof_observed |= self.channel.eof;
+            }
+            if after >= self.ready_end {
+                #[cfg(feature = "dev-tools")]
+                self.setup_trace.deadline_observed.get_or_insert(("READY_AFTER_RECEIVE", after));
                 return Err(refused("GROUP_DEADLINE"));
             }
             let Some(body) = body else {
@@ -1112,6 +1169,10 @@ impl GroupLease {
     }
     pub(super) fn registration_nonce(&self) -> &str {
         &self.channel.nonce
+    }
+    #[cfg(feature = "dev-tools")]
+    pub(super) fn setup_trace(&self) -> SetupTrace {
+        self.setup_trace
     }
 }
 impl Drop for GroupLease {

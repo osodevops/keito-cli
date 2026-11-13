@@ -92,6 +92,10 @@ trait Edge {
     fn setup_pending(&self) -> bool {
         false
     }
+    #[cfg(feature = "dev-tools")]
+    fn setup_trace(&self) -> Option<super::group::SetupTrace> {
+        None
+    }
     fn take_output(&mut self) -> CommandOutput;
     fn take_events(&mut self) -> Vec<String> {
         Vec::new()
@@ -170,6 +174,10 @@ impl GroupEdge {
     }
 }
 impl Edge for GroupEdge {
+    #[cfg(feature = "dev-tools")]
+    fn setup_trace(&self) -> Option<super::group::SetupTrace> {
+        Some(self.lease.setup_trace())
+    }
     fn setup_pending(&self) -> bool {
         self.stage.setup_pending()
     }
@@ -348,6 +356,13 @@ enum ProductEdge {
     Cooperative(CooperativeEdge),
 }
 impl Edge for ProductEdge {
+    #[cfg(feature = "dev-tools")]
+    fn setup_trace(&self) -> Option<super::group::SetupTrace> {
+        match self {
+            Self::Group(edge) => edge.setup_trace(),
+            Self::Cooperative(edge) => edge.setup_trace(),
+        }
+    }
     fn setup_pending(&self) -> bool {
         match self {
             Self::Group(edge) => edge.setup_pending(),
@@ -954,6 +969,8 @@ pub struct SlotReport {
     pub accepted_at: Option<u64>,
     pub completion_end: Option<u64>,
     pub first_fault: Option<&'static str>,
+    #[cfg(feature = "dev-tools")]
+    pub setup_trace: Option<super::group::SetupTrace>,
 }
 #[derive(Clone, Debug)]
 pub struct ScopeReport {
@@ -1611,6 +1628,8 @@ impl Scope {
                         accepted_at: s.accepted_at,
                         completion_end: s.completion_end,
                         first_fault: facts.first_fault,
+                        #[cfg(feature = "dev-tools")]
+                        setup_trace: s.edge.setup_trace(),
                     }
                 })
                 .collect(),
