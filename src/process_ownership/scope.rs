@@ -1738,7 +1738,9 @@ mod tests {
     fn repository_cohort() -> (Core<Fake>, [SlotId; 3]) {
         let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
         let slots = ["root", "common", "remotes"].map(|name| {
-            let id = core.admit(1, 32, |_| Ok(fake(name, Rc::default()))).unwrap();
+            let id = core
+                .admit(1, 32, |_| Ok(fake(name, Rc::default())))
+                .unwrap();
             core.slots[id.index].accepted_at = Some(2);
             core.slots[id.index].edge.facts = EdgeFacts {
                 status: Some(ExitStatus::from_raw((id.index as i32) << 8)),
@@ -1767,7 +1769,10 @@ mod tests {
         let (mut core, slots) = repository_cohort();
         let reordered = [slots[2].clone(), slots[0].clone(), slots[1].clone()];
         let results = core.take_repository_results(&reordered).unwrap().unwrap();
-        assert_eq!(results.map(|r| r.status.code()), [Some(2), Some(0), Some(1)]);
+        assert_eq!(
+            results.map(|r| r.status.code()),
+            [Some(2), Some(0), Some(1)]
+        );
         assert!(core.slots.iter().all(|slot| slot.output_taken));
         assert!(core.take_repository_results(&slots).is_err());
     }
@@ -1800,7 +1805,10 @@ mod tests {
             assert!(core.take_repository_results(&slots).is_err());
             assert!(core.slots.iter().all(|slot| !slot.output_taken));
             if missing == "fault" {
-                assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("ORIGINAL_FAULT")));
+                assert_eq!(
+                    core.owner.borrow().first_fault,
+                    Some(ProtocolError("ORIGINAL_FAULT"))
+                );
             }
         }
     }

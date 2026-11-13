@@ -213,18 +213,25 @@ impl Repository {
         let root_args = &["rev-parse", "--show-toplevel"];
         let common_args = &["rev-parse", "--path-format=absolute", "--git-common-dir"];
         let remotes_args = &["config", "--get-regexp", "^remote\\..*\\.url$"];
-        let mut cohort = runner.repository_outputs([
-            repository_command(directory, root_args),
-            repository_command(directory, common_args),
-            repository_command(directory, remotes_args),
-        ]).transpose().map_err(repository_ownership_error)?.map(IntoIterator::into_iter);
+        let mut cohort = runner
+            .repository_outputs([
+                repository_command(directory, root_args),
+                repository_command(directory, common_args),
+                repository_command(directory, remotes_args),
+            ])
+            .transpose()
+            .map_err(repository_ownership_error)?
+            .map(IntoIterator::into_iter);
         let mut git = |args: &[&str], empty_no_match| match &mut cohort {
-            Some(results) => repository_text(results.next().expect("fixed repository result count"), empty_no_match),
+            Some(results) => repository_text(
+                results.next().expect("fixed repository result count"),
+                empty_no_match,
+            ),
             None => git_with(runner, directory, args, empty_no_match),
         };
         let root = PathBuf::from(git(root_args, false)?)
-        .canonicalize()
-        .map_err(storage_error)?;
+            .canonicalize()
+            .map_err(storage_error)?;
         let common = git(common_args, false)?;
         let common = PathBuf::from(common)
             .canonicalize()
@@ -2938,7 +2945,10 @@ mod owned_probe_tests {
                 let actual: Vec<_> = command.get_args().collect();
                 assert_eq!(actual[0], "-C");
                 assert_eq!(actual[1], self.directory.as_os_str());
-                assert_eq!(actual[2..], args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>());
+                assert_eq!(
+                    actual[2..],
+                    args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+                );
                 assert!(command.get_envs().next().is_none());
             }
             Some(self.results.take().expect("one repository cohort"))
@@ -2952,11 +2962,22 @@ mod owned_probe_tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let path = root.to_str().unwrap().as_bytes().to_vec();
-        for remotes in [reply(1, Vec::new()).unwrap(), reply(0, b"z url2\na url1\n".to_vec()).unwrap()] {
-            let expected = if remotes.status.code() == Some(1) { hash("") } else { hash("a url1\nz url2") };
+        for remotes in [
+            reply(1, Vec::new()).unwrap(),
+            reply(0, b"z url2\na url1\n".to_vec()).unwrap(),
+        ] {
+            let expected = if remotes.status.code() == Some(1) {
+                hash("")
+            } else {
+                hash("a url1\nz url2")
+            };
             let mut runner = CohortReplies {
                 directory: root.clone(),
-                results: Some(Ok([reply(0, path.clone()).unwrap(), reply(0, path.clone()).unwrap(), remotes])),
+                results: Some(Ok([
+                    reply(0, path.clone()).unwrap(),
+                    reply(0, path.clone()).unwrap(),
+                    remotes,
+                ])),
             };
             let result = Repository::resolve_with(&root, &mut runner).unwrap();
             assert_eq!(result.key, hash(root.to_string_lossy().as_bytes()));
@@ -2970,7 +2991,11 @@ mod owned_probe_tests {
         let root = temp.path().canonicalize().unwrap();
         let path = root.to_str().unwrap().as_bytes().to_vec();
         for refusal in ["owner", "root", "common", "remote"] {
-            let mut results = [reply(0, path.clone()).unwrap(), reply(0, path.clone()).unwrap(), reply(1, Vec::new()).unwrap()];
+            let mut results = [
+                reply(0, path.clone()).unwrap(),
+                reply(0, path.clone()).unwrap(),
+                reply(1, Vec::new()).unwrap(),
+            ];
             match refusal {
                 "root" => results[0] = reply(128, Vec::new()).unwrap(),
                 "common" => results[1] = reply(0, vec![255]).unwrap(),
@@ -2979,7 +3004,11 @@ mod owned_probe_tests {
             }
             let mut runner = CohortReplies {
                 directory: root.clone(),
-                results: Some(if refusal == "owner" { Err(io::Error::other("private owner error")) } else { Ok(results) }),
+                results: Some(if refusal == "owner" {
+                    Err(io::Error::other("private owner error"))
+                } else {
+                    Ok(results)
+                }),
             };
             let error = Repository::resolve_with(&root, &mut runner).unwrap_err();
             assert!(!error.to_string().contains("private"));
