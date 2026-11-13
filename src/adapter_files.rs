@@ -375,24 +375,32 @@ impl Dir {
         out.sort();
         Ok(out)
     }
+    pub(crate) fn remove_tree(&self, child: &str) -> Result<(), AppError> {
+        self.remove_tree_checked(child, &mut || Ok(()))
+    }
     pub(crate) fn remove_tree_checked(
         &self,
         child: &str,
-        _check: &mut impl FnMut() -> Result<(), AppError>,
+        check: &mut impl FnMut() -> Result<(), AppError>,
     ) -> Result<(), AppError> {
-        self.remove_tree(child)
-    }
-    pub(crate) fn remove_tree(&self, child: &str) -> Result<(), AppError> {
+        check()?;
         let dir = self.child(child, false)?;
+        check()?;
         for entry in dir.entries()? {
+            check()?;
             if dir.child(&entry, false).is_ok() {
-                dir.remove_tree(&entry)?;
+                dir.remove_tree_checked(&entry, check)?;
             } else {
+                check()?;
                 let _ = dir.open(&entry)?;
+                check()?;
                 dir.unlink(&entry, false)?;
+                check()?;
             }
         }
-        self.unlink(child, true)
+        check()?;
+        self.unlink(child, true)?;
+        check()
     }
     pub(crate) fn metadata(&self) -> Result<Metadata, AppError> {
         self.file.metadata().map_err(|_| failure())
