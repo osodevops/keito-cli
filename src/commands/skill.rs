@@ -432,7 +432,11 @@ impl InstallSteps for CurrentInstallSteps<'_, '_> {
         Ok(())
     }
     fn publish(&mut self, agent: SkillAgent, version: String) -> Result<(), AppError> {
-        crate::adapter_files::installer_phase_event(if agent == SkillAgent::Codex { 40 } else { 41 });
+        crate::adapter_files::installer_phase_event(if agent == SkillAgent::Codex {
+            40
+        } else {
+            41
+        });
         let publication = self.publication.as_mut().ok_or_else(|| {
             AppError::Config("Installer publication requires settled preflight".into())
         })?;
@@ -485,7 +489,8 @@ fn install_native(
     let mut phase_trace = crate::adapter_files::installer_phase_trace::Guard::begin(
         std::env::var_os("KEITO_SOURCE_QA_INSTALL_PHASE_TRACE").as_deref()
             == Some(std::ffi::OsStr::new("v1")),
-    ).map_err(|_| AppError::Config("Developer installer phase trace unavailable".into()))?;
+    )
+    .map_err(|_| AppError::Config("Developer installer phase trace unavailable".into()))?;
     let preflight = crate::capture_command_owner::InstallerPreflight::new(scope, agents.len())?;
     let runtime = preflight.runtime().clone();
     let home =

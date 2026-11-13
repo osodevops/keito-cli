@@ -657,15 +657,29 @@ pub(crate) fn installer_phase_event(code: u8) {
 pub(crate) mod installer_phase_trace {
     use std::{cell::RefCell, io};
     pub(super) const MAX_FRAMES: u32 = 2048;
-    struct State { fd: i32, sequence: u32, failed: bool }
+    struct State {
+        fd: i32,
+        sequence: u32,
+        failed: bool,
+    }
     thread_local! {
         static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     }
-    pub(crate) struct Guard { fd: i32, flags: i32, enabled: bool, finished: bool }
+    pub(crate) struct Guard {
+        fd: i32,
+        flags: i32,
+        enabled: bool,
+        finished: bool,
+    }
     impl Guard {
         pub(crate) fn begin(enabled: bool) -> io::Result<Self> {
             if !enabled {
-                return Ok(Self { fd: -1, flags: 0, enabled: false, finished: false });
+                return Ok(Self {
+                    fd: -1,
+                    flags: 0,
+                    enabled: false,
+                    finished: false,
+                });
             }
             Self::begin_fd(libc::STDOUT_FILENO)
         }
@@ -681,12 +695,24 @@ pub(crate) mod installer_phase_trace {
                 return Err(io::Error::other("QA_PHASE_TRACE_PIPE"));
             }
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
                 return Err(io::Error::other("QA_PHASE_TRACE_FLAGS"));
             }
-            STATE.with(|s| *s.borrow_mut() = Some(State { fd, sequence: 0, failed: false }));
+            STATE.with(|s| {
+                *s.borrow_mut() = Some(State {
+                    fd,
+                    sequence: 0,
+                    failed: false,
+                })
+            });
             emit(1);
-            Ok(Self { fd, flags, enabled: true, finished: false })
+            Ok(Self {
+                fd,
+                flags,
+                enabled: true,
+                finished: false,
+            })
         }
         pub(crate) fn finish(&mut self, success: bool) {
             if self.enabled && !self.finished {
@@ -698,17 +724,25 @@ pub(crate) mod installer_phase_trace {
     impl Drop for Guard {
         fn drop(&mut self) {
             if self.enabled {
-                if !self.finished { emit(4); }
+                if !self.finished {
+                    emit(4);
+                }
                 STATE.with(|s| *s.borrow_mut() = None);
-                unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.flags); }
+                unsafe {
+                    libc::fcntl(self.fd, libc::F_SETFL, self.flags);
+                }
             }
         }
     }
     pub(super) fn emit(code: u8) {
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
-            let Some(state) = state.as_mut() else { return; };
-            if state.failed { return; }
+            let Some(state) = state.as_mut() else {
+                return;
+            };
+            if state.failed {
+                return;
+            }
             if state.sequence >= MAX_FRAMES
                 || !matches!(code, 1..=4 | 10..=12 | 20..=22 | 30..=32 | 40..=41 | 50 | 52..=53)
             {
@@ -736,11 +770,20 @@ pub(crate) mod installer_phase_trace {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::{fs::File, io::Read, os::fd::{AsRawFd, FromRawFd}};
+        use std::{
+            fs::File,
+            io::Read,
+            os::fd::{AsRawFd, FromRawFd},
+        };
         fn pipe() -> (File, File) {
             let mut fds = [-1; 2];
             assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-            for fd in fds { assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0); }
+            for fd in fds {
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
             unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
         }
         #[test]
@@ -749,22 +792,45 @@ pub(crate) mod installer_phase_trace {
             let root = tempfile::tempdir().unwrap();
             let dir = crate::adapter_files::Dir::anchor(root.path()).unwrap();
             let mut guard = Guard::begin_fd(writer.as_raw_fd()).unwrap();
-            dir.atomic("PRIVATE_PATH_CANARY", b"PRIVATE_BODY_CANARY", 0o600, Some(None), "test-flush").unwrap();
+            dir.atomic(
+                "PRIVATE_PATH_CANARY",
+                b"PRIVATE_BODY_CANARY",
+                0o600,
+                Some(None),
+                "test-flush",
+            )
+            .unwrap();
             guard.finish(true);
-            drop(guard); drop(writer);
-            let mut bytes = Vec::new(); reader.read_to_end(&mut bytes).unwrap();
-            assert!(!bytes.is_empty(), "actual filesystem progress must be emitted");
+            drop(guard);
+            drop(writer);
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert!(
+                !bytes.is_empty(),
+                "actual filesystem progress must be emitted"
+            );
             assert_eq!(bytes.len() % 24, 0);
-            let codes: Vec<_> = bytes.chunks_exact(24).enumerate().map(|(i, frame)| {
-                assert_eq!(&frame[..4], b"KIP1");
-                assert_eq!(u32::from_le_bytes(frame[8..12].try_into().unwrap()), i as u32);
-                assert_eq!(&frame[5..8], &[0; 3]); assert_eq!(&frame[12..16], &[0; 4]);
-                assert!(u64::from_le_bytes(frame[16..24].try_into().unwrap()) > 0);
-                frame[4]
-            }).collect();
+            let codes: Vec<_> = bytes
+                .chunks_exact(24)
+                .enumerate()
+                .map(|(i, frame)| {
+                    assert_eq!(&frame[..4], b"KIP1");
+                    assert_eq!(
+                        u32::from_le_bytes(frame[8..12].try_into().unwrap()),
+                        i as u32
+                    );
+                    assert_eq!(&frame[5..8], &[0; 3]);
+                    assert_eq!(&frame[12..16], &[0; 4]);
+                    assert!(u64::from_le_bytes(frame[16..24].try_into().unwrap()) > 0);
+                    frame[4]
+                })
+                .collect();
             assert_eq!(codes, [1, 10, 11, 20, 21, 2]);
             assert!(!bytes.windows(8).any(|w| w == b"PRIVATE_"));
-            assert_eq!(std::fs::read(root.path().join("PRIVATE_PATH_CANARY")).unwrap(), b"PRIVATE_BODY_CANARY");
+            assert_eq!(
+                std::fs::read(root.path().join("PRIVATE_PATH_CANARY")).unwrap(),
+                b"PRIVATE_BODY_CANARY"
+            );
         }
         #[test]
         fn installer_phase_trace_full_pipe_failure_is_sticky_and_nonblocking() {
@@ -772,16 +838,26 @@ pub(crate) mod installer_phase_trace {
             let mut guard = Guard::begin_fd(writer.as_raw_fd()).unwrap();
             let block = [0u8; 24];
             loop {
-                let n = unsafe { libc::write(writer.as_raw_fd(), block.as_ptr().cast(), block.len()) };
-                if n < 0 { assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock); break; }
+                let n =
+                    unsafe { libc::write(writer.as_raw_fd(), block.as_ptr().cast(), block.len()) };
+                if n < 0 {
+                    assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                    break;
+                }
                 assert!(n > 0);
             }
             emit(20);
             assert!(STATE.with(|s| s.borrow().as_ref().unwrap().failed));
             let sequence = STATE.with(|s| s.borrow().as_ref().unwrap().sequence);
-            emit(21); guard.finish(false);
-            assert_eq!(STATE.with(|s| s.borrow().as_ref().unwrap().sequence), sequence);
-            drop(guard); drop(writer); drop(reader);
+            emit(21);
+            guard.finish(false);
+            assert_eq!(
+                STATE.with(|s| s.borrow().as_ref().unwrap().sequence),
+                sequence
+            );
+            drop(guard);
+            drop(writer);
+            drop(reader);
         }
         #[test]
         fn installer_phase_trace_frame_cap_never_wraps_or_resumes() {
@@ -790,9 +866,15 @@ pub(crate) mod installer_phase_trace {
             STATE.with(|s| s.borrow_mut().as_mut().unwrap().sequence = MAX_FRAMES);
             emit(20);
             assert!(STATE.with(|s| s.borrow().as_ref().unwrap().failed));
-            emit(21); guard.finish(true);
-            assert_eq!(STATE.with(|s| s.borrow().as_ref().unwrap().sequence), MAX_FRAMES);
-            drop(guard); drop(writer); drop(reader);
+            emit(21);
+            guard.finish(true);
+            assert_eq!(
+                STATE.with(|s| s.borrow().as_ref().unwrap().sequence),
+                MAX_FRAMES
+            );
+            drop(guard);
+            drop(writer);
+            drop(reader);
         }
     }
 }

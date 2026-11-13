@@ -435,7 +435,7 @@ fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i3
     assert!(matches!(
         mode,
         "--cli"
-        | "--installer-phases-diagnostic"
+            | "--installer-phases-diagnostic"
             | "--run"
             | "--chain"
             | "--git-init"
@@ -505,7 +505,18 @@ fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i3
         environment(&mut command, &case, &home, &capture);
         if mode == "--installer-phases-diagnostic" {
             assert_eq!(fields.len(), 3);
-            command.args(["--quiet", "skill", "install", "--source", "bundled", "--agent", "codex", "--agent", "claude-code"])
+            command
+                .args([
+                    "--quiet",
+                    "skill",
+                    "install",
+                    "--source",
+                    "bundled",
+                    "--agent",
+                    "codex",
+                    "--agent",
+                    "claude-code",
+                ])
                 .env("KEITO_SOURCE_QA_INSTALL_PHASE_TRACE", "v1");
         } else {
             assert!(fields.len() >= 4);
