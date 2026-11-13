@@ -230,14 +230,18 @@ fn validate_modes(dir: &Dir, prefix: &str) -> Result<(), AppError> {
 fn write_payload(
     dir: &Dir,
     payload: &Payload,
-    _check: &mut impl FnMut() -> Result<(), AppError>,
+    check: &mut impl FnMut() -> Result<(), AppError>,
 ) -> Result<(), AppError> {
+    // Do not let a payload batch hide a cancellation/deadline between files.
+    // Individual filesystem syscalls remain synchronous and unpreemptable.
+    check()?;
     // Payload is sorted. Retain only the common parent chain, never a growing
     // path cache. Source traversal permits at most sixteen directory levels.
     let mut directories = Vec::with_capacity(17);
     directories.push(dir.clone());
     let mut previous: Vec<&str> = Vec::new();
     for (relative, bytes) in payload {
+        check()?;
         let parts: Vec<_> = relative.split('/').collect();
         let (file, parents) = parts.split_last().ok_or_else(failure)?;
         if parents.len() > 16 {
@@ -250,24 +254,31 @@ fn write_payload(
             .count();
         directories.truncate(retained + 1);
         for component in parents.iter().skip(retained) {
+            check()?;
             let child = directories
                 .last()
                 .ok_or_else(failure)?
                 .child(component, true)?;
+            check()?;
             directories.push(child);
         }
         previous = parents.to_vec();
         // atomic revalidates the entire anchored parent chain before opening
         // and again after the file flush. Reuse never bypasses replacement checks.
-        directories.last().ok_or_else(failure)?.atomic(
+        check()?;
+        directories.last().ok_or_else(failure)?.atomic_checked(
             file,
             bytes,
             if file.ends_with(".sh") { 0o700 } else { 0o600 },
             Some(None),
             "install-payload-file-fsynced",
+            check,
         )?;
+        check()?;
     }
-    dir.sync()
+    check()?;
+    dir.sync()?;
+    check()
 }
 fn parse_config(bytes: Option<&[u8]>) -> Result<Value, AppError> {
     let value = match bytes {
