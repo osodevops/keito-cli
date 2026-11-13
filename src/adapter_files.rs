@@ -671,6 +671,17 @@ pub(crate) mod installer_phase_trace {
         enabled: bool,
         finished: bool,
     }
+    pub(crate) fn with_trace<T>(
+        initialize: impl FnOnce() -> io::Result<Guard>,
+        run: impl FnOnce() -> Result<T, crate::error::AppError>,
+    ) -> Result<T, crate::error::AppError> {
+        let mut guard = initialize().map_err(|_| crate::error::AppError::Config(
+            "Developer installer phase trace unavailable".into(),
+        ))?;
+        let result = run();
+        guard.finish(result.is_ok());
+        result
+    }
     impl Guard {
         pub(crate) fn begin(enabled: bool) -> io::Result<Self> {
             if !enabled {
@@ -785,6 +796,35 @@ pub(crate) mod installer_phase_trace {
                 );
             }
             unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+        }
+        #[test]
+        fn installer_phase_trace_init_failure_preserves_handler_success() {
+            let called = std::cell::Cell::new(0);
+            let result = with_trace(
+                || Guard::begin_fd(-1),
+                || {
+                    called.set(called.get() + 1);
+                    Ok("original installer success")
+                },
+            );
+            assert_eq!(called.get(), 1, "trace setup may not bypass the installer");
+            assert_eq!(result.unwrap(), "original installer success");
+            assert!(STATE.with(|state| state.borrow().is_none()));
+        }
+        #[test]
+        fn installer_phase_trace_init_failure_preserves_original_handler_error() {
+            let called = std::cell::Cell::new(0);
+            let result: Result<(), crate::error::AppError> = with_trace(
+                || Guard::begin_fd(-1),
+                || {
+                    called.set(called.get() + 1);
+                    Err(crate::error::AppError::Conflict("original installer failure".into()))
+                },
+            );
+            assert_eq!(called.get(), 1, "trace setup may not bypass the installer");
+            assert!(matches!(result, Err(crate::error::AppError::Conflict(message))
+                if message == "original installer failure"));
+            assert!(STATE.with(|state| state.borrow().is_none()));
         }
         #[test]
         fn installer_phase_trace_actual_atomic_write_is_fixed_metadata() {

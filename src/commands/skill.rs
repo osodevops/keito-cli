@@ -486,11 +486,30 @@ fn install_native(
     scope: Option<&mut crate::process_ownership::scope::Scope>,
 ) -> Result<(), AppError> {
     #[cfg(feature = "dev-tools")]
-    let mut phase_trace = crate::adapter_files::installer_phase_trace::Guard::begin(
-        std::env::var_os("KEITO_SOURCE_QA_INSTALL_PHASE_TRACE").as_deref()
-            == Some(std::ffi::OsStr::new("v1")),
-    )
-    .map_err(|_| AppError::Config("Developer installer phase trace unavailable".into()))?;
+    {
+        crate::adapter_files::installer_phase_trace::with_trace(
+            || crate::adapter_files::installer_phase_trace::Guard::begin(
+                std::env::var_os("KEITO_SOURCE_QA_INSTALL_PHASE_TRACE").as_deref()
+                    == Some(std::ffi::OsStr::new("v1")),
+            ),
+            || install_native_body(global, mode, source, agents, skip_skills_add, confirm_migration, scope),
+        )
+    }
+    #[cfg(not(feature = "dev-tools"))]
+    {
+        install_native_body(global, mode, source, agents, skip_skills_add, confirm_migration, scope)
+    }
+}
+#[cfg(unix)]
+fn install_native_body(
+    global: &GlobalFlags,
+    mode: OutputMode,
+    source: &str,
+    agents: Vec<SkillAgent>,
+    skip_skills_add: bool,
+    confirm_migration: bool,
+    scope: Option<&mut crate::process_ownership::scope::Scope>,
+) -> Result<(), AppError> {
     let preflight = crate::capture_command_owner::InstallerPreflight::new(scope, agents.len())?;
     let runtime = preflight.runtime().clone();
     let home =
@@ -524,13 +543,10 @@ fn install_native(
     // Scratch cleanup is part of the operation, including standalone finality.
     // A late cleanup cannot be hidden behind an earlier clean terminal.
     drop(steps.bundled.take());
-    let result = match publication {
+    match publication {
         Some(publication) => publication.finish(result),
         None => result,
-    };
-    #[cfg(feature = "dev-tools")]
-    phase_trace.finish(result.is_ok());
-    result
+    }
 }
 
 #[cfg(all(test, unix))]
