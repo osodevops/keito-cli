@@ -4,6 +4,29 @@ use error::AppError;
 use keito_cli::{capture_runtime_pair, cli, commands, error, output};
 use std::io::IsTerminal;
 
+fn local_command(cli: &Cli) -> bool {
+    matches!(&cli.command, cli::Command::Capture(cli::capture::CaptureCommand {
+        command: cli::capture::CaptureSubcommand::Hook { .. },
+    }))
+}
+
+fn poll_local(
+    future: impl std::future::Future<Output = Result<(), AppError>>,
+    hook: bool,
+) -> Result<(), AppError> {
+    use std::future::Future;
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => Err(AppError::Config(if hook {
+            "Capture hook required unsupported asynchronous work; collection remains paused"
+        } else {
+            "Local command required unsupported asynchronous work; operation refused"
+        }.into())),
+    }
+}
+
 fn main() {
     #[cfg(unix)]
     let mut entry_scope = None;
@@ -24,17 +47,14 @@ fn main() {
             Ok(cli) => cli,
             Err(error) => { parser_exit = Some(error.exit_code()); let _ = error.print(); return Ok(()); }
         };
-        if matches!(&cli.command,cli::Command::Capture(cli::capture::CaptureCommand {command:cli::capture::CaptureSubcommand::Hook{..}})) {
+        if local_command(&cli) {
             // Hook persistence is deliberately synchronous and network-free.
             // Do not start the general command runtime's worker threads per
             // lifecycle boundary. A future async dependency must fail closed.
-            use std::future::Future;
-            let mut future=std::pin::pin!(run(cli, #[cfg(unix)] entry_scope.as_mut()));
-            let mut context=std::task::Context::from_waker(std::task::Waker::noop());
-            return match future.as_mut().poll(&mut context) {
-                std::task::Poll::Ready(result)=>result,
-                std::task::Poll::Pending=>Err(AppError::Config("Capture hook required unsupported asynchronous work; collection remains paused".into())),
-            };
+            let hook = matches!(&cli.command, cli::Command::Capture(cli::capture::CaptureCommand {
+                command: cli::capture::CaptureSubcommand::Hook { .. },
+            }));
+            return poll_local(run(cli, #[cfg(unix)] entry_scope.as_mut()), hook);
         }
         tokio::runtime::Runtime::new()
             .map_err(|_| AppError::Config("Cannot start command runtime".into()))?
@@ -63,6 +83,75 @@ fn main() {
             eprintln!("{} {}", "error:".red().bold(), e);
         }
         std::process::exit(e.exit_code());
+    }
+}
+
+#[cfg(test)]
+mod local_startup_tests {
+    use super::*;
+
+    fn parsed(arguments: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("keito").chain(arguments.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn local_startup_known_local_commands_need_no_async_workers() {
+        for arguments in [
+            vec!["skill", "runtime"],
+            vec!["--quiet", "skill", "install", "--source", "bundled", "--agent", "codex"],
+            vec!["capture", "status"],
+            vec!["capture", "pause", "--repo"],
+            vec!["capture", "resume", "--repo"],
+            vec!["capture", "usage", "status", "--repo", "--agent", "codex"],
+            vec!["capture", "usage", "enable", "--repo", "--agent", "codex", "--profile-home", "/synthetic/home", "--harness-executable", "/synthetic/codex", "--confirm"],
+        ] {
+            assert!(local_command(&parsed(&arguments)), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn local_startup_general_and_network_commands_keep_async_workers() {
+        for arguments in [
+            vec!["auth", "status"],
+            vec!["capture", "sync"],
+            vec!["capture", "worker"],
+            vec!["capture", "setup", "--agent", "codex", "--project", "p", "--task", "t", "--confirm"],
+            vec!["skill", "doctor", "--live"],
+            vec!["skill", "install", "--source", "bundled", "--agent", "codex"],
+            vec!["--quiet", "skill", "install", "--source", "external/repository", "--agent", "codex"],
+            vec!["--quiet", "skill", "install", "--source", "bundled"],
+        ] {
+            assert!(!local_command(&parsed(&arguments)), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn local_startup_existing_hook_is_still_synchronous() {
+        assert!(local_command(&parsed(&["capture", "hook", "--agent", "codex", "--event", "prompt", "--harness-version", "0.167.0"])));
+    }
+
+    #[test]
+    fn local_startup_ready_future_does_not_enter_tokio() {
+        poll_local(async {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            Ok(())
+        }, false).unwrap();
+    }
+
+    #[test]
+    fn local_startup_pending_future_is_polled_once_and_refused() {
+        let mut polls = 0;
+        let future = std::future::poll_fn(|_| {
+            polls += 1;
+            std::task::Poll::Pending
+        });
+        assert!(matches!(poll_local(future, false), Err(AppError::Config(_))));
+        assert_eq!(polls, 1);
+    }
+
+    #[test]
+    fn local_startup_ready_failure_is_preserved() {
+        assert!(matches!(poll_local(async { Err(AppError::Conflict("finite-refusal".into())) }, false), Err(AppError::Conflict(value)) if value == "finite-refusal"));
     }
 }
 
