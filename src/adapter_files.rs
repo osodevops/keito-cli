@@ -375,6 +375,13 @@ impl Dir {
         out.sort();
         Ok(out)
     }
+    pub(crate) fn remove_tree_checked(
+        &self,
+        child: &str,
+        _check: &mut impl FnMut() -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
+        self.remove_tree(child)
+    }
     pub(crate) fn remove_tree(&self, child: &str) -> Result<(), AppError> {
         let dir = self.child(child, false)?;
         for entry in dir.entries()? {
@@ -476,6 +483,38 @@ mod installer_flush_tests {
         }
     }
 
+    #[test]
+    fn recovery_owner_already_refused_preserves_the_entire_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let target = dir.child("stage", true).unwrap();
+        std::fs::write(target.path.join("a"), b"a").unwrap();
+        let result = dir.remove_tree_checked("stage", &mut || {
+            Err(AppError::Conflict("Original recovery owner refusal".into()))
+        });
+        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original recovery owner refusal"));
+        assert_eq!(target.read("a", 16).unwrap().unwrap(), b"a");
+        assert!(root.path().join("stage").is_dir());
+    }
+    #[test]
+    fn recovery_owner_refusal_after_first_deletion_preserves_remaining_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::anchor(root.path()).unwrap();
+        let target = dir.child("stage", true).unwrap();
+        std::fs::write(target.path.join("a"), b"a").unwrap();
+        std::fs::write(target.path.join("b"), b"b").unwrap();
+        let result = dir.remove_tree_checked("stage", &mut || {
+            if target.path.join("a").exists() {
+                Ok(())
+            } else {
+                Err(AppError::Conflict("Original recovery owner refusal".into()))
+            }
+        });
+        assert!(matches!(result, Err(AppError::Conflict(message)) if message == "Original recovery owner refusal"));
+        assert!(!target.path.join("a").exists());
+        assert_eq!(target.read("b", 16).unwrap().unwrap(), b"b");
+        assert!(root.path().join("stage").is_dir());
+    }
     #[test]
     fn installer_flush_atomic_syncs_file_then_renamed_directory_once() {
         let root = tempfile::tempdir().unwrap();
