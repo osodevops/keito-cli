@@ -104,6 +104,11 @@ enum Stage {
     Cleaning,
     Done,
 }
+impl Stage {
+    fn setup_pending(&self) -> bool {
+        matches!(self, Self::Ready | Self::Park)
+    }
+}
 struct GroupEdge {
     lease: GroupLease,
     command: Option<Command>,
@@ -165,6 +170,9 @@ impl GroupEdge {
     }
 }
 impl Edge for GroupEdge {
+    fn setup_pending(&self) -> bool {
+        self.stage.setup_pending()
+    }
     fn begin(&mut self, end: u64) -> io::Result<()> {
         self.command.take();
         self.pipes.cancel_input();
@@ -340,6 +348,12 @@ enum ProductEdge {
     Cooperative(CooperativeEdge),
 }
 impl Edge for ProductEdge {
+    fn setup_pending(&self) -> bool {
+        match self {
+            Self::Group(edge) => edge.setup_pending(),
+            Self::Cooperative(edge) => edge.setup_pending(),
+        }
+    }
     fn begin(&mut self, end: u64) -> io::Result<()> {
         match self {
             Self::Group(e) => e.begin(end),
@@ -844,10 +858,20 @@ impl<E: Edge> Core<E> {
         }
         self.finished = true;
     }
-    // RED: the repository cohort currently admits siblings without a setup gate.
-    #[cfg(test)]
+    // No sibling preparation/spawn while a prior short READY/PARK handshake
+    // still requires this same entry thread. Running/cleanup may overlap.
     fn repository_admission_ready(&mut self) -> io::Result<bool> {
-        Ok(true)
+        let admission = self.owner.borrow().check_admission();
+        if let Err(reason) = admission {
+            return Err(error(reason.0));
+        }
+        if self.finished || self.cancel_end.is_some() {
+            self.poison("SCOPE_ADMISSION");
+            return Err(error("SCOPE_ADMISSION"));
+        }
+        Ok(!self.slots.iter().any(|slot| {
+            slot.accepted_at.is_none() && slot.edge.setup_pending()
+        }))
     }
     // Validate the entire fixed cohort BEFORE consuming any result. An earlier
     // accepted sibling cannot leak output while another is pending or invalid.
@@ -1403,9 +1427,16 @@ impl Scope {
             ];
             let mut slots = [None, None, None];
             for ((command, plan), slot) in commands.into_iter().zip(plans).zip(&mut slots) {
-                // Existing children progress between admissions. Any observed
-                // fault closes admission before another child can be started.
-                self.poll();
+                // The private fixed cohort has at most three edges here.
+                // A blocking sibling spawn must not consume an earlier
+                // keeper's already-running short setup window.
+                loop {
+                    self.poll();
+                    if self.core.repository_admission_ready()? {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 *slot = Some(self.start_verified_opaque(command, plan, image)?);
                 self.poll();
                 if let Some(reason) = self.core.owner.borrow().first_fault {
@@ -1764,6 +1795,14 @@ mod tests {
         assert!(core.repository_admission_ready().unwrap());
         assert!(core.slots[0].accepted_at.is_none());
         assert!(core.slots[0].edge.facts.status.is_none());
+    }
+    #[test]
+    fn repository_admission_actual_stage_mapping_only_waits_for_ready_and_park() {
+        assert!(Stage::Ready.setup_pending());
+        assert!(Stage::Park.setup_pending());
+        assert!(!Stage::Running.setup_pending());
+        assert!(!Stage::Cleaning.setup_pending());
+        assert!(!Stage::Done.setup_pending());
     }
     #[test]
     fn repository_admission_sticky_fault_never_reopens_for_a_ready_sibling() {
