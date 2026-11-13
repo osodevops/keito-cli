@@ -957,6 +957,20 @@ impl<E: Edge> Core<E> {
     }
 }
 
+fn await_repository_admission<E: Edge>(
+    core: &mut Core<E>,
+    progress: &mut impl FnMut(&mut Core<E>),
+    pause: &mut impl FnMut(std::time::Duration),
+) -> io::Result<()> {
+    loop {
+        progress(core);
+        if core.repository_admission_ready()? {
+            return Ok(());
+        }
+        pause(std::time::Duration::from_millis(1));
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SlotReport {
     pub slot: usize,
@@ -1448,13 +1462,19 @@ impl Scope {
                 // The private fixed cohort has at most three edges here.
                 // A blocking sibling spawn must not consume an earlier
                 // keeper's already-running short setup window.
-                loop {
-                    self.poll();
-                    if self.core.repository_admission_ready()? {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                let upstream = &mut self.upstream;
+                let ledger = &mut self.ledger;
+                await_repository_admission(
+                    &mut self.core,
+                    &mut |core| Self::poll_turn(core, upstream, ledger),
+                    &mut |duration| {
+                        if duration.is_zero() {
+                            std::thread::yield_now();
+                        } else {
+                            std::thread::sleep(duration);
+                        }
+                    },
+                )?;
                 *slot = Some(self.start_verified_opaque(command, plan, image)?);
                 self.poll();
                 if let Some(reason) = self.core.owner.borrow().first_fault {
@@ -1825,6 +1845,79 @@ mod tests {
         assert!(!Stage::Running.setup_pending());
         assert!(!Stage::Cleaning.setup_pending());
         assert!(!Stage::Done.setup_pending());
+    }
+    #[test]
+    fn repository_setup_wait_observes_a_response_inside_the_original_final_poll_period() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        let slot = core.admit(1, 32, |_| Ok(fake("ready", Rc::default()))).unwrap();
+        core.slots[slot.index].edge.setup_pending = true;
+        let end = 20_000_000u64;
+        let ready_at = end - 30_000;
+        let clock = std::cell::Cell::new(end - 49_000);
+        let mut turns = 0;
+        let result = await_repository_admission(
+            &mut core,
+            &mut |core| {
+                turns += 1;
+                assert!(turns <= 64, "finite scheduling counterexample");
+                if clock.get() >= end {
+                    core.poison("GROUP_DEADLINE");
+                } else if clock.get() >= ready_at {
+                    core.slots[slot.index].edge.setup_pending = false;
+                }
+            },
+            &mut |duration| {
+                // A yield permits one bounded microsecond of peer progress;
+                // a deliberate millisecond sleep skips this original window.
+                clock.set(clock.get() + (duration.as_nanos() as u64).max(1_000));
+            },
+        );
+        assert!(result.is_ok(), "READY before original deadline was missed");
+        assert!(clock.get() >= ready_at && clock.get() < end);
+        assert_eq!(core.hard_end, 500_000_000);
+        assert!(core.slots[slot.index].completion_end.is_none());
+        assert!(core.slots[slot.index].accepted_at.is_none());
+        assert!(!core.slots[slot.index].output_taken);
+    }
+    #[test]
+    fn repository_setup_wait_progress_fault_stops_before_another_pause() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        let slot = core.admit(1, 32, |_| Ok(fake("ready", Rc::default()))).unwrap();
+        core.slots[slot.index].edge.setup_pending = true;
+        let mut turns = 0;
+        let mut pauses = 0;
+        let result = await_repository_admission(
+            &mut core,
+            &mut |core| {
+                turns += 1;
+                if turns == 2 {
+                    core.poison("ORIGINAL_WAIT_FAULT");
+                }
+            },
+            &mut |_| pauses += 1,
+        );
+        assert!(result.is_err());
+        assert_eq!((turns, pauses), (2, 1));
+        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("ORIGINAL_WAIT_FAULT")));
+        assert_eq!(core.slots.len(), 1);
+        assert!(!core.slots[slot.index].output_taken);
+    }
+    #[test]
+    fn repository_setup_wait_expiry_refuses_without_a_pause_or_new_interval() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        let slot = core.admit(1, 32, |_| Ok(fake("ready", Rc::default()))).unwrap();
+        core.slots[slot.index].edge.setup_pending = true;
+        let end = core.hard_end;
+        let result = await_repository_admission(
+            &mut core,
+            &mut |core| core.poison("GROUP_DEADLINE"),
+            &mut |_| panic!("expired setup must not wait again"),
+        );
+        assert!(result.is_err());
+        assert_eq!(core.hard_end, end);
+        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("GROUP_DEADLINE")));
+        assert!(core.slots[slot.index].completion_end.is_none());
+        assert!(core.slots[slot.index].accepted_at.is_none());
     }
     #[test]
     fn repository_admission_sticky_fault_never_reopens_for_a_ready_sibling() {
