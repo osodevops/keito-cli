@@ -798,7 +798,7 @@ fn install_versioned_checked(
         {
             return Err(failure());
         }
-        generations.remove_tree(&stage_name)?;
+        generations.remove_tree_checked(&stage_name, check)?;
     } else {
         generations.rename(&stage_name, &generations, &key)?;
         checkpoint("install-generation-published");
