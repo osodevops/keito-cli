@@ -869,9 +869,10 @@ impl<E: Edge> Core<E> {
             self.poison("SCOPE_ADMISSION");
             return Err(error("SCOPE_ADMISSION"));
         }
-        Ok(!self.slots.iter().any(|slot| {
-            slot.accepted_at.is_none() && slot.edge.setup_pending()
-        }))
+        Ok(!self
+            .slots
+            .iter()
+            .any(|slot| slot.accepted_at.is_none() && slot.edge.setup_pending()))
     }
     // Validate the entire fixed cohort BEFORE consuming any result. An earlier
     // accepted sibling cannot leak output while another is pending or invalid.
@@ -1783,7 +1784,9 @@ mod tests {
     fn repository_admission_pending_setup_blocks_without_waiting_for_workload_completion() {
         let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
         assert!(core.repository_admission_ready().unwrap());
-        let slot = core.admit(1, 32, |_| Ok(fake("first", Rc::default()))).unwrap();
+        let slot = core
+            .admit(1, 32, |_| Ok(fake("first", Rc::default())))
+            .unwrap();
         core.slots[slot.index].edge.setup_pending = true;
         let original_end = core.hard_end;
         assert!(!core.repository_admission_ready().unwrap());
@@ -1807,10 +1810,14 @@ mod tests {
     #[test]
     fn repository_admission_sticky_fault_never_reopens_for_a_ready_sibling() {
         let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
-        core.admit(1, 32, |_| Ok(fake("first", Rc::default()))).unwrap();
+        core.admit(1, 32, |_| Ok(fake("first", Rc::default())))
+            .unwrap();
         core.poison("ORIGINAL_FAULT");
         assert!(core.repository_admission_ready().is_err());
-        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("ORIGINAL_FAULT")));
+        assert_eq!(
+            core.owner.borrow().first_fault,
+            Some(ProtocolError("ORIGINAL_FAULT"))
+        );
         assert_eq!(core.slots.len(), 1);
         assert!(!core.slots[0].output_taken);
     }
@@ -1818,7 +1825,9 @@ mod tests {
     fn repository_admission_cancelled_and_finished_owners_refuse_without_renewal() {
         for kind in ["zero", "cancel", "finished"] {
             let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
-            let slot = core.admit(1, 32, |_| Ok(fake("first", Rc::default()))).unwrap();
+            let slot = core
+                .admit(1, 32, |_| Ok(fake("first", Rc::default())))
+                .unwrap();
             if kind == "finished" {
                 core.finished = true;
             } else {
