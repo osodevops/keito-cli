@@ -85,10 +85,38 @@ pub struct Clock {
 }
 #[cfg(target_os = "macos")]
 fn native_boot_identity_from(
-    _read: impl FnOnce(&mut libc::timeval, &mut usize) -> i32,
+    read: impl FnOnce(&mut libc::timeval, &mut usize) -> i32,
 ) -> Option<String> {
-    // RED: valid bounded kernel samples must produce an identity.
-    None
+    let mut value = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut length = std::mem::size_of::<libc::timeval>();
+    if read(&mut value, &mut length) != 0
+        || length != std::mem::size_of::<libc::timeval>()
+        || value.tv_sec <= 0
+        || !(0..1_000_000).contains(&value.tv_usec)
+    {
+        return None;
+    }
+    // Never hash ABI padding, localized dates or environment-controlled text.
+    // A pre-upgrade active clock deliberately differs and closes incomplete.
+    Some(hash(format!("macos-kern-boottime-v1:{}:{}", value.tv_sec, value.tv_usec)))
+}
+#[cfg(target_os = "macos")]
+fn native_boot_identity() -> Option<String> {
+    native_boot_identity_from(|value, length| {
+        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+        // Fixed read-only MIB and exact initialized output ABI. NULL newp and
+        // zero newlen prohibit a write; no subprocess, cache or fallback.
+        unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                (value as *mut libc::timeval).cast(),
+                length,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
+    })
 }
 impl Clock {
     #[cfg(unix)]
@@ -101,6 +129,9 @@ impl Clock {
     pub(crate) fn now_with(
         runner: &mut impl crate::process_ownership::probes::LeafRunner,
     ) -> Result<Self, AppError> {
+        // Retain the explicit containing runner API. macOS boot metadata is
+        // now a direct read; repository commands still use the same owner.
+        let _ = runner;
         let mut time = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -112,17 +143,9 @@ impl Clock {
             ));
         }
         #[cfg(target_os = "macos")]
-        let boot = {
-            let mut command = Command::new("/usr/sbin/sysctl");
-            command.args(["-n", "kern.boottime"]);
-            let result = runner.output(command, 8192, 8192).map_err(|_| {
-                AppError::Config("Boot command ownership unavailable; capture paused".into())
-            })?;
-            result.status.success().then(|| hash(result.output.stdout))
-        };
+        let boot = native_boot_identity();
         #[cfg(not(target_os = "macos"))]
         let boot = {
-            let _ = runner;
             fs::read("/proc/sys/kernel/random/boot_id").ok().map(hash)
         };
         Ok(Self {

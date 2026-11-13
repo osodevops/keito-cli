@@ -167,7 +167,8 @@ pub fn diagnose_fixture_hook_probes(
     // their text interpretation. The own repository is validated by native.
     crate::capture::Repository::resolve_with(repository, &mut runner)?;
     crate::capture::Clock::now_with(&mut runner)?;
-    let expected = if cfg!(target_os = "macos") { 4 } else { 3 };
+    // Boot metadata no longer starts a leaf on macOS; only three Git probes.
+    let expected = 3;
     if runner.ordinal != expected {
         runner
             .scope
