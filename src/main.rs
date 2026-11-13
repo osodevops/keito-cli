@@ -123,6 +123,44 @@ fn main() {
     }
 }
 
+async fn run(
+    cli: Cli,
+    #[cfg(unix)] scope: Option<&mut keito_cli::process_ownership::scope::Scope>,
+) -> Result<(), AppError> {
+    let output_mode = if cli.json || !std::io::stdout().is_terminal() {
+        output::OutputMode::Json
+    } else {
+        output::OutputMode::Table
+    };
+
+    match cli.command {
+        cli::Command::Capture(cmd) => {
+            #[cfg(unix)]
+            {
+                commands::capture::run_with_scope(cmd, &cli.global, output_mode, scope).await
+            }
+            #[cfg(not(unix))]
+            {
+                commands::capture::run(cmd, &cli.global, output_mode).await
+            }
+        }
+        cli::Command::Auth(cmd) => commands::auth::run(cmd, &cli.global, output_mode).await,
+        cli::Command::Clients(cmd) => commands::clients::run(cmd, &cli.global, output_mode).await,
+        cli::Command::Time(cmd) => commands::time::run(cmd, &cli.global, output_mode).await,
+        cli::Command::Projects(cmd) => commands::projects::run(cmd, &cli.global, output_mode).await,
+        cli::Command::Skill(cmd) => {
+            #[cfg(unix)]
+            {
+                commands::skill::run_with_scope(cmd, &cli.global, output_mode, scope).await
+            }
+            #[cfg(not(unix))]
+            {
+                commands::skill::run(cmd, &cli.global, output_mode).await
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod local_startup_tests {
     use super::*;
@@ -241,43 +279,5 @@ mod local_startup_tests {
         assert!(
             matches!(poll_local(async { Err(AppError::Conflict("finite-refusal".into())) }, false), Err(AppError::Conflict(value)) if value == "finite-refusal")
         );
-    }
-}
-
-async fn run(
-    cli: Cli,
-    #[cfg(unix)] scope: Option<&mut keito_cli::process_ownership::scope::Scope>,
-) -> Result<(), AppError> {
-    let output_mode = if cli.json || !std::io::stdout().is_terminal() {
-        output::OutputMode::Json
-    } else {
-        output::OutputMode::Table
-    };
-
-    match cli.command {
-        cli::Command::Capture(cmd) => {
-            #[cfg(unix)]
-            {
-                commands::capture::run_with_scope(cmd, &cli.global, output_mode, scope).await
-            }
-            #[cfg(not(unix))]
-            {
-                commands::capture::run(cmd, &cli.global, output_mode).await
-            }
-        }
-        cli::Command::Auth(cmd) => commands::auth::run(cmd, &cli.global, output_mode).await,
-        cli::Command::Clients(cmd) => commands::clients::run(cmd, &cli.global, output_mode).await,
-        cli::Command::Time(cmd) => commands::time::run(cmd, &cli.global, output_mode).await,
-        cli::Command::Projects(cmd) => commands::projects::run(cmd, &cli.global, output_mode).await,
-        cli::Command::Skill(cmd) => {
-            #[cfg(unix)]
-            {
-                commands::skill::run_with_scope(cmd, &cli.global, output_mode, scope).await
-            }
-            #[cfg(not(unix))]
-            {
-                commands::skill::run(cmd, &cli.global, output_mode).await
-            }
-        }
     }
 }
