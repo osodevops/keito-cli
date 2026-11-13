@@ -1851,7 +1851,9 @@ mod tests {
     #[test]
     fn repository_setup_wait_observes_a_response_inside_the_original_final_poll_period() {
         let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
-        let slot = core.admit(1, 32, |_| Ok(fake("ready", Rc::default()))).unwrap();
+        let slot = core
+            .admit(1, 32, |_| Ok(fake("ready", Rc::default())))
+            .unwrap();
         core.slots[slot.index].edge.setup_pending = true;
         let end = 20_000_000u64;
         let ready_at = end - 30_000;
@@ -1884,7 +1886,9 @@ mod tests {
     #[test]
     fn repository_setup_wait_progress_fault_stops_before_another_pause() {
         let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
-        let slot = core.admit(1, 32, |_| Ok(fake("ready", Rc::default()))).unwrap();
+        let slot = core
+            .admit(1, 32, |_| Ok(fake("ready", Rc::default())))
+            .unwrap();
         core.slots[slot.index].edge.setup_pending = true;
         let mut turns = 0;
         let mut pauses = 0;
@@ -1900,14 +1904,19 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!((turns, pauses), (2, 1));
-        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("ORIGINAL_WAIT_FAULT")));
+        assert_eq!(
+            core.owner.borrow().first_fault,
+            Some(ProtocolError("ORIGINAL_WAIT_FAULT"))
+        );
         assert_eq!(core.slots.len(), 1);
         assert!(!core.slots[slot.index].output_taken);
     }
     #[test]
     fn repository_setup_wait_expiry_refuses_without_a_pause_or_new_interval() {
         let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
-        let slot = core.admit(1, 32, |_| Ok(fake("ready", Rc::default()))).unwrap();
+        let slot = core
+            .admit(1, 32, |_| Ok(fake("ready", Rc::default())))
+            .unwrap();
         core.slots[slot.index].edge.setup_pending = true;
         let end = core.hard_end;
         let result = await_repository_admission(
@@ -1917,7 +1926,10 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(core.hard_end, end);
-        assert_eq!(core.owner.borrow().first_fault, Some(ProtocolError("GROUP_DEADLINE")));
+        assert_eq!(
+            core.owner.borrow().first_fault,
+            Some(ProtocolError("GROUP_DEADLINE"))
+        );
         assert!(core.slots[slot.index].completion_end.is_none());
         assert!(core.slots[slot.index].accepted_at.is_none());
     }
