@@ -94,6 +94,49 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertEqual(self.a["stderr_count"], len(raw))
         self.assertNotIn("message", str(self.a.get("output_limit_first")))
 
+    def test_failure_categories_reject_unsafe_schema_and_never_copy_private_text(self):
+        import json
+        cases = [
+            (json.dumps({"error": True, "code": 8, "message": "PRIVATE_MESSAGE_CANARY"}).encode(), "APP_ERROR_8"),
+            (json.dumps({"error": True, "code": 8, "private": "PRIVATE_EXTRA_CANARY"}).encode(), None),
+            (json.dumps({"error": True, "code": True}).encode(), None),
+            (b"PRIVATE_NON_JSON_CANARY", None),
+            (b"[" * 1200 + b"0" + b"]" * 1200, None),
+            (json.dumps({"error": True, "code": 8,
+                         "message": "Coding-agent version probe refused: original deadline exceeded",
+                         "details": {"kind": "capture_version_probe", "reason": "deadline",
+                                     "cleanup_unverified": False, "cleanup_status": "not_reported"}}).encode(),
+             "VERSION_PROBE_DEADLINE"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(expected=expected, size=len(raw)):
+                owner = SourceOwner()
+                manager = OwnedChildren(self.root, {}, self.root, owner)
+                value = slot("c", 103, [], self.end)
+                value.update({"stdin_configured": True, "stdout_configured": True,
+                              "stderr_configured": True, "control_closed": False})
+                blocks = [raw, b""]
+                with patch("os.read", side_effect=lambda fd, count: blocks.pop(0) if fd == 102 else b""):
+                    manager._poll_slot(value, False)
+                self.assertEqual(value.get("output_limit_first"), {
+                    "stream": "stderr", "observed_bytes": len(raw), "allowed_bytes": 0,
+                    "error_category": expected})
+                self.assertEqual(owner.first_fault, "RUNTIME_OUTPUT_LIMIT")
+                self.assertIsNone(value["accepted"])
+                self.assertNotIn("PRIVATE", str(value.get("output_limit_first")))
+
+    def test_failure_classification_cannot_replace_original_output_fault(self):
+        blocks = [b"PRIVATE_UNCLASSIFIED", b""]
+        with patch("source_qa_children._stderr_category", create=True, side_effect=MemoryError), \
+             patch("os.read", side_effect=lambda fd, count: blocks.pop(0) if fd == 102 else b""):
+            self.manager._poll_slot(self.a, False)
+        self.assertEqual(self.owner.first_fault, "RUNTIME_OUTPUT_LIMIT")
+        self.assertIsInstance(self.manager.first_error, ChildFailure)
+        self.assertEqual(str(self.manager.first_error), "runtime output limit")
+        self.assertEqual(self.a.get("output_limit_first"), {
+            "stream": "stderr", "observed_bytes": len(b"PRIVATE_UNCLASSIFIED"),
+            "allowed_bytes": 0, "error_category": None})
+
     def test_review_failed_endpoint_is_not_physical_eof(self):
         self.a["endpoint"].first_fault = "INERT_ENDPOINT"
         self.a["child"].returncode = 0

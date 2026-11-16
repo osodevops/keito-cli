@@ -565,7 +565,9 @@ fn observed_version(
             Ok(())
         });
     }
-    let result = runner.output(command, 8192, 8192).map_err(|_| refused())?;
+    let result = runner
+        .output(command, 8192, 8192)
+        .map_err(crate::capture_command_owner::version_probe_error)?;
     if !result.status.success() {
         return Err(refused());
     }

@@ -14,6 +14,49 @@ from pathlib import Path
 INSTALL_OPERATION_NS = 30_000_000_000
 
 
+def _stderr_category(block):
+    """Closed diagnostic from an already-read block; never retain its content."""
+    if type(block) is not bytes or len(block) > 4096:
+        return None
+    try:
+        value = json.loads(block)
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+    if (type(value) is not dict or value.get("error") is not True
+            or not set(value) <= {"error", "code", "message", "suggestion", "details"}
+            or type(value.get("code")) is not int or not 1 <= value["code"] <= 8):
+        return None
+    if value["code"] == 8:
+        messages = {
+            "Configuration error: Repository command ownership unavailable; capture paused": "REPOSITORY_OWNERSHIP",
+            "Configuration error: Capture command ownership unavailable; collection remains paused": "COMMAND_OWNERSHIP",
+            "Configuration error: Command ownership did not settle; collection remains paused": "TERMINAL_SETTLEMENT",
+            "Configuration error: Numeric profile qualification is unavailable; review the supported native version, managed installation and explicit profile approval. Metadata capture remains available.": "PROFILE_QUALIFICATION",
+        }
+        message = value.get("message")
+        if type(message) is str and message in messages:
+            return messages[message]
+        reasons = {
+            "admission_refused": ("ownership admission refused", "VERSION_PROBE_ADMISSION"),
+            "deadline": ("original deadline exceeded", "VERSION_PROBE_DEADLINE"),
+            "clock": ("monotonic clock unavailable", "VERSION_PROBE_CLOCK"),
+            "ownership": ("ownership proof unavailable", "VERSION_PROBE_OWNERSHIP"),
+            "unavailable": ("probe unavailable", "VERSION_PROBE_UNAVAILABLE"),
+        }
+        details = value.get("details")
+        if (type(details) is dict
+                and set(details) == {"kind", "reason", "cleanup_unverified", "cleanup_status"}
+                and details.get("kind") == "capture_version_probe"
+                and type(details.get("reason")) is str and details["reason"] in reasons
+                and type(details.get("cleanup_unverified")) is bool
+                and details.get("cleanup_status") == ("unverified" if details["cleanup_unverified"] else "not_reported")):
+            display, category = reasons[details["reason"]]
+            if message == "Coding-agent version probe refused: " + display:
+                return category
+    return (None, "APP_ERROR_1", "APP_ERROR_2", "APP_ERROR_3", "APP_ERROR_4",
+            "APP_ERROR_5", "APP_ERROR_6", "APP_ERROR_7", "APP_ERROR_8")[value["code"]]
+
+
 class Cancelled(BaseException):
     def __init__(self, signum):
         self.signum = signum
@@ -338,7 +381,8 @@ class OwnedChildren:
                 "capture_limit": capture_limit, "stdout": bytearray(), "stdout_count": 0,
                 "stderr_count": 0, "stdout_eof": False, "stderr_eof": False,
                 "cancel_sent": False, "waited_published": False, "collected": False,
-                "accepted": None, "retrieved": False, "first_fault": None}
+                "accepted": None, "retrieved": False, "first_fault": None,
+                "output_limit_first": None}
         slot.update({"stdin_configured": False, "stdout_configured": False, "stderr_configured": False,
                      "control_closed": False, "cancel_end": None})
         # Reserve history and buffers before Popen. Slot remains even on error.
@@ -494,6 +538,16 @@ class OwnedChildren:
                 if slot[name + "_count"] > (slot["capture_limit"] if name == "stdout" else 0):
                     slot["first_fault"] = slot["first_fault"] or "RUNTIME_OUTPUT_LIMIT"
                     self._fail(ChildFailure("runtime output limit"), "RUNTIME_OUTPUT_LIMIT")
+                    if slot.get("output_limit_first") is None:
+                        observation = {"stream": name, "observed_bytes": slot[name + "_count"],
+                                       "allowed_bytes": slot["capture_limit"] if name == "stdout" else 0,
+                                       "error_category": None}
+                        slot["output_limit_first"] = observation
+                        # The original failure is already latched. Optional
+                        # classification cannot replace it or retain raw stderr.
+                        if name == "stderr":
+                            try: observation["error_category"] = _stderr_category(block)
+                            except BaseException: pass
         try:
             status = child.poll()
         except OSError as error:
