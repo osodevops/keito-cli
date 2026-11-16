@@ -24,7 +24,8 @@ use std::{
 const RESERVE_NS: u64 = 50_000_000;
 const MAX_IO_BYTES: usize = 4 * 1024 * 1024;
 const SLOTS_PER_TURN: usize = 8;
-pub(crate) const INSTALL_OPERATION_NS: u64 = 4_000_000_000;
+/// Original maximum for one selected installation; an earlier parent always wins.
+pub const INSTALL_OPERATION_NS: u64 = 4_000_000_000;
 const ORDINARY_OPERATION_NS: u64 = 1_000_000_000;
 fn error(reason: &'static str) -> io::Error {
     io::Error::other(reason)
@@ -2103,13 +2104,37 @@ mod tests {
     fn installer_borrowed_parent_cannot_grant_more_than_one_local_operation() {
         let mut core: Core<Fake> = Core::new(Rc::default(), 900_000_000_000);
         core.begin_installer(100_000_000, 2).unwrap();
-        assert_eq!(core.hard_end, 4_100_000_000);
+        assert_eq!(core.hard_end, 30_100_000_000);
         assert_eq!(core.installer_end().unwrap(), 1_100_000_000);
         assert!(core.begin_installer(500_000_000, 2).is_err());
-        assert_eq!(core.hard_end, 4_100_000_000);
+        assert_eq!(core.hard_end, 30_100_000_000);
         let mut overflow: Core<Fake> = Core::new(Rc::default(), u64::MAX);
         assert!(overflow.begin_installer(u64::MAX - 1, 1).is_err());
         assert_eq!(overflow.cancel_end, Some(0));
+    }
+    #[test]
+    fn installer_policy_allows_publication_after_four_seconds_without_renewal() {
+        let mut core = installer_ready();
+        core.seal_installer(true, &mut || Ok(300_000_000)).unwrap();
+        let original = core.hard_end;
+        assert!(core
+            .publication_live(true, &mut || Ok(5_000_000_000))
+            .is_ok());
+        assert_eq!(original, 30_000_000_000);
+        assert_eq!(core.hard_end, original);
+        assert!(core
+            .publication_live(true, &mut || Ok(original))
+            .is_err());
+        assert_eq!(core.hard_end, original);
+    }
+    #[test]
+    fn installer_policy_keeps_earlier_four_second_parent_and_one_second_preflight() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 4_000_000_000);
+        core.begin_installer(100_000_000, 2).unwrap();
+        assert_eq!(core.hard_end, 4_000_000_000);
+        assert_eq!(core.installer_end().unwrap(), 1_100_000_000);
+        assert!(core.begin_installer(200_000_000, 2).is_err());
+        assert_eq!(core.hard_end, 4_000_000_000);
     }
     #[test]
     fn installer_cohort_expiry_broadcasts_all_before_poll_and_keeps_first_fault() {

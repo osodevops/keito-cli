@@ -375,7 +375,13 @@ class SourceOwner:
         self._collected_failed_managers = set()
         self._closed = False
         self.runtime_io_reserved = 0
+        # Immutable observation of first admission, distinct from tighter cleanup.
+        self._runtime_end_ns = None
         self._clock_broadcasting = False
+
+    @property
+    def runtime_end_ns(self):
+        return self._runtime_end_ns
 
     def fail(self, reason):
         if self.first_fault is None:

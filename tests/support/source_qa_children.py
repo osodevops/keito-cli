@@ -7,6 +7,11 @@ import secrets
 import signal
 import subprocess
 import time
+from pathlib import Path
+
+
+# Kept at the historical value for the first behavioral RED.
+INSTALL_OPERATION_NS = 4_000_000_000
 
 
 class Cancelled(BaseException):
@@ -276,7 +281,39 @@ class OwnedChildren:
             raise self.first_error
         return False
 
+    def _select_end(self, timeout, installer=False):
+        if installer and (self.owner.managers != [self] or self.slots
+                          or self.hard_end is not None or self.owner.runtime_end_ns is not None):
+            raise ChildFailure("installer must be the first runtime admission")
+        self.owner.check()
+        at = self._now()
+        maximum = INSTALL_OPERATION_NS if installer else 4_000_000_000
+        self.owner.limit_end(at + maximum)
+        end = min(at + int(timeout * 1_000_000_000), self.owner.deadline_ns, at + maximum)
+        if self.hard_end is not None:
+            end = min(end, self.hard_end)
+        if end <= at:
+            raise ChildFailure("expired cooperative operation")
+        self.hard_end = end
+        if self.owner.runtime_end_ns is None:
+            self.owner._runtime_end_ns = end
+        return at, end
+
+    def start_installer(self, label, arguments, extra=None, capture_limit=0, input_bytes=b""):
+        case = Path(self.root)
+        prepared = case.parent
+        expected = [str(prepared / "natives/codex-inert-source-only"),
+                    "--installer-phases-diagnostic", str(prepared), str(case),
+                    str(prepared / "pair/keito")]
+        if (not case.is_absolute() or Path(self.cwd) != case or arguments != expected):
+            raise ChildFailure("invalid closed installer route")
+        return self._start(label, arguments, INSTALL_OPERATION_NS / 1_000_000_000,
+                           extra, capture_limit, input_bytes, installer=True)
+
     def start(self, label, arguments, timeout, extra=None, capture_limit=0, input_bytes=b""):
+        return self._start(label, arguments, timeout, extra, capture_limit, input_bytes)
+
+    def _start(self, label, arguments, timeout, extra=None, capture_limit=0, input_bytes=b"", installer=False):
         import socket
         import threading
         if (not self.entered or self.cleanup_end is not None or len(self.slots) >= 4096
@@ -287,18 +324,7 @@ class OwnedChildren:
                 or type(input_bytes) is not bytes or len(input_bytes) > 1024 * 1024
                 or threading.active_count() != 1):
             raise ChildFailure("invalid cooperative runtime operation")
-        self.owner.check()
-        at = self._now()
-        self.owner.limit_end(at + 4_000_000_000)
-        end = at + int(timeout * 1_000_000_000)
-        if self.owner.deadline_ns is not None:
-            end = min(end, self.owner.deadline_ns)
-        end = min(end, at + 4_000_000_000)
-        if self.hard_end is not None:
-            end = min(end, self.hard_end)
-        if end <= at:
-            raise ChildFailure("expired cooperative operation")
-        self.hard_end = end
+        at, end = self._select_end(timeout, installer)
         charge = len(input_bytes) + capture_limit
         if self.owner.runtime_io_reserved + charge > 4 * 1024 * 1024:
             raise ChildFailure("runtime buffer budget")

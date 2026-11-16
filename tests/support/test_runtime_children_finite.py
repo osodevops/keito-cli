@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from source_qa_children import OwnedChildren, Cancelled
+from source_qa_children import OwnedChildren, Cancelled, ChildFailure
 from source_qa_protocol import SourceOwner, ProtocolError
 
 
@@ -339,6 +339,68 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertIsNone(self.b["child"].returncode)
         self.assertEqual((self.root / "a-result.json").read_text(), "retain collision")
         self.assertEqual(len(self.manager.slots), 2)
+
+
+class InstallerPolicyTests(unittest.TestCase):
+    def manager(self, parent=None):
+        owner = SourceOwner()
+        owner.deadline_ns = parent
+        manager = OwnedChildren(Path("/private/synthetic/case"), {},
+                                Path("/private/synthetic/case"), owner)
+        owner.register_manager(manager)
+        manager.entered = True
+        return manager
+
+    @patch("source_qa_protocol.monotonic_ns", return_value=100_000_000)
+    def test_installer_original_end_and_cleanup_observation_are_distinct(self, _clock):
+        manager = self.manager()
+        self.assertEqual(manager._select_end(30, installer=True), (100_000_000, 30_100_000_000))
+        self.assertEqual(manager.owner.runtime_end_ns, 30_100_000_000)
+        manager.owner.limit_end(4_100_000_000)
+        self.assertEqual(manager.owner.deadline_ns, 4_100_000_000)
+        self.assertEqual(manager.owner.runtime_end_ns, 30_100_000_000)
+        with self.assertRaises(AttributeError):
+            manager.owner.runtime_end_ns = 90_000_000_000
+        with self.assertRaises(ChildFailure):
+            manager._select_end(30, installer=True)
+
+    @patch("source_qa_protocol.monotonic_ns", return_value=100_000_000)
+    def test_installer_preserves_earlier_parent_and_cannot_follow_other_runtime(self, _clock):
+        manager = self.manager(4_000_000_000)
+        self.assertEqual(manager._select_end(30, installer=True)[1], 4_000_000_000)
+        ordinary = self.manager()
+        self.assertEqual(ordinary._select_end(30)[1], 4_100_000_000)
+        with self.assertRaises(ChildFailure):
+            ordinary._select_end(30, installer=True)
+        sibling = OwnedChildren(ordinary.root, {}, ordinary.cwd, ordinary.owner)
+        ordinary.owner.register_manager(sibling)
+        with self.assertRaises(ChildFailure):
+            sibling._select_end(30, installer=True)
+
+    @patch("source_qa_protocol.monotonic_ns", return_value=100_000_000)
+    def test_ordinary_and_hook_limits_do_not_change(self, _clock):
+        manager = self.manager()
+        self.assertEqual(manager._select_end(1)[1], 1_100_000_000)
+        with patch("source_qa_protocol.monotonic_ns", return_value=200_000_000):
+            self.assertEqual(manager._select_end(600)[1], 1_100_000_000)
+        self.assertEqual(manager.owner.runtime_end_ns, 1_100_000_000)
+
+    @patch("source_qa_protocol.monotonic_ns", return_value=100_000_000)
+    def test_installer_route_is_closed_before_any_runtime_preparation(self, _clock):
+        manager = self.manager()
+        prepared = manager.root.parent
+        argv = [str(prepared / "natives/codex-inert-source-only"),
+                "--installer-phases-diagnostic", str(prepared), str(manager.root),
+                str(prepared / "pair/keito")]
+        with patch.object(manager, "_start", return_value="selected") as start:
+            self.assertEqual(manager.start_installer("install", argv), "selected")
+            self.assertEqual(start.call_args.args[2], 30)
+            self.assertTrue(start.call_args.kwargs["installer"])
+            for bad in [argv[:-1], argv + ["extra"], ["/usr/bin/git"] + argv[1:],
+                        [argv[0], "--cli"] + argv[2:], argv[:-1] + ["relative"]]:
+                with self.assertRaises(ChildFailure):
+                    manager.start_installer("install", bad)
+            self.assertEqual(start.call_count, 1)
 
 
 if __name__ == "__main__":
