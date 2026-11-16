@@ -110,6 +110,8 @@ impl Dir {
         Ok(())
     }
     fn open_directory(&self, child: &str) -> Result<Self, AppError> {
+        #[cfg(test)]
+        directory_verification_tests::directory_opened();
         let c = name(child)?;
         let fd = unsafe {
             libc::openat(
@@ -478,6 +480,78 @@ fn publication_fault(phase: &str) -> Result<(), AppError> {
 #[cfg(test)]
 pub(crate) fn set_publication_fault(phase: Option<&str>) {
     FAILURE_PHASE.with(|p| *p.borrow_mut() = phase.map(str::to_owned));
+}
+
+#[cfg(test)]
+mod directory_verification_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static DIRECTORY_OPENS: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(super) fn directory_opened() {
+        DIRECTORY_OPENS.with(|count| count.set(count.get() + 1));
+    }
+
+    #[test]
+    fn directory_verify_uses_existing_descriptors_for_every_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let anchor = Dir::anchor(root.path()).unwrap();
+        let parent = anchor.child("parent", true).unwrap();
+        let leaf = parent.child("leaf", true).unwrap();
+        let before = DIRECTORY_OPENS.with(Cell::get);
+        leaf.verify().unwrap();
+        assert_eq!(
+            DIRECTORY_OPENS.with(Cell::get),
+            before,
+            "verification must not open disposable descriptors for held ancestors"
+        );
+        assert!(leaf.path.is_dir());
+    }
+
+    #[test]
+    fn directory_verify_refuses_real_directory_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let anchor = Dir::anchor(root.path()).unwrap();
+        let leaf = anchor.child("leaf", true).unwrap();
+        std::fs::rename(root.path().join("leaf"), root.path().join("retained")).unwrap();
+        std::fs::create_dir(root.path().join("leaf")).unwrap();
+        assert!(leaf.verify().is_err());
+        assert!(leaf.atomic("blocked", b"new", 0o600, Some(None), "test").is_err());
+        assert!(!root.path().join("leaf/blocked").exists());
+        assert!(!root.path().join("retained/blocked").exists());
+    }
+
+    #[test]
+    fn directory_verify_refuses_symlink_even_to_the_held_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let anchor = Dir::anchor(root.path()).unwrap();
+        let leaf = anchor.child("leaf", true).unwrap();
+        std::fs::rename(root.path().join("leaf"), root.path().join("retained")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("retained"), root.path().join("leaf")).unwrap();
+        assert!(leaf.verify().is_err());
+        assert!(leaf.atomic("blocked", b"new", 0o600, Some(None), "test").is_err());
+        assert!(!root.path().join("retained/blocked").exists());
+    }
+
+    #[test]
+    fn directory_verify_refuses_replaced_ancestor_and_root() {
+        for replace_root in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().join("base");
+            std::fs::create_dir(&base).unwrap();
+            let anchor = Dir::anchor(&base).unwrap();
+            let parent = anchor.child("parent", true).unwrap();
+            let leaf = parent.child("leaf", true).unwrap();
+            let target = if replace_root { base } else { parent.path.clone() };
+            std::fs::rename(&target, target.with_extension("retained")).unwrap();
+            std::fs::create_dir(&target).unwrap();
+            assert!(leaf.verify().is_err());
+            assert!(leaf.atomic("blocked", b"new", 0o600, Some(None), "test").is_err());
+            assert!(!leaf.path.join("blocked").exists());
+        }
+    }
 }
 
 #[cfg(test)]
