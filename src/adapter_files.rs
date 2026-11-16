@@ -92,12 +92,35 @@ impl Dir {
         if let Some((parent, child)) = &self.parent {
             parent.verify()?;
             let expected = self.file.metadata().map_err(|_| failure())?;
-            let actual = parent
-                .open_directory(child)?
-                .file
-                .metadata()
-                .map_err(|_| failure())?;
-            if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+            let child = name(child)?;
+            let mut actual = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // The parent and expected child are already held by descriptors.
+            // Inspect the current entry without following links or opening a
+            // disposable descriptor just to stat it. Every ancestor remains
+            // checked on every call; this is still a snapshot, not a path lock.
+            if unsafe {
+                libc::fstatat(
+                    parent.file.as_raw_fd(),
+                    child.as_ptr(),
+                    actual.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(failure());
+            }
+            // SAFETY: successful fstatat initialized the complete stat value.
+            let actual = unsafe { actual.assume_init() };
+            if actual.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || actual.st_uid != unsafe { libc::geteuid() }
+            {
+                return Err(failure());
+            }
+            // stat field widths differ between supported Unix platforms.
+            #[allow(clippy::unnecessary_cast)]
+            let same_identity =
+                expected.dev() == actual.st_dev as u64 && expected.ino() == actual.st_ino as u64;
+            if !same_identity {
                 return Err(conflict());
             }
         } else {
