@@ -296,7 +296,9 @@ class OwnedChildren:
             raise ChildFailure("expired cooperative operation")
         self.hard_end = end
         if self.owner.runtime_end_ns is None:
-            self.owner._runtime_end_ns = end
+            # Observe the actual owner admission; a shorter slot has its own end.
+            # This field never grants authority or changes cleanup tightening.
+            self.owner._runtime_end_ns = self.owner.deadline_ns
         return at, end
 
     def start_installer(self, label, arguments, extra=None, capture_limit=0, input_bytes=b""):
