@@ -804,7 +804,51 @@ pub(crate) fn approve_with_runner(
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
-    use std::{io::Write, os::unix::fs::PermissionsExt};
+    use std::{io::{self, Write}, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn version_probe_enable_preserves_closed_owner_reason_without_execution() {
+        struct FailedProbe(&'static str);
+        impl crate::process_ownership::probes::LeafRunner for FailedProbe {
+            fn output(
+                &mut self,
+                command: Command,
+                stdout_cap: usize,
+                stderr_cap: usize,
+            ) -> io::Result<crate::process_ownership::scope::CommandResult> {
+                assert_eq!(command.get_args().collect::<Vec<_>>(), vec![std::ffi::OsStr::new("--version")]);
+                assert_eq!((stdout_cap, stderr_cap), (8192, 8192));
+                Err(io::Error::other(
+                    crate::process_ownership::protocol::ProtocolError(self.0),
+                ))
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let path = home.join("inert-header-never-executed");
+        #[cfg(target_os = "macos")]
+        fs::write(&path, b"\xcf\xfa\xed\xfe").unwrap();
+        #[cfg(target_os = "linux")]
+        fs::write(&path, b"\x7fELF").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let native = ImagePin::observe(&path, true).unwrap();
+        for (fault, expected) in [
+            ("SCOPE_OPERATION_DEADLINE", "deadline"),
+            ("SCOPE_ADMISSION", "admission_refused"),
+            ("SCOPE_CLOCK", "clock"),
+            ("SCOPE_PARENT_CANCELLED", "ownership"),
+            ("PRIVATE_UNRECOGNIZED_FAULT", "ownership"),
+        ] {
+            let error = observed_version(&native, &home, "0.167.0", &mut FailedProbe(fault))
+                .unwrap_err();
+            let value: serde_json::Value = serde_json::from_str(&error.to_json()).unwrap();
+            assert_eq!(value["code"], 8);
+            assert_eq!(value["details"]["kind"], "capture_version_probe");
+            assert_eq!(value["details"]["reason"], expected);
+            assert!(!error.to_json().contains("PRIVATE_"));
+            assert!(!error.to_json().contains("auth login"));
+        }
+    }
 
     #[test]
     fn enable_time_native_pin_accepts_the_target_claude_image_size_without_execution() {

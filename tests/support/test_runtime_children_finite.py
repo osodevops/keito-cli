@@ -67,6 +67,33 @@ class RuntimeManagerTests(unittest.TestCase):
         self.owner.forward([f"REGISTER|{os.getpid()}|101|{'a'*32}|0",
                             f"REGISTER|{os.getpid()}|102|{'b'*32}|0"])
 
+    def test_output_limit_preserves_first_stream_counts_without_retaining_content(self):
+        raw = b"PRIVATE_OUTPUT_CANARY"
+        blocks = [raw, b""]
+        with patch("os.read", side_effect=lambda fd, count: blocks.pop(0) if fd == 101 else b""):
+            self.manager._poll_slot(self.a, False)
+        self.assertEqual(self.a.get("output_limit_first"), {
+            "stream": "stdout", "observed_bytes": len(raw), "allowed_bytes": 8,
+            "error_category": None})
+        self.assertEqual(self.a["first_fault"], "RUNTIME_OUTPUT_LIMIT")
+        self.assertEqual(self.owner.first_fault, "RUNTIME_OUTPUT_LIMIT")
+        self.assertEqual(len(self.a["stdout"]), 8)
+        self.assertNotIn("PRIVATE", str(self.a.get("output_limit_first")))
+
+    def test_stderr_limit_stays_zero_and_retains_only_closed_error_category(self):
+        import json
+        raw = json.dumps({"error": True, "code": 8,
+                          "message": "Configuration error: Repository command ownership unavailable; capture paused"}).encode()
+        blocks = [raw, b""]
+        with patch("os.read", side_effect=lambda fd, count: blocks.pop(0) if fd == 102 else b""):
+            self.manager._poll_slot(self.a, False)
+        self.assertEqual(self.a.get("output_limit_first"), {
+            "stream": "stderr", "observed_bytes": len(raw), "allowed_bytes": 0,
+            "error_category": "REPOSITORY_OWNERSHIP"})
+        self.assertEqual(self.owner.first_fault, "RUNTIME_OUTPUT_LIMIT")
+        self.assertEqual(self.a["stderr_count"], len(raw))
+        self.assertNotIn("message", str(self.a.get("output_limit_first")))
+
     def test_review_failed_endpoint_is_not_physical_eof(self):
         self.a["endpoint"].first_fault = "INERT_ENDPOINT"
         self.a["child"].returncode = 0
