@@ -541,7 +541,9 @@ mod directory_verification_tests {
         std::fs::rename(root.path().join("leaf"), root.path().join("retained")).unwrap();
         std::fs::create_dir(root.path().join("leaf")).unwrap();
         assert!(leaf.verify().is_err());
-        assert!(leaf.atomic("blocked", b"new", 0o600, Some(None), "test").is_err());
+        assert!(leaf
+            .atomic("blocked", b"new", 0o600, Some(None), "test")
+            .is_err());
         assert!(!root.path().join("leaf/blocked").exists());
         assert!(!root.path().join("retained/blocked").exists());
     }
@@ -554,7 +556,9 @@ mod directory_verification_tests {
         std::fs::rename(root.path().join("leaf"), root.path().join("retained")).unwrap();
         std::os::unix::fs::symlink(root.path().join("retained"), root.path().join("leaf")).unwrap();
         assert!(leaf.verify().is_err());
-        assert!(leaf.atomic("blocked", b"new", 0o600, Some(None), "test").is_err());
+        assert!(leaf
+            .atomic("blocked", b"new", 0o600, Some(None), "test")
+            .is_err());
         assert!(!root.path().join("retained/blocked").exists());
     }
 
@@ -567,11 +571,17 @@ mod directory_verification_tests {
             let anchor = Dir::anchor(&base).unwrap();
             let parent = anchor.child("parent", true).unwrap();
             let leaf = parent.child("leaf", true).unwrap();
-            let target = if replace_root { base } else { parent.path.clone() };
+            let target = if replace_root {
+                base
+            } else {
+                parent.path.clone()
+            };
             std::fs::rename(&target, target.with_extension("retained")).unwrap();
             std::fs::create_dir(&target).unwrap();
             assert!(leaf.verify().is_err());
-            assert!(leaf.atomic("blocked", b"new", 0o600, Some(None), "test").is_err());
+            assert!(leaf
+                .atomic("blocked", b"new", 0o600, Some(None), "test")
+                .is_err());
             assert!(!leaf.path.join("blocked").exists());
         }
     }
