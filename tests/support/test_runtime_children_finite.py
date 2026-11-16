@@ -383,7 +383,25 @@ class InstallerPolicyTests(unittest.TestCase):
         self.assertEqual(manager._select_end(1)[1], 1_100_000_000)
         with patch("source_qa_protocol.monotonic_ns", return_value=200_000_000):
             self.assertEqual(manager._select_end(600)[1], 1_100_000_000)
-        self.assertEqual(manager.owner.runtime_end_ns, 1_100_000_000)
+        self.assertEqual(manager.owner.runtime_end_ns, 4_100_000_000)
+
+    @patch("source_qa_protocol.monotonic_ns", return_value=100_000_000)
+    def test_short_slot_retains_actual_owner_admission_and_separate_cleanup(self, _clock):
+        for parent, original, slot_end in [
+                (None, 4_100_000_000, 1_100_000_000),
+                (3_000_000_000, 3_000_000_000, 1_100_000_000),
+                (800_000_000, 800_000_000, 800_000_000)]:
+            with self.subTest(parent=parent):
+                manager = self.manager(parent)
+                self.assertEqual(manager._select_end(1)[1], slot_end)
+                self.assertEqual(manager.hard_end, slot_end)
+                self.assertEqual(manager.owner.deadline_ns, original)
+                self.assertEqual(manager.owner.runtime_end_ns, original)
+                manager.owner.limit_end(700_000_000)
+                self.assertEqual(manager.owner.deadline_ns, 700_000_000)
+                self.assertEqual(manager.owner.runtime_end_ns, original)
+                self.assertEqual(manager._select_end(30)[1], 700_000_000)
+                self.assertEqual(manager.owner.runtime_end_ns, original)
 
     @patch("source_qa_protocol.monotonic_ns", return_value=100_000_000)
     def test_installer_route_is_closed_before_any_runtime_preparation(self, _clock):
