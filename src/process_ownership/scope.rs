@@ -25,7 +25,7 @@ const RESERVE_NS: u64 = 50_000_000;
 const MAX_IO_BYTES: usize = 4 * 1024 * 1024;
 const SLOTS_PER_TURN: usize = 8;
 /// Original maximum for one selected installation; an earlier parent always wins.
-pub const INSTALL_OPERATION_NS: u64 = 4_000_000_000;
+pub const INSTALL_OPERATION_NS: u64 = 30_000_000_000;
 const ORDINARY_OPERATION_NS: u64 = 1_000_000_000;
 fn error(reason: &'static str) -> io::Error {
     io::Error::other(reason)

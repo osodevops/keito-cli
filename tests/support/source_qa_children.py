@@ -10,8 +10,8 @@ import time
 from pathlib import Path
 
 
-# Kept at the historical value for the first behavioral RED.
-INSTALL_OPERATION_NS = 4_000_000_000
+# One original installation maximum; inherited parents always clip it.
+INSTALL_OPERATION_NS = 30_000_000_000
 
 
 class Cancelled(BaseException):
