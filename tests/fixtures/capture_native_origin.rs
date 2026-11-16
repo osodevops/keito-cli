@@ -575,7 +575,9 @@ fn execute(scope: &mut Scope, arguments: &[std::ffi::OsString]) -> io::Result<i3
 fn operation_duration(arguments: &[std::ffi::OsString]) -> u64 {
     if arguments.len() == 4
         && arguments[0] == "--installer-phases-diagnostic"
-        && arguments[1..].iter().all(|value| Path::new(value).is_absolute())
+        && arguments[1..]
+            .iter()
+            .all(|value| Path::new(value).is_absolute())
     {
         return keito_cli::process_ownership::scope::INSTALL_OPERATION_NS;
     }
@@ -640,12 +642,36 @@ mod diagnostic_tests {
     use super::*;
     #[test]
     fn installer_policy_fixture_selects_only_the_closed_installation_route() {
-        let args = |values: &[&str]| values.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
-        assert_eq!(operation_duration(&args(&["--installer-phases-diagnostic", "/owned/root", "/owned/root/case", "/owned/root/pair/keito"])), 30_000_000_000);
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            operation_duration(&args(&[
+                "--installer-phases-diagnostic",
+                "/owned/root",
+                "/owned/root/case",
+                "/owned/root/pair/keito"
+            ])),
+            30_000_000_000
+        );
         for values in [
             vec!["--installer-phases-diagnostic"],
-            vec!["--installer-phases-diagnostic", "relative", "/case", "/core"],
-            vec!["--installer-phases-diagnostic", "/root", "/case", "/core", "extra"],
+            vec![
+                "--installer-phases-diagnostic",
+                "relative",
+                "/case",
+                "/core",
+            ],
+            vec![
+                "--installer-phases-diagnostic",
+                "/root",
+                "/case",
+                "/core",
+                "extra",
+            ],
             vec!["--cli", "/root", "/case", "/core", "capture", "status"],
             vec!["--opaque-diagnostic", "/root", "/case", "/core", "no-op"],
             vec!["--version"],
@@ -654,7 +680,10 @@ mod diagnostic_tests {
         }
         assert_eq!(operation_duration(&args(&["--run"])), 1_000_000_000);
         assert_eq!(operation_duration(&args(&["--chain"])), 1_000_000_000);
-        assert_eq!(operation_duration(&args(&["--hook-probe-diagnostic"])), 500_000_000);
+        assert_eq!(
+            operation_duration(&args(&["--hook-probe-diagnostic"])),
+            500_000_000
+        );
     }
     #[test]
     fn opaque_diagnostic_selector_refuses_programs_and_extra_arguments() {

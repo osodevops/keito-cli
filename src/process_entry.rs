@@ -94,10 +94,22 @@ mod tests {
     #[test]
     fn installer_policy_preserves_earlier_parents_and_other_entry_limits() {
         let origin = 100_000_000;
-        assert_eq!(selected_end(origin, u64::MAX, true).unwrap(), 30_100_000_000);
-        assert_eq!(selected_end(origin, 4_000_000_000, true).unwrap(), 4_000_000_000);
-        assert_eq!(selected_end(origin, u64::MAX, false).unwrap(), 1_100_000_000);
-        assert_eq!(selected_end(origin, 300_000_000, false).unwrap(), 300_000_000);
+        assert_eq!(
+            selected_end(origin, u64::MAX, true).unwrap(),
+            30_100_000_000
+        );
+        assert_eq!(
+            selected_end(origin, 4_000_000_000, true).unwrap(),
+            4_000_000_000
+        );
+        assert_eq!(
+            selected_end(origin, u64::MAX, false).unwrap(),
+            1_100_000_000
+        );
+        assert_eq!(
+            selected_end(origin, 300_000_000, false).unwrap(),
+            300_000_000
+        );
         assert!(selected_end(u64::MAX - 20_000_000_000, u64::MAX, true).is_err());
     }
 }

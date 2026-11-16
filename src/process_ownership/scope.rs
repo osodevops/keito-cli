@@ -2122,9 +2122,7 @@ mod tests {
             .is_ok());
         assert_eq!(original, 30_000_000_000);
         assert_eq!(core.hard_end, original);
-        assert!(core
-            .publication_live(true, &mut || Ok(original))
-            .is_err());
+        assert!(core.publication_live(true, &mut || Ok(original)).is_err());
         assert_eq!(core.hard_end, original);
     }
     #[test]
