@@ -806,7 +806,10 @@ pub(crate) fn approve_with_runner(
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
-    use std::{io::{self, Write}, os::unix::fs::PermissionsExt};
+    use std::{
+        io::{self, Write},
+        os::unix::fs::PermissionsExt,
+    };
 
     #[test]
     fn version_probe_enable_preserves_closed_owner_reason_without_execution() {
@@ -818,7 +821,10 @@ mod tests {
                 stdout_cap: usize,
                 stderr_cap: usize,
             ) -> io::Result<crate::process_ownership::scope::CommandResult> {
-                assert_eq!(command.get_args().collect::<Vec<_>>(), vec![std::ffi::OsStr::new("--version")]);
+                assert_eq!(
+                    command.get_args().collect::<Vec<_>>(),
+                    vec![std::ffi::OsStr::new("--version")]
+                );
                 assert_eq!((stdout_cap, stderr_cap), (8192, 8192));
                 Err(io::Error::other(
                     crate::process_ownership::protocol::ProtocolError(self.0),
@@ -841,8 +847,8 @@ mod tests {
             ("SCOPE_PARENT_CANCELLED", "ownership"),
             ("PRIVATE_UNRECOGNIZED_FAULT", "ownership"),
         ] {
-            let error = observed_version(&native, &home, "0.167.0", &mut FailedProbe(fault))
-                .unwrap_err();
+            let error =
+                observed_version(&native, &home, "0.167.0", &mut FailedProbe(fault)).unwrap_err();
             let value: serde_json::Value = serde_json::from_str(&error.to_json()).unwrap();
             assert_eq!(value["code"], 8);
             assert_eq!(value["details"]["kind"], "capture_version_probe");
