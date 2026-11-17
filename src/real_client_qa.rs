@@ -97,6 +97,7 @@ enum Failure {
     Help,
     Evidence,
     Finality,
+    Interrupted,
 }
 type Result<T> = std::result::Result<T, Failure>;
 
@@ -682,7 +683,8 @@ struct Physical {
 }
 #[derive(Serialize)]
 struct Receipt<'a> {
-    passed: bool,
+    checks_passed_before_persistence: bool,
+    acceptance_requires_exit_zero: bool,
     primary: Option<Failure>,
     scope_clean: bool,
     resources_known: bool,
@@ -697,7 +699,8 @@ fn receipt<'a>(
     observations: &'a [Observation],
 ) -> Receipt<'a> {
     Receipt {
-        passed: primary.is_none() && report.clean && observations.len() == 4,
+        checks_passed_before_persistence: primary.is_none() && report.clean && observations.len() == 4,
+        acceptance_requires_exit_zero: true,
         primary,
         scope_clean: report.clean,
         resources_known: report.all_resources,
@@ -725,6 +728,102 @@ fn receipt<'a>(
         detached_descendants: "UNKNOWN",
         product_qualification: false,
     }
+}
+
+/// This candidate is written after the outcome receipts, but is deliberately
+/// not an acceptance assertion: its own persistence and terminal publication
+/// must still pass the final clock/cancellation gate, witnessed by exit zero.
+#[derive(Serialize)]
+struct AcceptanceCandidate {
+    kind: &'static str,
+    entry_ns: u64,
+    end_ns: u64,
+    after_outcome_persistence_ns: Option<u64>,
+    primary: Option<Failure>,
+    acceptance_requires_exit_zero: bool,
+    product_qualification: bool,
+}
+trait TerminalIo {
+    fn observe(&mut self) -> Result<u64>;
+    fn outcomes(&mut self, primary: Option<Failure>) -> Result<()>;
+    fn candidate(&mut self, candidate: &AcceptanceCandidate) -> Result<()>;
+    fn publish(&mut self, clean: bool) -> bool;
+}
+struct EntryTerminal<'a, F> {
+    scope: &'a mut Scope,
+    root: &'a Path,
+    persist_outcomes: F,
+}
+impl<F: FnMut(&Scope, Option<Failure>) -> Result<()>> TerminalIo for EntryTerminal<'_, F> {
+    fn observe(&mut self) -> Result<u64> {
+        self.scope.poll();
+        if crate::process_ownership::signals::pending() {
+            return Err(Failure::Interrupted);
+        }
+        if self.scope.failed() {
+            return Err(Failure::Finality);
+        }
+        monotonic_now().map_err(|_| Failure::Clock)
+    }
+    fn outcomes(&mut self, primary: Option<Failure>) -> Result<()> {
+        (self.persist_outcomes)(self.scope, primary)
+    }
+    fn candidate(&mut self, candidate: &AcceptanceCandidate) -> Result<()> {
+        write_receipt(self.root, "ACCEPTANCE-CANDIDATE.json", candidate)
+    }
+    fn publish(&mut self, clean: bool) -> bool {
+        self.scope.publish_terminal(clean)
+    }
+}
+fn terminal_checkpoint(
+    io: &mut impl TerminalIo,
+    entry: u64,
+    end: u64,
+    last: &mut u64,
+    primary: &mut Option<Failure>,
+) -> Option<u64> {
+    match io.observe().and_then(|at| {
+        if at < entry || at < *last || at >= end {
+            Err(Failure::Clock)
+        } else {
+            *last = at;
+            Ok(at)
+        }
+    }) {
+        Ok(at) => Some(at),
+        Err(error) => {
+            primary.get_or_insert(error);
+            None
+        }
+    }
+}
+fn finalize_terminal(
+    io: &mut impl TerminalIo,
+    entry: u64,
+    end: u64,
+    mut primary: Option<Failure>,
+) -> bool {
+    // RED scaffold retains the former premature-publication behavior. The
+    // finite fault tests below must reject it before the acceptance repair.
+    if !io.publish(primary.is_none()) {
+        primary.get_or_insert(Failure::Finality);
+    }
+    if let Err(error) = io.outcomes(primary) {
+        primary.get_or_insert(error);
+    }
+    let candidate = AcceptanceCandidate {
+        kind: "PROVISIONAL_OFFLINE_ACCEPTANCE",
+        entry_ns: entry,
+        end_ns: end,
+        after_outcome_persistence_ns: None,
+        primary,
+        acceptance_requires_exit_zero: true,
+        product_qualification: false,
+    };
+    if let Err(error) = io.candidate(&candidate) {
+        primary.get_or_insert(error);
+    }
+    primary.is_none()
 }
 /// Fixed CLI shape: exactly one fresh private case root. No program/argv/budget input.
 pub fn run_offline() -> bool {
@@ -778,31 +877,35 @@ pub fn run_offline() -> bool {
     if !report.clean {
         primary.get_or_insert(Failure::Finality);
     }
-    if !scope.publish_terminal(primary.is_none()) {
+    if !claimed {
+        scope.publish_terminal(false);
+        return false;
+    }
+    if observations.len() != 4 {
         primary.get_or_insert(Failure::Finality);
     }
-    if !first_attempted
-        && claimed
-        && write_receipt(
-            &root,
-            "FIRST.json",
-            &receipt(primary, &report, &observations),
-        )
-        .is_err()
-    {
-        primary.get_or_insert(Failure::Evidence);
-    }
-    if claimed
-        && write_receipt(
-            &root,
-            "FINAL.json",
-            &receipt(primary, &scope.report(), &observations),
-        )
-        .is_err()
-    {
-        primary.get_or_insert(Failure::Evidence);
-    }
-    primary.is_none() && report.clean && observations.len() == 4
+    let end = end.min(scope.hard_end());
+    finalize_terminal(
+        &mut EntryTerminal {
+            scope: &mut scope,
+            root: &root,
+            persist_outcomes: |scope: &Scope, primary| {
+                let report = scope.report();
+                let mut failure = None;
+                if !first_attempted {
+                    failure = write_receipt(&root, "FIRST.json", &receipt(primary, &report, &observations)).err();
+                }
+                let final_primary = primary.or(failure);
+                if let Err(error) = write_receipt(&root, "FINAL.json", &receipt(final_primary, &report, &observations)) {
+                    failure.get_or_insert(error);
+                }
+                failure.map_or(Ok(()), Err)
+            },
+        },
+        entry,
+        end,
+        primary,
+    )
 }
 
 fn permission_denied(error: &io::Error) -> bool {
@@ -855,27 +958,136 @@ fn policy_controls(scope: &mut Scope, root: PathBuf, entry: u64, end: u64) -> bo
         scope.begin_cancel(ProtocolError("DEV_CLIENT_POLICY_DENIAL"), end);
     }
     let report = scope.finish();
-    let terminal = scope.publish_terminal(operation_clean && report.clean);
-    let receipt = serde_json::json!({
+    let primary = if operation_clean && report.clean { None } else { Some(Failure::Finality) };
+    finalize_terminal(
+        &mut EntryTerminal {
+            scope,
+            root: &roots.root,
+            persist_outcomes: |scope: &Scope, primary| {
+                let report = scope.report();
+                let receipt = serde_json::json!({
         "kind": "OFFLINE_POLICY_CONTROLS", "file_open_permission_denied": file_denied,
         "udp_endpoint_permission_denied": udp_denied,
-        "scope_clean": report.clean, "terminal_clean": terminal,
+        "scope_clean": report.clean, "primary": primary,
+        "acceptance_requires_exit_zero": true,
         "entry_ns": entry, "end_ns": end, "client_invocations": 0,
         "no_datagram_send_or_listener_API": true,
         "original_profile_or_service_probe": false,
         "effective_policy_for_actual_clients": "NOT_YET_QUALIFIED",
-    });
-    let saved = write_receipt(&roots.root, "POLICY-CONTROLS.json", &receipt).is_ok();
-    operation_clean
-        && report.clean
-        && terminal
-        && saved
-        && monotonic_now().is_ok_and(|at| entry <= at && at < end)
+                });
+                write_receipt(&roots.root, "POLICY-CONTROLS.json", &receipt)
+            },
+        },
+        entry,
+        end,
+        primary,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum During {
+        Outcomes,
+        Candidate,
+        Publication,
+    }
+    struct FakeTerminal {
+        now: u64,
+        during: Option<During>,
+        advance: u64,
+        interrupted: bool,
+        interrupt: bool,
+        write_failed: bool,
+        observations: Vec<&'static str>,
+        published: Option<bool>,
+        candidate_time: Option<u64>,
+        candidate_primary: Option<Failure>,
+    }
+    impl FakeTerminal {
+        fn new(during: Option<During>, advance: u64, interrupt: bool) -> Self {
+            Self {
+                now: 101, during, advance, interrupted: false, interrupt,
+                write_failed: false, observations: vec![], published: None,
+                candidate_time: None, candidate_primary: None,
+            }
+        }
+        fn step(&mut self, during: During) {
+            if self.during == Some(during) {
+                self.now = self.advance;
+                self.interrupted |= self.interrupt;
+            }
+        }
+    }
+    impl TerminalIo for FakeTerminal {
+        fn observe(&mut self) -> Result<u64> {
+            self.observations.push("observe");
+            if self.interrupted { Err(Failure::Interrupted) } else { Ok(self.now) }
+        }
+        fn outcomes(&mut self, _: Option<Failure>) -> Result<()> {
+            self.observations.push("outcomes");
+            self.step(During::Outcomes);
+            if self.write_failed { Err(Failure::Evidence) } else { Ok(()) }
+        }
+        fn candidate(&mut self, candidate: &AcceptanceCandidate) -> Result<()> {
+            self.observations.push("candidate");
+            self.candidate_time = candidate.after_outcome_persistence_ns;
+            self.candidate_primary = candidate.primary;
+            assert!(candidate.acceptance_requires_exit_zero && !candidate.product_qualification);
+            self.step(During::Candidate);
+            Ok(())
+        }
+        fn publish(&mut self, clean: bool) -> bool {
+            self.observations.push("publish");
+            self.published = Some(clean);
+            self.step(During::Publication);
+            clean
+        }
+    }
+    #[test]
+    fn offline_client_terminal_rejects_deadline_during_outcome_candidate_or_publication() {
+        for stage in [During::Outcomes, During::Candidate, During::Publication] {
+            for late in [200, 201] {
+                let mut io = FakeTerminal::new(Some(stage), late, false);
+                assert!(!finalize_terminal(&mut io, 100, 200, None));
+            }
+        }
+    }
+    #[test]
+    fn offline_client_terminal_rejects_interruption_during_each_persistence_or_publication() {
+        for stage in [During::Outcomes, During::Candidate, During::Publication] {
+            let mut io = FakeTerminal::new(Some(stage), 102, true);
+            assert!(!finalize_terminal(&mut io, 100, 200, None));
+        }
+    }
+    #[test]
+    fn offline_client_terminal_witness_and_publication_follow_durable_outcomes() {
+        let mut io = FakeTerminal::new(None, 0, false);
+        assert!(finalize_terminal(&mut io, 100, 200, None));
+        assert_eq!(io.candidate_time, Some(101));
+        assert_eq!(io.observations, ["observe", "outcomes", "observe", "candidate", "observe", "publish", "observe"]);
+        assert_eq!(io.published, Some(true));
+    }
+    #[test]
+    fn offline_client_terminal_rejects_backwards_or_already_expired_inherited_end() {
+        let mut io = FakeTerminal::new(Some(During::Outcomes), 100, false);
+        assert!(!finalize_terminal(&mut io, 100, 200, None));
+        let mut io = FakeTerminal::new(None, 0, false);
+        assert!(!finalize_terminal(&mut io, 100, 101, None));
+    }
+    #[test]
+    fn offline_client_terminal_failure_preserves_first_error_and_never_publishes_success() {
+        let mut io = FakeTerminal::new(Some(During::Outcomes), 201, true);
+        io.write_failed = true;
+        assert!(!finalize_terminal(&mut io, 100, 200, Some(Failure::Version)));
+        assert_eq!(io.candidate_primary, Some(Failure::Version));
+        assert_eq!(io.published, Some(false));
+        let mut io = FakeTerminal::new(None, 0, false);
+        io.write_failed = true;
+        assert!(!finalize_terminal(&mut io, 100, 200, None));
+        assert_eq!(io.published, Some(false));
+    }
     #[test]
     fn offline_client_descriptor_projection_covers_high_fds_and_rejects_ambiguous_tables() {
         assert_eq!(normalize_descriptors(vec![2000, 0, 2, 1]).unwrap(), [2000]);
