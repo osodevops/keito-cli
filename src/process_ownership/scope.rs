@@ -27,6 +27,14 @@ const SLOTS_PER_TURN: usize = 8;
 /// Original maximum for one selected installation; an earlier parent always wins.
 pub const INSTALL_OPERATION_NS: u64 = 30_000_000_000;
 const ORDINARY_OPERATION_NS: u64 = 1_000_000_000;
+
+// The fixed developer version/help lane has the ordinary one-second owner.
+// Keep the selector closed; callers cannot supply a keeper policy or duration.
+#[cfg(feature = "dev-tools")]
+pub(super) fn dev_client_keeper_policy() -> CleanupPolicy {
+    CleanupPolicy::HookShort
+}
+
 fn error(reason: &'static str) -> io::Error {
     io::Error::other(reason)
 }
@@ -1416,7 +1424,9 @@ impl Scope {
             .core
             .admit_dev_client(at, capacity, selected_end, |owner, end| {
                 let pipes = plan.prepare().map_err(|_| error("SCOPE_IO_PREPARE"))?;
-                let lease = GroupLease::spawn_verified_keeper(owner, image, end)?;
+                let lease = GroupLease::spawn_verified_keeper_with_policy(
+                    owner, image, end, dev_client_keeper_policy(),
+                )?;
                 Ok(ProductEdge::Group(GroupEdge {
                     lease,
                     command: Some(command),

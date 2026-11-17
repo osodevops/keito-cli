@@ -3411,3 +3411,39 @@ mod short_policy_tests {
         assert_eq!(session.first_fault, Some("KEEPER_LIFETIME"));
     }
 }
+
+
+#[cfg(all(test, feature = "dev-tools"))]
+mod dev_client_keeper_policy_tests {
+    use super::*;
+    fn selected() -> CleanupPolicy {
+        super::super::scope::dev_client_keeper_policy()
+    }
+    #[test]
+    fn dev_client_keeper_policy_uses_remaining_ordinary_setup_before_cleanup() {
+        let admitted = 100_000_000;
+        let hard = 1_100_000_000;
+        let setup_end = selected().setup_end(admitted, hard);
+        assert_eq!(setup_end, 1_050_000_000);
+        // A READY observation after the hook window can be timely for a
+        // one-second native command, but never beyond that command's end.
+        assert!(admitted + 30_000_000 < setup_end);
+        assert_eq!(selected().reserve_ns(), 50_000_000);
+        assert_eq!(selected().term_ns(), 15_000_000);
+    }
+    #[test]
+    fn dev_client_keeper_policy_honors_earlier_parent_without_restarting_setup() {
+        let hard = 180_000_000;
+        assert_eq!(selected().setup_end(100_000_000, hard), 130_000_000);
+        assert_eq!(selected().setup_end(120_000_000, hard), 130_000_000);
+        assert!(Lifetime::with_policy(130_000_000, hard, selected()).is_err());
+    }
+    #[test]
+    fn dev_client_keeper_policy_is_closed_and_keeps_hook_policy_unchanged() {
+        assert_eq!(selected(), CleanupPolicy::CommandProbe);
+        assert_eq!(CleanupPolicy::keeper_tag(Some("command-probe-v1")).unwrap(), selected());
+        assert_eq!(CleanupPolicy::HookShort.setup_end(100_000_000, 1_100_000_000), 120_000_000);
+        assert_eq!(CleanupPolicy::HookShort.reserve_ns(), 50_000_000);
+        assert_eq!(CleanupPolicy::HookShort.term_ns(), 15_000_000);
+    }
+}
