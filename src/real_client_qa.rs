@@ -699,7 +699,9 @@ fn receipt<'a>(
     observations: &'a [Observation],
 ) -> Receipt<'a> {
     Receipt {
-        checks_passed_before_persistence: primary.is_none() && report.clean && observations.len() == 4,
+        checks_passed_before_persistence: primary.is_none()
+            && report.clean
+            && observations.len() == 4,
         acceptance_requires_exit_zero: true,
         primary,
         scope_clean: report.clean,
@@ -902,10 +904,19 @@ pub fn run_offline() -> bool {
                 let report = scope.report();
                 let mut failure = None;
                 if !first_attempted {
-                    failure = write_receipt(&root, "FIRST.json", &receipt(primary, &report, &observations)).err();
+                    failure = write_receipt(
+                        &root,
+                        "FIRST.json",
+                        &receipt(primary, &report, &observations),
+                    )
+                    .err();
                 }
                 let final_primary = primary.or(failure);
-                if let Err(error) = write_receipt(&root, "FINAL.json", &receipt(final_primary, &report, &observations)) {
+                if let Err(error) = write_receipt(
+                    &root,
+                    "FINAL.json",
+                    &receipt(final_primary, &report, &observations),
+                ) {
                     failure.get_or_insert(error);
                 }
                 failure.map_or(Ok(()), Err)
@@ -967,7 +978,11 @@ fn policy_controls(scope: &mut Scope, root: PathBuf, entry: u64, end: u64) -> bo
         scope.begin_cancel(ProtocolError("DEV_CLIENT_POLICY_DENIAL"), end);
     }
     let report = scope.finish();
-    let primary = if operation_clean && report.clean { None } else { Some(Failure::Finality) };
+    let primary = if operation_clean && report.clean {
+        None
+    } else {
+        Some(Failure::Finality)
+    };
     finalize_terminal(
         &mut EntryTerminal {
             scope,
@@ -975,15 +990,15 @@ fn policy_controls(scope: &mut Scope, root: PathBuf, entry: u64, end: u64) -> bo
             persist_outcomes: |scope: &Scope, primary| {
                 let report = scope.report();
                 let receipt = serde_json::json!({
-        "kind": "OFFLINE_POLICY_CONTROLS", "file_open_permission_denied": file_denied,
-        "udp_endpoint_permission_denied": udp_denied,
-        "scope_clean": report.clean, "primary": primary,
-        "acceptance_requires_exit_zero": true,
-        "entry_ns": entry, "end_ns": end, "client_invocations": 0,
-        "no_datagram_send_or_listener_API": true,
-        "original_profile_or_service_probe": false,
-        "effective_policy_for_actual_clients": "NOT_YET_QUALIFIED",
-                });
+                "kind": "OFFLINE_POLICY_CONTROLS", "file_open_permission_denied": file_denied,
+                "udp_endpoint_permission_denied": udp_denied,
+                "scope_clean": report.clean, "primary": primary,
+                "acceptance_requires_exit_zero": true,
+                "entry_ns": entry, "end_ns": end, "client_invocations": 0,
+                "no_datagram_send_or_listener_API": true,
+                "original_profile_or_service_probe": false,
+                "effective_policy_for_actual_clients": "NOT_YET_QUALIFIED",
+                        });
                 write_receipt(&roots.root, "POLICY-CONTROLS.json", &receipt)
             },
         },
@@ -1017,9 +1032,16 @@ mod tests {
     impl FakeTerminal {
         fn new(during: Option<During>, advance: u64, interrupt: bool) -> Self {
             Self {
-                now: 101, during, advance, interrupted: false, interrupt,
-                write_failed: false, observations: vec![], published: None,
-                candidate_time: None, candidate_primary: None,
+                now: 101,
+                during,
+                advance,
+                interrupted: false,
+                interrupt,
+                write_failed: false,
+                observations: vec![],
+                published: None,
+                candidate_time: None,
+                candidate_primary: None,
             }
         }
         fn step(&mut self, during: During) {
@@ -1032,12 +1054,20 @@ mod tests {
     impl TerminalIo for FakeTerminal {
         fn observe(&mut self) -> Result<u64> {
             self.observations.push("observe");
-            if self.interrupted { Err(Failure::Interrupted) } else { Ok(self.now) }
+            if self.interrupted {
+                Err(Failure::Interrupted)
+            } else {
+                Ok(self.now)
+            }
         }
         fn outcomes(&mut self, _: Option<Failure>) -> Result<()> {
             self.observations.push("outcomes");
             self.step(During::Outcomes);
-            if self.write_failed { Err(Failure::Evidence) } else { Ok(()) }
+            if self.write_failed {
+                Err(Failure::Evidence)
+            } else {
+                Ok(())
+            }
         }
         fn candidate(&mut self, candidate: &AcceptanceCandidate) -> Result<()> {
             self.observations.push("candidate");
@@ -1075,7 +1105,18 @@ mod tests {
         let mut io = FakeTerminal::new(None, 0, false);
         assert!(finalize_terminal(&mut io, 100, 200, None));
         assert_eq!(io.candidate_time, Some(101));
-        assert_eq!(io.observations, ["observe", "outcomes", "observe", "candidate", "observe", "publish", "observe"]);
+        assert_eq!(
+            io.observations,
+            [
+                "observe",
+                "outcomes",
+                "observe",
+                "candidate",
+                "observe",
+                "publish",
+                "observe"
+            ]
+        );
         assert_eq!(io.published, Some(true));
     }
     #[test]
@@ -1089,7 +1130,12 @@ mod tests {
     fn offline_client_terminal_failure_preserves_first_error_and_never_publishes_success() {
         let mut io = FakeTerminal::new(Some(During::Outcomes), 201, true);
         io.write_failed = true;
-        assert!(!finalize_terminal(&mut io, 100, 200, Some(Failure::Version)));
+        assert!(!finalize_terminal(
+            &mut io,
+            100,
+            200,
+            Some(Failure::Version)
+        ));
         assert_eq!(io.candidate_primary, Some(Failure::Version));
         assert_eq!(io.published, Some(false));
         let mut io = FakeTerminal::new(None, 0, false);
