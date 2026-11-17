@@ -23,14 +23,14 @@ pub mod commands;
 pub mod config;
 pub mod error;
 pub mod output;
-#[cfg(all(feature = "dev-tools", unix))]
-pub mod real_client_qa;
 #[cfg(unix)]
 #[doc(hidden)]
 pub mod process_entry;
 #[cfg(unix)]
 #[doc(hidden)]
 pub mod process_ownership;
+#[cfg(all(feature = "dev-tools", unix))]
+pub mod real_client_qa;
 pub mod skill_adapter;
 #[cfg(all(feature = "dev-tools", unix))]
 pub mod source_qa_group;

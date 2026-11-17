@@ -532,7 +532,8 @@ impl<E: Edge> Core<E> {
         selected_end: u64,
         create: impl FnOnce(SharedOwner, u64) -> io::Result<E>,
     ) -> io::Result<SlotId> {
-        if self.installer.is_some() || self.slots.len() >= 4
+        if self.installer.is_some()
+            || self.slots.len() >= 4
             || self.slots.iter().any(|slot| slot.accepted_at.is_none())
         {
             self.poison("DEV_CLIENT_ADMISSION");
@@ -549,11 +550,15 @@ impl<E: Edge> Core<E> {
     }
     #[cfg(feature = "dev-tools")]
     fn release_dev_completed(&mut self, ledgers_complete: bool) -> io::Result<()> {
-        if !ledgers_complete || self.installer.is_some() || self.slots.is_empty()
-            || self.cancel_end.is_some() || self.finish_called
+        if !ledgers_complete
+            || self.installer.is_some()
+            || self.slots.is_empty()
+            || self.cancel_end.is_some()
+            || self.finish_called
             || self.owner.borrow().check_admission().is_err()
             || self.slots.iter().any(|slot| {
-                !slot.output_taken || !slot.edge.facts().resources_complete()
+                !slot.output_taken
+                    || !slot.edge.facts().resources_complete()
                     || slot.accepted_at.is_none_or(|at| at >= slot.hard_end)
             })
         {
@@ -1403,15 +1408,25 @@ impl Scope {
             }
         };
         let capacity = plan.capacity();
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let result = self.core.admit_dev_client(at, capacity, selected_end, |owner, end| {
-            let pipes = plan.prepare().map_err(|_| error("SCOPE_IO_PREPARE"))?;
-            let lease = GroupLease::spawn_verified_keeper(owner, image, end)?;
-            Ok(ProductEdge::Group(GroupEdge {
-                lease, command: Some(command), pipes, stage: Stage::Ready,
-                proof: false, first_fault: None, published: [false; 4],
-            }))
-        });
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let result = self
+            .core
+            .admit_dev_client(at, capacity, selected_end, |owner, end| {
+                let pipes = plan.prepare().map_err(|_| error("SCOPE_IO_PREPARE"))?;
+                let lease = GroupLease::spawn_verified_keeper(owner, image, end)?;
+                Ok(ProductEdge::Group(GroupEdge {
+                    lease,
+                    command: Some(command),
+                    pipes,
+                    stage: Stage::Ready,
+                    proof: false,
+                    first_fault: None,
+                    published: [false; 4],
+                }))
+            });
         if result.is_err() {
             self.begin_cancel(ProtocolError("DEV_CLIENT_ADMISSION"), selected_end);
         }
@@ -1760,7 +1775,11 @@ mod tests {
     #[test]
     fn offline_client_completed_leaf_cache_releases_only_after_proven_collection() {
         let mut core = Core::new(std::rc::Rc::default(), 4_000_000_000);
-        let slot = core.admit_dev_client(100, 0, 1_000_000_100, |_, _| Ok(fake("collected", std::rc::Rc::default()))).unwrap();
+        let slot = core
+            .admit_dev_client(100, 0, 1_000_000_100, |_, _| {
+                Ok(fake("collected", std::rc::Rc::default()))
+            })
+            .unwrap();
         core.request_complete(&slot, 200).unwrap();
         core.poll(&mut || Ok(201));
         core.take_result(&slot).unwrap();
@@ -1768,13 +1787,21 @@ mod tests {
         assert_eq!(core.hard_end, 4_000_000_000);
         assert_eq!(core.slots[0].hard_end, 1_000_000_100);
         assert_eq!(core.active_end(), 4_000_000_000);
-        assert!(core.admit_dev_client(1_500_000_000, 0, 2_500_000_000, |_, _| Ok(fake("next", std::rc::Rc::default()))).is_ok());
+        assert!(core
+            .admit_dev_client(1_500_000_000, 0, 2_500_000_000, |_, _| Ok(fake(
+                "next",
+                std::rc::Rc::default()
+            )))
+            .is_ok());
     }
     #[cfg(feature = "dev-tools")]
     #[test]
     fn offline_client_incomplete_or_unforwarded_collection_cannot_release_cache() {
         let mut core = Core::new(std::rc::Rc::default(), 4_000_000_000);
-        core.admit_dev_client(100, 0, 1_000_000_100, |_, _| Ok(fake("unproved", std::rc::Rc::default()))).unwrap();
+        core.admit_dev_client(100, 0, 1_000_000_100, |_, _| {
+            Ok(fake("unproved", std::rc::Rc::default()))
+        })
+        .unwrap();
         assert!(core.release_dev_completed(false).is_err());
         assert_eq!(core.active_end(), 1_000_000_100);
     }
@@ -1787,7 +1814,8 @@ mod tests {
         core.admit_dev_client(100, 8, 1_000_000_100, |_, end| {
             captured.set(end);
             Ok(fake("offline", events.clone()))
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(core.hard_end, 4_000_000_000);
         assert_eq!(core.slots[0].hard_end, 1_000_000_100);
         assert_eq!(captured.get(), 1_000_000_100);
@@ -1797,12 +1825,17 @@ mod tests {
     fn offline_client_does_not_admit_a_successor_with_unsettled_previous_slot() {
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut core = Core::new(std::rc::Rc::default(), 4_000_000_000);
-        core.admit_dev_client(100, 0, 1_000_000_100, |_, _| Ok(fake("first", events.clone()))).unwrap();
+        core.admit_dev_client(100, 0, 1_000_000_100, |_, _| {
+            Ok(fake("first", events.clone()))
+        })
+        .unwrap();
         let created = std::cell::Cell::new(false);
-        assert!(core.admit_dev_client(200, 0, 1_000_000_200, |_, _| {
-            created.set(true);
-            Ok(fake("second", events.clone()))
-        }).is_err());
+        assert!(core
+            .admit_dev_client(200, 0, 1_000_000_200, |_, _| {
+                created.set(true);
+                Ok(fake("second", events.clone()))
+            })
+            .is_err());
         assert!(!created.get());
         assert_eq!(core.slots.len(), 1);
     }
@@ -1815,10 +1848,16 @@ mod tests {
             core.admit_dev_client(100, 0, 1_000_000_100, |_, end| {
                 assert_eq!(end, 700_000_000);
                 Ok(fake("parent", events.clone()))
-            }).unwrap();
+            })
+            .unwrap();
             core.slots[i].accepted_at = Some(101);
         }
-        assert!(core.admit_dev_client(100, 0, 1_000_000_100, |_, _| Ok(fake("fifth", events.clone()))).is_err());
+        assert!(core
+            .admit_dev_client(100, 0, 1_000_000_100, |_, _| Ok(fake(
+                "fifth",
+                events.clone()
+            )))
+            .is_err());
     }
     use super::*;
     use std::{cell::RefCell, os::unix::process::ExitStatusExt};
