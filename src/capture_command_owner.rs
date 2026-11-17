@@ -312,7 +312,7 @@ impl<'a> CommandOwner<'a> {
                 .scope
                 .first_fault()
                 .map(|fault| crate::capture::HookOwnerFault::from_static(fault.0)),
-            setup: self.scope.first_setup_trace().map(hook_setup_probe),
+            setup: self.scope.first_fault_setup_trace().map(hook_setup_probe),
         }
     }
     pub(crate) fn finish<T>(&mut self, result: Result<T, AppError>) -> Result<T, AppError> {
@@ -387,6 +387,17 @@ fn hook_setup_probe(
 ) -> crate::capture::HookSetupProbe {
     let offset = |at: u64| at.checked_sub(trace.setup_start_ns);
     crate::capture::HookSetupProbe {
+        fault_state: trace.fault_origin.map(|(_, state)| match state {
+            "AWAIT_READY" => crate::capture::HookGroupState::AwaitReady,
+            "READY" => crate::capture::HookGroupState::Ready,
+            "JOINED" => crate::capture::HookGroupState::Joined,
+            "PARKED" => crate::capture::HookGroupState::Parked,
+            "CLEANING" => crate::capture::HookGroupState::Cleaning,
+            "GONE" => crate::capture::HookGroupState::Gone,
+            "RELEASED" => crate::capture::HookGroupState::Released,
+            "FAILED" => crate::capture::HookGroupState::Failed,
+            _ => crate::capture::HookGroupState::Other,
+        }),
         ready_window_ns: offset(trace.ready_end_ns),
         pre_spawn_offset_ns: offset(trace.pre_spawn_ns),
         spawn_return_offset_ns: trace.spawn_return_ns.and_then(offset),
@@ -461,6 +472,7 @@ mod tests {
             ready_frame_observed: false,
             ready_eof_observed: false,
             deadline_observed: Some(("READY_BEFORE_RECEIVE", 127)),
+            fault_origin: None,
         });
         assert_eq!(probe.ready_window_ns, Some(20));
         assert_eq!(probe.pre_spawn_offset_ns, Some(15));
@@ -488,6 +500,7 @@ mod tests {
             ready_frame_observed: false,
             ready_eof_observed: false,
             deadline_observed: None,
+            fault_origin: None,
         });
         assert!(probe.ready_window_ns.is_none());
         assert!(probe.pre_spawn_offset_ns.is_none());
@@ -495,6 +508,33 @@ mod tests {
         assert!(probe.first_ready_poll_offset_ns.is_none());
         assert!(probe.deadline_offset_ns.is_none());
         assert!(probe.deadline_edge.is_none());
+    }
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn failure_setup_trace_state_is_closed_and_missing_origin_stays_unknown() {
+        use crate::capture::HookGroupState;
+        use crate::process_ownership::group::SetupTrace;
+        assert!(hook_setup_probe(SetupTrace::default())
+            .fault_state
+            .is_none());
+        for (state, expected) in [
+            ("AWAIT_READY", HookGroupState::AwaitReady),
+            ("READY", HookGroupState::Ready),
+            ("JOINED", HookGroupState::Joined),
+            ("PARKED", HookGroupState::Parked),
+            ("CLEANING", HookGroupState::Cleaning),
+            ("GONE", HookGroupState::Gone),
+            ("RELEASED", HookGroupState::Released),
+            ("FAILED", HookGroupState::Failed),
+            ("PRIVATE_RAW_CANARY", HookGroupState::Other),
+        ] {
+            let probe = hook_setup_probe(SetupTrace {
+                fault_origin: Some(("GROUP_DEADLINE", state)),
+                ..Default::default()
+            });
+            assert_eq!(probe.fault_state, Some(expected));
+            assert!(!serde_json::to_string(&probe).unwrap().contains("PRIVATE"));
+        }
     }
     #[test]
     fn installer_dropped_unsealed_handle_keeps_its_borrowed_owner_failed() {

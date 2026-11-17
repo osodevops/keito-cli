@@ -1556,6 +1556,7 @@ mod tests {
                     ready_frame_observed: false,
                     ready_eof_observed: true,
                     deadline_observed: Some(("READY_BEFORE_RECEIVE", 31)),
+                    fault_origin: None,
                 }),
             }],
         }

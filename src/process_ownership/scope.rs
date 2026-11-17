@@ -457,6 +457,18 @@ impl<E: Edge> Core<E> {
             entry_selected: false,
         }
     }
+    #[cfg(feature = "dev-tools")]
+    fn first_fault_setup_trace(&self) -> Option<super::group::SetupTrace> {
+        let first = self.owner.borrow().first_fault?;
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.edge.setup_trace())
+            .find(|trace| {
+                trace
+                    .fault_origin
+                    .is_some_and(|(reason, _)| reason == first.0)
+            })
+    }
     fn poison(&mut self, reason: &'static str) {
         self.owner.borrow_mut().poison(ProtocolError(reason));
     }
@@ -1150,11 +1162,8 @@ impl Scope {
         self.core.owner.borrow().first_fault
     }
     #[cfg(feature = "dev-tools")]
-    pub(crate) fn first_setup_trace(&self) -> Option<super::group::SetupTrace> {
-        self.core
-            .slots
-            .iter()
-            .find_map(|slot| slot.edge.setup_trace())
+    pub(crate) fn first_fault_setup_trace(&self) -> Option<super::group::SetupTrace> {
+        self.core.first_fault_setup_trace()
     }
     pub(crate) fn begin_installer_preflight(&mut self, expected: usize) -> io::Result<()> {
         self.poll();
@@ -1973,8 +1982,14 @@ mod tests {
         fail_begin: bool,
         begin_ends: Vec<u64>,
         setup_pending: bool,
+        #[cfg(feature = "dev-tools")]
+        setup_trace: Option<super::super::group::SetupTrace>,
     }
     impl Edge for Fake {
+        #[cfg(feature = "dev-tools")]
+        fn setup_trace(&self) -> Option<super::super::group::SetupTrace> {
+            self.setup_trace
+        }
         fn setup_pending(&self) -> bool {
             self.setup_pending
         }
@@ -2026,8 +2041,66 @@ mod tests {
             fail_begin: false,
             begin_ends: vec![],
             setup_pending: false,
+            #[cfg(feature = "dev-tools")]
+            setup_trace: None,
         }
     }
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn failure_setup_trace_never_substitutes_a_healthy_sibling_or_unmatched_fault() {
+        use super::super::group::SetupTrace;
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        let healthy = core
+            .admit(1, 32, |_| Ok(fake("healthy", Rc::default())))
+            .unwrap();
+        core.slots[healthy.index].edge.setup_trace = Some(SetupTrace {
+            setup_start_ns: 10,
+            ready_frame_observed: true,
+            ..Default::default()
+        });
+        assert!(core.first_fault_setup_trace().is_none());
+        core.poison("GROUP_DEADLINE");
+        assert!(core.first_fault_setup_trace().is_none());
+        core.slots[healthy.index]
+            .edge
+            .setup_trace
+            .as_mut()
+            .unwrap()
+            .fault_origin = Some(("GROUP_IO", "JOINED"));
+        assert!(core.first_fault_setup_trace().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn failure_setup_trace_selects_the_origin_after_a_healthy_first_slot() {
+        use super::super::group::SetupTrace;
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        let healthy = core
+            .admit(1, 32, |_| Ok(fake("healthy", Rc::default())))
+            .unwrap();
+        let failed = core
+            .admit(2, 32, |_| Ok(fake("failed", Rc::default())))
+            .unwrap();
+        core.slots[healthy.index].edge.setup_trace = Some(SetupTrace {
+            setup_start_ns: 10,
+            ready_frame_observed: true,
+            ..Default::default()
+        });
+        core.slots[failed.index].edge.setup_trace = Some(SetupTrace {
+            setup_start_ns: 20,
+            fault_origin: Some(("GROUP_DEADLINE", "AWAIT_READY")),
+            ..Default::default()
+        });
+        core.poison("GROUP_DEADLINE");
+        let selected = core.first_fault_setup_trace().unwrap();
+        assert_eq!(selected.setup_start_ns, 20);
+        assert_eq!(
+            selected.fault_origin,
+            Some(("GROUP_DEADLINE", "AWAIT_READY"))
+        );
+        assert!(!selected.ready_frame_observed);
+    }
+
     #[test]
     fn repository_admission_pending_setup_blocks_without_waiting_for_workload_completion() {
         let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);

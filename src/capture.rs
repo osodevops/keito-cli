@@ -884,9 +884,25 @@ pub enum HookReadyEdge {
     AfterReceive,
 }
 #[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookGroupState {
+    AwaitReady,
+    Ready,
+    Joined,
+    Parked,
+    Cleaning,
+    Gone,
+    Released,
+    Failed,
+    Other,
+}
+#[cfg(feature = "dev-tools")]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookSetupProbe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault_state: Option<HookGroupState>,
     pub ready_window_ns: Option<u64>,
     pub pre_spawn_offset_ns: Option<u64>,
     pub spawn_return_offset_ns: Option<u64>,
@@ -3050,12 +3066,14 @@ mod failure_probe_tests {
             "ready_frame_observed": false,
             "ready_eof_observed": false,
             "deadline_edge": "before_receive",
+            "fault_state": "await_ready",
         });
         let failure: CaptureFailure = serde_json::from_value(marker.clone()).unwrap();
         assert!(serde_json::to_vec(&failure).unwrap().len() <= 1024);
         assert_eq!(serde_json::to_value(failure).unwrap(), marker);
         for (key, value) in [
             ("deadline_edge", serde_json::json!("PRIVATE_RAW_CANARY")),
+            ("fault_state", serde_json::json!("PRIVATE_RAW_CANARY")),
             ("unknown", serde_json::json!("PRIVATE_RAW_CANARY")),
         ] {
             let mut invalid = marker.clone();

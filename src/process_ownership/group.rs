@@ -589,7 +589,7 @@ fn safe_reason(error: &io::Error) -> &'static str {
 
 /// Developer-only observations, never a timing or cleanup capability.
 #[cfg(feature = "dev-tools")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SetupTrace {
     pub setup_start_ns: u64,
     pub ready_end_ns: u64,
@@ -601,6 +601,28 @@ pub struct SetupTrace {
     pub ready_frame_observed: bool,
     pub ready_eof_observed: bool,
     pub deadline_observed: Option<(&'static str, u64)>,
+    pub fault_origin: Option<(&'static str, &'static str)>,
+}
+
+#[cfg(feature = "dev-tools")]
+impl SetupTrace {
+    fn note_fault_origin(&mut self, owner: &SharedOwner, phase: Phase, reason: &'static str) {
+        // Only the edge that first poisons the containing owner may claim it.
+        // Sibling cancellation and later cleanup cannot replace that origin.
+        if owner.borrow().first_fault.is_none() && self.fault_origin.is_none() {
+            let state = match phase {
+                Phase::AwaitReady => "AWAIT_READY",
+                Phase::Ready => "READY",
+                Phase::Joined => "JOINED",
+                Phase::Parked => "PARKED",
+                Phase::Cleaning => "CLEANING",
+                Phase::Gone => "GONE",
+                Phase::Released => "RELEASED",
+                Phase::Failed => "FAILED",
+            };
+            self.fault_origin = Some((reason, state));
+        }
+    }
 }
 
 /// Register immediately after spawn_keeper, BEFORE await_ready/start/receipts.
@@ -814,6 +836,7 @@ impl GroupLease {
             ready_frame_observed: false,
             ready_eof_observed: false,
             deadline_observed: None,
+            fault_origin: None,
         });
         #[cfg(feature = "dev-tools")]
         let mut settlement = Box::new(if policy == CleanupPolicy::Legacy {
@@ -872,6 +895,9 @@ impl GroupLease {
     }
 
     fn fail(&mut self, reason: &'static str) {
+        #[cfg(feature = "dev-tools")]
+        self.setup_trace
+            .note_fault_origin(&self.owner, self.settlement.progress.phase, reason);
         self.settlement.progress.fail(reason);
         let first = self.settlement.progress.first_fault.unwrap();
         self.owner.borrow_mut().poison(ProtocolError(first));
@@ -3158,6 +3184,24 @@ mod tests {
 #[cfg(test)]
 mod short_policy_tests {
     use super::*;
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn failure_setup_trace_origin_is_sticky_and_excludes_sibling_cancellation() {
+        let owner: SharedOwner = Default::default();
+        let mut first = SetupTrace::default();
+        let mut sibling = SetupTrace::default();
+        first.note_fault_origin(&owner, Phase::Joined, "GROUP_DEADLINE");
+        owner.borrow_mut().poison(ProtocolError("GROUP_DEADLINE"));
+        first.note_fault_origin(&owner, Phase::Cleaning, "GROUP_IO");
+        sibling.note_fault_origin(&owner, Phase::AwaitReady, "GROUP_DEADLINE");
+        assert_eq!(first.fault_origin, Some(("GROUP_DEADLINE", "JOINED")));
+        assert!(sibling.fault_origin.is_none());
+        assert_eq!(
+            owner.borrow().first_fault,
+            Some(ProtocolError("GROUP_DEADLINE"))
+        );
+    }
+
     use std::os::unix::net::UnixStream;
     struct Group {
         actions: Vec<&'static str>,
