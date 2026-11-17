@@ -239,7 +239,11 @@ fn assert_concurrent_hooks(count: usize, seed_age_seconds: i64) {
         "seconds={} attention={} stop_clock=[{},{}]",
         segment.duration_seconds, sessions[0].needs_attention, earliest_stop_wall, latest_stop_wall
     );
-    assert!(!sessions[0].needs_attention);
+    assert!(
+        !sessions[0].needs_attention,
+        "completed stop requires review: {}",
+        capture_failure_diagnostics(&store)
+    );
     assert_eq!(segment_start, start.wall);
     assert!((earliest_stop_wall..=latest_stop_wall).contains(&segment_end));
     assert_eq!(segment.duration_seconds, segment_end - start.wall);
@@ -249,6 +253,26 @@ fn assert_concurrent_hooks(count: usize, seed_age_seconds: i64) {
     );
     assert_eq!(sessions[0].revision, 1);
     assert_no_private_content(&capture_dir);
+}
+
+// Read only bounded metadata from this test's synthetic capture directory,
+// after an assertion has already failed. A silent guard exit is not proof
+// that its core acknowledged or that every owned descendant terminated.
+fn capture_failure_diagnostics(store: &Store) -> serde_json::Value {
+    let status = match store.status() {
+        Ok(status) => serde_json::json!({
+            "storage_paused": status.storage_paused,
+            "storage_reason": status.storage_reason,
+            "pending_invocations": status.pending_invocations,
+            "pending": status.pending,
+            "held": status.held,
+            "needs_attention": status.needs_attention,
+            "unfinished": status.unfinished,
+            "capture_failure": status.capture_failure,
+        }),
+        Err(error) => serde_json::json!({ "error": error.to_string() }),
+    };
+    serde_json::json!({ "status": status, "descendant_finality": "UNPROVED" })
 }
 
 fn assert_no_private_content(directory: &std::path::Path) {
@@ -503,7 +527,12 @@ fn assert_refused_stop(duplicate_contended: bool) {
     assert_eq!(session.segments[0].duration_seconds, 0);
     assert_eq!(session.segments[0].completeness, "INCOMPLETE");
     assert!(store.status().unwrap().storage_paused);
-    store.recover(&Clock::now().unwrap()).unwrap();
+    store.recover(&Clock::now().unwrap()).unwrap_or_else(|error| {
+        panic!(
+            "explicit recovery refused after directly waiting both guards: error={error}; duplicate_contended={duplicate_contended}; remaining={}",
+            capture_failure_diagnostics(&store)
+        )
+    });
     let queued = store
         .claim(&binding, chrono::Utc::now().timestamp())
         .unwrap()
