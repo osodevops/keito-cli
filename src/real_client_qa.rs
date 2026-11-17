@@ -158,9 +158,12 @@ struct Stamp {
 // normalization here; the pre-exec callback performs no allocation or logging.
 #[allow(clippy::unnecessary_cast)]
 fn stat_matches(m: &libc::stat, expected: Stamp) -> bool {
-    m.st_dev as u64 == expected.device && m.st_ino as u64 == expected.inode
-        && m.st_uid == expected.uid && m.st_mode as u32 == expected.mode
-        && m.st_nlink as u64 == expected.links && m.st_size as u64 == expected.bytes
+    m.st_dev as u64 == expected.device
+        && m.st_ino as u64 == expected.inode
+        && m.st_uid == expected.uid
+        && m.st_mode as u32 == expected.mode
+        && m.st_nlink as u64 == expected.links
+        && m.st_size as u64 == expected.bytes
 }
 impl Stamp {
     fn of(m: &Metadata) -> Self {
@@ -225,13 +228,14 @@ struct Roots {
     root: PathBuf,
     held: Vec<(PathBuf, File, u64, u64)>,
 }
+#[cfg(any(target_os = "macos", test))]
 fn normalize_descriptors(mut fds: Vec<i32>) -> Result<Vec<i32>> {
     if fds.len() >= 4096 || fds.iter().any(|fd| *fd < 0) {
         return Err(Failure::Admission);
     }
     fds.sort_unstable();
-    if fds.windows(2).any(|pair| pair[0] == pair[1])
-        || [0, 1, 2].iter().any(|fd| !fds.contains(fd)) {
+    if fds.windows(2).any(|pair| pair[0] == pair[1]) || [0, 1, 2].iter().any(|fd| !fds.contains(fd))
+    {
         return Err(Failure::Admission);
     }
     fds.retain(|fd| *fd >= 3);
@@ -244,10 +248,19 @@ fn inherited_descriptors() -> Result<Vec<i32>> {
     let mut rows: Vec<libc::proc_fdinfo> = Vec::with_capacity(4096);
     rows.resize_with(4096, || unsafe { std::mem::zeroed() });
     let capacity = std::mem::size_of_val(rows.as_slice());
-    let count = unsafe { libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDLISTFDS, 0,
-        rows.as_mut_ptr().cast(), capacity as i32) };
-    if count <= 0 || count as usize >= capacity
-        || count as usize % std::mem::size_of::<libc::proc_fdinfo>() != 0 {
+    let count = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            rows.as_mut_ptr().cast(),
+            capacity as i32,
+        )
+    };
+    if count <= 0
+        || count as usize >= capacity
+        || count as usize % std::mem::size_of::<libc::proc_fdinfo>() != 0
+    {
         return Err(Failure::Admission);
     }
     rows.truncate(count as usize / std::mem::size_of::<libc::proc_fdinfo>());
@@ -523,18 +536,29 @@ fn exercise(
     claimed: &mut bool,
 ) -> Result<()> {
     let mut state = PlanState::new(entry, scope.hard_end())?;
-    for name in ["FIRST.json", "FINAL.json", "operation-1.json", "operation-2.json", "operation-3.json", "operation-4.json"] {
+    for name in [
+        "FIRST.json",
+        "FINAL.json",
+        "operation-1.json",
+        "operation-2.json",
+        "operation-3.json",
+        "operation-4.json",
+    ] {
         match fs::symlink_metadata(roots.root.join(name)) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             _ => return Err(Failure::Evidence),
         }
     }
     // One durable, exclusive reservation prevents replay/concurrent launches
     // of this root before any pair/native admission or client execution.
-    write_receipt(&roots.root, "START.json", &serde_json::json!({
-        "schema": 1, "entry_ns": entry, "end_ns": state.end,
-        "offline_only": true, "maximum_native_operations": 4,
-    }))?;
+    write_receipt(
+        &roots.root,
+        "START.json",
+        &serde_json::json!({
+            "schema": 1, "entry_ns": entry, "end_ns": state.end,
+            "offline_only": true, "maximum_native_operations": 4,
+        }),
+    )?;
     *claimed = true;
     let anchor = option_env!("KEITO_RELEASE_GUARD_SHA256").ok_or(Failure::Pair)?;
     let pair = crate::capture_runtime_pair::verify(
@@ -713,11 +737,12 @@ pub fn run_offline() -> bool {
     if !cfg!(target_os = "macos") {
         return false;
     }
-    let args: Vec<_> = std::env::args_os().take(3).collect();
-    if args.len() != 2 {
+    let args: Vec<_> = std::env::args_os().take(4).collect();
+    let controls = args.len() == 3 && args[1] == "--check-policy";
+    if args.len() != 2 && !controls {
         return false;
     }
-    let root = PathBuf::from(&args[1]);
+    let root = PathBuf::from(&args[if controls { 2 } else { 1 }]);
     if entry_environment(&root).is_err() {
         return false;
     }
@@ -727,6 +752,9 @@ pub fn run_offline() -> bool {
     }) else {
         return false;
     };
+    if controls {
+        return policy_controls(&mut scope, root, entry, end);
+    }
     let mut observations = Vec::with_capacity(4);
     let mut claimed = false;
     let setup = Roots::open(root.clone());
@@ -753,14 +781,16 @@ pub fn run_offline() -> bool {
     if !scope.publish_terminal(primary.is_none()) {
         primary.get_or_insert(Failure::Finality);
     }
-    if !first_attempted && claimed && write_receipt(
+    if !first_attempted
+        && claimed
+        && write_receipt(
             &root,
             "FIRST.json",
             &receipt(primary, &report, &observations),
         )
         .is_err()
-        {
-            primary.get_or_insert(Failure::Evidence);
+    {
+        primary.get_or_insert(Failure::Evidence);
     }
     if claimed
         && write_receipt(
@@ -773,6 +803,60 @@ pub fn run_offline() -> bool {
         primary.get_or_insert(Failure::Evidence);
     }
     primary.is_none() && report.clean && observations.len() == 4
+}
+
+fn permission_denied(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
+}
+fn policy_controls(scope: &mut Scope, root: PathBuf, entry: u64, end: u64) -> bool {
+    let Ok(roots) = Roots::open(root) else {
+        scope.begin_cancel(ProtocolError("DEV_CLIENT_POLICY_ROOT"), end);
+        scope.finish();
+        scope.publish_terminal(false);
+        return false;
+    };
+    let canary = Path::new(ROOT_PARENT).join(format!("{}-denied-canary", roots.root.file_name().unwrap().to_string_lossy()));
+    // The preparer must attest this new run-owned canary exists. Never read its
+    // body, even on a policy failure; no original profile/service is probed.
+    let file_denied = match File::open(canary) {
+        Ok(file) => { drop(file); false },
+        Err(error) => permission_denied(&error),
+    };
+    #[cfg(target_os = "macos")]
+    let udp_denied = {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            permission_denied(&io::Error::last_os_error())
+        } else {
+            // Own the returned socket before any fallible operation. UDP
+            // connect does not send a datagram; there is no send/listen call.
+            let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+            let denied = socket.connect((std::net::Ipv4Addr::LOCALHOST, 9))
+                .err().is_some_and(|error| permission_denied(&error));
+            drop(socket);
+            denied
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let udp_denied = false;
+    let within_end = monotonic_now().is_ok_and(|at| entry <= at && at < end);
+    let operation_clean = file_denied && udp_denied && within_end && roots.check().is_ok();
+    if !operation_clean { scope.begin_cancel(ProtocolError("DEV_CLIENT_POLICY_DENIAL"), end); }
+    let report = scope.finish();
+    let terminal = scope.publish_terminal(operation_clean && report.clean);
+    let receipt = serde_json::json!({
+        "kind": "OFFLINE_POLICY_CONTROLS", "file_open_permission_denied": file_denied,
+        "udp_endpoint_permission_denied": udp_denied,
+        "scope_clean": report.clean, "terminal_clean": terminal,
+        "entry_ns": entry, "end_ns": end, "client_invocations": 0,
+        "no_datagram_send_or_listener_API": true,
+        "original_profile_or_service_probe": false,
+        "effective_policy_for_actual_clients": "NOT_YET_QUALIFIED",
+    });
+    let saved = write_receipt(&roots.root, "POLICY-CONTROLS.json", &receipt).is_ok();
+    operation_clean && report.clean && terminal && saved
+        && monotonic_now().is_ok_and(|at| entry <= at && at < end)
 }
 
 #[cfg(test)]
