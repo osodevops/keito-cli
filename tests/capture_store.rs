@@ -1224,15 +1224,19 @@ fn unsupported_repository_capture_refuses_before_reading_mapping_or_creating_sta
     ] {
         std::fs::write(&file, body).unwrap();
         let error = Repository::resolve(temp.path()).unwrap_err();
-        assert!(matches!(error, keito_cli::error::AppError::Config(ref message)
-            if message == "Automatic capture is unsupported on this platform; manual time commands remain available"));
+        assert!(
+            matches!(error, keito_cli::error::AppError::Config(ref message)
+            if message == "Automatic capture is unsupported on this platform; manual time commands remain available")
+        );
         assert!(!error.to_string().contains("PRIVATE_CANARY"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), body);
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
         assert_eq!(std::fs::read_dir(&mapping).unwrap().count(), 1);
     }
     let absent = temp.path().join("must-not-be-created");
-    assert!(matches!(Repository::resolve(&absent), Err(keito_cli::error::AppError::Config(ref message))
-        if message == "Automatic capture is unsupported on this platform; manual time commands remain available"));
+    assert!(
+        matches!(Repository::resolve(&absent), Err(keito_cli::error::AppError::Config(ref message))
+        if message == "Automatic capture is unsupported on this platform; manual time commands remain available")
+    );
     assert!(!absent.exists());
 }
