@@ -32,7 +32,7 @@ const ORDINARY_OPERATION_NS: u64 = 1_000_000_000;
 // Keep the selector closed; callers cannot supply a keeper policy or duration.
 #[cfg(feature = "dev-tools")]
 pub(super) fn dev_client_keeper_policy() -> CleanupPolicy {
-    CleanupPolicy::HookShort
+    CleanupPolicy::CommandProbe
 }
 
 fn error(reason: &'static str) -> io::Error {
@@ -1425,7 +1425,10 @@ impl Scope {
             .admit_dev_client(at, capacity, selected_end, |owner, end| {
                 let pipes = plan.prepare().map_err(|_| error("SCOPE_IO_PREPARE"))?;
                 let lease = GroupLease::spawn_verified_keeper_with_policy(
-                    owner, image, end, dev_client_keeper_policy(),
+                    owner,
+                    image,
+                    end,
+                    dev_client_keeper_policy(),
                 )?;
                 Ok(ProductEdge::Group(GroupEdge {
                     lease,

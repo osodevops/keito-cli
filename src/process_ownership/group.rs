@@ -3412,7 +3412,6 @@ mod short_policy_tests {
     }
 }
 
-
 #[cfg(all(test, feature = "dev-tools"))]
 mod dev_client_keeper_policy_tests {
     use super::*;
@@ -3441,8 +3440,14 @@ mod dev_client_keeper_policy_tests {
     #[test]
     fn dev_client_keeper_policy_is_closed_and_keeps_hook_policy_unchanged() {
         assert_eq!(selected(), CleanupPolicy::CommandProbe);
-        assert_eq!(CleanupPolicy::keeper_tag(Some("command-probe-v1")).unwrap(), selected());
-        assert_eq!(CleanupPolicy::HookShort.setup_end(100_000_000, 1_100_000_000), 120_000_000);
+        assert_eq!(
+            CleanupPolicy::keeper_tag(Some("command-probe-v1")).unwrap(),
+            selected()
+        );
+        assert_eq!(
+            CleanupPolicy::HookShort.setup_end(100_000_000, 1_100_000_000),
+            120_000_000
+        );
         assert_eq!(CleanupPolicy::HookShort.reserve_ns(), 50_000_000);
         assert_eq!(CleanupPolicy::HookShort.term_ns(), 15_000_000);
     }
