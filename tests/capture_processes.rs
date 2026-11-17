@@ -129,15 +129,20 @@ fn hook(root: &std::path::Path, capture: &std::path::Path, event: &str) -> Comma
 
 #[test]
 fn concurrent_real_hook_processes_persist_once_and_discard_raw_content() {
-    assert_concurrent_hooks(20);
+    assert_concurrent_hooks(20, 90);
 }
 
 #[test]
 fn one_verified_guard_hook_accepts_the_seeded_boundary() {
-    assert_concurrent_hooks(1);
+    assert_concurrent_hooks(1, 90);
 }
 
-fn assert_concurrent_hooks(count: usize) {
+#[test]
+fn guarded_hook_preserves_an_older_seeded_interval_without_a_startup_speed_assumption() {
+    assert_concurrent_hooks(1, 93);
+}
+
+fn assert_concurrent_hooks(count: usize, seed_age_seconds: i64) {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("PRIVATE_PATH_CANARY");
     std::fs::create_dir(&repo_root).unwrap();
@@ -170,8 +175,8 @@ fn assert_concurrent_hooks(count: usize) {
         })
         .unwrap();
     let mut start = Clock::now().unwrap();
-    start.wall -= 90;
-    start.monotonic -= 90;
+    start.wall -= seed_age_seconds;
+    start.monotonic -= seed_age_seconds;
     store
         .event(
             &repo,
@@ -187,6 +192,8 @@ fn assert_concurrent_hooks(count: usize) {
         )
         .unwrap();
     let body=serde_json::json!({"session_id":"session-fixture","turn_id":"turn-fixture","cwd":repo_root,"prompt":"PRIVATE_PROMPT_CANARY","last_assistant_message":"PRIVATE_ASSISTANT_CANARY","transcript_path":"/PRIVATE_TRANSCRIPT_CANARY","tool_input":{"secret":"PRIVATE_TOOL_CANARY"}}).to_string();
+    // Bound the real stop clock independently of machine startup speed.
+    let earliest_stop_wall = chrono::Utc::now().timestamp();
     let children: Vec<_> = (0..count)
         .map(|_| {
             let mut child = hook(&repo_root, &capture_dir, "stop")
@@ -210,6 +217,7 @@ fn assert_concurrent_hooks(count: usize) {
         assert!(out.stdout.is_empty());
         assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE"));
     }
+    let latest_stop_wall = chrono::Utc::now().timestamp();
     let sessions = store.preview("session-fixture").unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(
@@ -219,7 +227,26 @@ fn assert_concurrent_hooks(count: usize) {
         serde_json::to_string(&sessions).unwrap(),
         serde_json::to_string(&store.status().unwrap()).unwrap()
     );
-    assert!((90..=92).contains(&sessions[0].segments[0].duration_seconds));
+    let segment = &sessions[0].segments[0];
+    let segment_start = chrono::DateTime::parse_from_rfc3339(&segment.started_at)
+        .unwrap()
+        .timestamp();
+    let segment_end = chrono::DateTime::parse_from_rfc3339(&segment.ended_at)
+        .unwrap()
+        .timestamp();
+    assert_eq!(
+        segment.completeness, "COMPLETE",
+        "seconds={} attention={} stop_clock=[{},{}]",
+        segment.duration_seconds, sessions[0].needs_attention, earliest_stop_wall, latest_stop_wall
+    );
+    assert!(!sessions[0].needs_attention);
+    assert_eq!(segment_start, start.wall);
+    assert!((earliest_stop_wall..=latest_stop_wall).contains(&segment_end));
+    assert_eq!(segment.duration_seconds, segment_end - start.wall);
+    assert!(
+        (earliest_stop_wall - start.wall..=latest_stop_wall - start.wall)
+            .contains(&segment.duration_seconds)
+    );
     assert_eq!(sessions[0].revision, 1);
     assert_no_private_content(&capture_dir);
 }
@@ -364,6 +391,15 @@ fn sqlite_contention_exposes_lost_boundary_as_storage_pause_in_status() {
 
 #[test]
 fn refused_stop_under_real_lock_cannot_be_completed_by_another_hook_process() {
+    assert_refused_stop(false);
+}
+
+#[test]
+fn refused_stop_survives_a_duplicate_that_is_also_refused_before_sqlite_admission() {
+    assert_refused_stop(true);
+}
+
+fn assert_refused_stop(duplicate_contended: bool) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("repo");
     std::fs::create_dir(&root).unwrap();
@@ -437,14 +473,22 @@ fn refused_stop_under_real_lock_cannot_be_completed_by_another_hook_process() {
         store.status().unwrap().storage_paused,
         "refusal must be durable"
     );
-    database.execute_batch("ROLLBACK").unwrap();
+    if !duplicate_contended {
+        database.execute_batch("ROLLBACK").unwrap();
+    }
     let duplicate = invoke_hook();
     assert!(duplicate.status.success());
-    let session = &store.preview("refused-native").unwrap()[0];
-    assert!(session.needs_attention);
-    assert_eq!(session.segments.len(), 1);
-    assert_eq!(session.segments[0].duration_seconds, 0);
-    assert_eq!(session.segments[0].completeness, "INCOMPLETE");
+    if duplicate_contended {
+        database.execute_batch("ROLLBACK").unwrap();
+    }
+    // Guard success is silent/fail-open, so the duplicate may itself have
+    // refused before reaching SQLite. Never allow it to manufacture time,
+    // even temporarily, before the normal transmission gate reconciles it.
+    let before_claim = store.preview("refused-native").unwrap();
+    assert!(before_claim[0]
+        .segments
+        .iter()
+        .all(|segment| segment.completeness != "COMPLETE" || segment.duration_seconds == 0));
     assert!(store.status().unwrap().storage_paused);
     assert!(
         store
@@ -453,6 +497,12 @@ fn refused_stop_under_real_lock_cannot_be_completed_by_another_hook_process() {
             .is_none(),
         "a retained failed invocation must block transmission"
     );
+    let session = &store.preview("refused-native").unwrap()[0];
+    assert!(session.needs_attention);
+    assert_eq!(session.segments.len(), 1);
+    assert_eq!(session.segments[0].duration_seconds, 0);
+    assert_eq!(session.segments[0].completeness, "INCOMPLETE");
+    assert!(store.status().unwrap().storage_paused);
     store.recover(&Clock::now().unwrap()).unwrap();
     let queued = store
         .claim(&binding, chrono::Utc::now().timestamp())
