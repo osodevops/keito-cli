@@ -3,6 +3,7 @@ use keito_cli::capture::{self, Repository};
 use keito_cli::capture::{Binding, Clock, Store};
 #[cfg(unix)]
 use keito_cli::cli::capture::CaptureEvent::*;
+#[cfg(unix)]
 use std::path::Path;
 
 #[cfg(unix)]
@@ -361,6 +362,7 @@ fn credential_and_path_identifiers_reject_without_echo() {
     }
 }
 
+#[cfg(unix)]
 fn git(path: &Path, args: &[&str]) {
     assert!(std::process::Command::new("git")
         .arg("-C")
@@ -371,6 +373,7 @@ fn git(path: &Path, args: &[&str]) {
         .status
         .success())
 }
+#[cfg(unix)]
 #[test]
 fn linked_worktrees_share_identity_but_nested_repositories_and_changed_remotes_do_not() {
     let temp = tempfile::tempdir().unwrap();
@@ -612,6 +615,7 @@ fn absent_linked_hint_inherits_approval_but_explicit_conflict_is_held() {
         .unwrap();
     assert!(store.preview("wrong-session").unwrap().is_empty());
 }
+#[cfg(unix)]
 #[test]
 fn remote_changes_do_not_change_operational_repository_family_identity() {
     let temp = tempfile::tempdir().unwrap();
@@ -795,6 +799,7 @@ fn typed_acknowledgement_retires_only_expired_acknowledged_payloads() {
     assert_eq!(old, 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn legacy_yaml_and_json_mapping_hints_have_the_same_minimized_identity() {
     let temp = tempfile::tempdir().unwrap();
@@ -807,6 +812,7 @@ fn legacy_yaml_and_json_mapping_hints_have_the_same_minimized_identity() {
     let json = Repository::resolve(temp.path()).unwrap();
     assert_eq!(yaml.hint_hash, json.hint_hash);
 }
+#[cfg(unix)]
 #[test]
 fn mapping_parser_refuses_deep_resource_amplification_without_echo() {
     let temp = tempfile::tempdir().unwrap();
@@ -822,6 +828,7 @@ fn mapping_parser_refuses_deep_resource_amplification_without_echo() {
     let error = Repository::resolve(temp.path()).unwrap_err().to_string();
     assert!(!error.contains("PRIVATE_CANARY"));
 }
+#[cfg(unix)]
 #[test]
 fn malformed_and_duplicate_mapping_keys_are_refused_without_source_excerpt() {
     let temp = tempfile::tempdir().unwrap();
@@ -1199,4 +1206,33 @@ fn native_resume_during_capture_pause_abandons_old_turn_for_both_harnesses() {
             30
         );
     }
+}
+
+// Repository discovery requires the owned Unix process boundary. Other
+// platforms refuse before reading mapping bodies or launching Git.
+#[cfg(not(unix))]
+#[test]
+fn unsupported_repository_capture_refuses_before_reading_mapping_or_creating_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let mapping = temp.path().join(".keito");
+    std::fs::create_dir(&mapping).unwrap();
+    let file = mapping.join("config.yml");
+    for body in [
+        "project_id: synthetic-project\n",
+        "project_id: [PRIVATE_CANARY\n",
+        "project_id: one\nproject_id: PRIVATE_CANARY\n",
+    ] {
+        std::fs::write(&file, body).unwrap();
+        let error = Repository::resolve(temp.path()).unwrap_err();
+        assert!(matches!(error, keito_cli::error::AppError::Config(ref message)
+            if message == "Automatic capture is unsupported on this platform; manual time commands remain available"));
+        assert!(!error.to_string().contains("PRIVATE_CANARY"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), body);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&mapping).unwrap().count(), 1);
+    }
+    let absent = temp.path().join("must-not-be-created");
+    assert!(matches!(Repository::resolve(&absent), Err(keito_cli::error::AppError::Config(ref message))
+        if message == "Automatic capture is unsupported on this platform; manual time commands remain available"));
+    assert!(!absent.exists());
 }
