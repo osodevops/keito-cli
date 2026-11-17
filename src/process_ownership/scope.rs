@@ -142,6 +142,9 @@ impl Stage {
     }
 }
 // Scheduling only: this lock never proves command identity, consent or success.
+// Retain each slot through group and pipe finality, so a parked command cannot
+// admit another live Git group into the same four-slot pool. This is not an
+// absolute process bound after owner death or unproved cleanup.
 // Each admission opens an independent description; never duplicate the lock FD.
 const HOOK_SETUP_SLOTS: usize = 4;
 struct HookSetupAdmission {
@@ -246,6 +249,19 @@ struct GroupEdge {
     published: [bool; 4],
     setup_admission: Option<HookSetupAdmission>,
 }
+fn release_hook_admission(
+    stage: &Stage,
+    facts: EdgeFacts,
+    admission: &mut Option<HookSetupAdmission>,
+) {
+    if matches!(stage, Stage::Done)
+        && facts.resources_complete()
+        && facts.group_absent
+        && facts.terminal_eof
+    {
+        admission.take();
+    }
+}
 impl GroupEdge {
     fn progress(&mut self) -> io::Result<()> {
         // Outputs progress even while PARK is pending. Each pipe has a fixed
@@ -281,9 +297,6 @@ impl GroupEdge {
             Stage::Park => {
                 if self.lease.poll_parked()? {
                     self.stage = Stage::Running;
-                    // PARK succeeded. Both child handles remain independently
-                    // owned; only the scheduling lock is released here.
-                    self.setup_admission.take();
                 }
             }
             Stage::Running => {
@@ -293,10 +306,13 @@ impl GroupEdge {
                 if self.lease.poll_local_cleanup()?.is_some() {
                     self.proof = true;
                     self.stage = Stage::Done;
-                    self.setup_admission.take();
                 }
             }
             Stage::Done => {}
+        }
+        if self.setup_admission.is_some() && matches!(self.stage, Stage::Done) {
+            let facts = self.facts();
+            release_hook_admission(&self.stage, facts, &mut self.setup_admission);
         }
         Ok(())
     }
@@ -2497,6 +2513,75 @@ mod tests {
         assert!(released.try_lock(&directory).unwrap());
         let mut still_held = HookSetupAdmission::open(&directory, 0).unwrap();
         assert!(!still_held.try_lock(&directory).unwrap());
+    }
+
+    fn completed_hook_facts() -> EdgeFacts {
+        EdgeFacts {
+            waits_known: true,
+            group_absent: true,
+            terminal_eof: true,
+            resource_proof: true,
+            io_required: true,
+            io: IoFacts {
+                stdin_closed: true,
+                stdout_eof: true,
+                stderr_eof: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hook_admission_remains_locked_through_running_and_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = File::open(temp.path()).unwrap();
+        let mut admission = Some(HookSetupAdmission::open(&directory, 0).unwrap());
+        assert!(admission.as_mut().unwrap().try_lock(&directory).unwrap());
+        let mut waiter = HookSetupAdmission::open(&directory, 0).unwrap();
+        for stage in [Stage::Ready, Stage::Park, Stage::Running, Stage::Cleaning] {
+            release_hook_admission(&stage, completed_hook_facts(), &mut admission);
+            assert!(admission.is_some(), "live command released capacity");
+            assert!(!waiter.try_lock(&directory).unwrap());
+        }
+        release_hook_admission(&Stage::Done, completed_hook_facts(), &mut admission);
+        assert!(admission.is_none());
+        assert!(waiter.try_lock(&directory).unwrap());
+        // Completion polling cannot release a second description's lock.
+        release_hook_admission(&Stage::Done, completed_hook_facts(), &mut admission);
+        let mut next = HookSetupAdmission::open(&directory, 0).unwrap();
+        assert!(!next.try_lock(&directory).unwrap());
+    }
+
+    #[test]
+    fn hook_admission_requires_full_wait_group_and_pipe_finality() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = File::open(temp.path()).unwrap();
+        let mut admission = Some(HookSetupAdmission::open(&directory, 0).unwrap());
+        assert!(admission.as_mut().unwrap().try_lock(&directory).unwrap());
+        let mut waiter = HookSetupAdmission::open(&directory, 0).unwrap();
+        for missing in 0..7 {
+            let mut facts = completed_hook_facts();
+            match missing {
+                0 => facts.resource_proof = false,
+                1 => facts.waits_known = false,
+                2 => facts.group_absent = false,
+                3 => facts.terminal_eof = false,
+                4 => facts.io.stdin_closed = false,
+                5 => facts.io.stdout_eof = false,
+                _ => facts.io.stderr_eof = false,
+            }
+            release_hook_admission(&Stage::Done, facts, &mut admission);
+            assert!(admission.is_some(), "incomplete cleanup released capacity");
+            assert!(!waiter.try_lock(&directory).unwrap());
+        }
+        release_hook_admission(&Stage::Done, completed_hook_facts(), &mut admission);
+        assert!(admission.is_none());
+        assert!(waiter.try_lock(&directory).unwrap());
     }
 
     #[test]
