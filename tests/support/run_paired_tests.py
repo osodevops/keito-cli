@@ -65,6 +65,10 @@ def main(arguments):
     os.environ["TMPDIR"] = str(root / "tmp")
     environment = dict(os.environ)
     environment.pop("KEITO_RELEASE_GUARD_SHA256", None)
+    # The caller resolves the toolchain before entering this runner. Cargo
+    # otherwise finds rustc through PATH, where parallel rustup proxies may
+    # attempt component installation during the first guard build.
+    environment["RUSTC"] = rustc
     # /usr/bin/git on macOS is an xcrun shim, not the Git image. Resolve the
     # tool once during fixture preparation instead of charging shim discovery
     # to every short owned leaf after env_clear().

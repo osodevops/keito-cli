@@ -20,7 +20,7 @@ class PairFixtures(unittest.TestCase):
                 run.mkdir()
                 for name in ("git", "guard-bin", "core-bin"):
                     (root / name).write_bytes(name.encode())
-                with patch.dict(paired.os.environ), patch.object(paired.sys, "platform", "linux"), \
+                with patch.dict(paired.os.environ, {"RUSTC": "fixture-inherited-rustup-proxy"}), patch.object(paired.sys, "platform", "linux"), \
                         patch.object(paired.tempfile, "mkdtemp", return_value=str(run)), \
                         patch.object(paired.shutil, "which", return_value=str(root / "git")), \
                         patch.object(paired.subprocess, "check_output", return_value="host: fixture-target\n"), \
@@ -29,6 +29,10 @@ class PairFixtures(unittest.TestCase):
                     paired.main(["fixture-cargo", "fixture-rustc", *arguments])
                 command = launch.call_args_list[-1].args[0]
                 self.assertEqual(command.count("--all-targets"), 1)
+                # Cargo must use the compiler passed by the caller for every
+                # phase, never the rustup shim found through PATH.
+                for call in launch.call_args_list:
+                    self.assertEqual(call.kwargs["env"].get("RUSTC"), "fixture-rustc")
 
     def test_each_running_image_has_its_own_binding_and_tampering_breaks_it(self):
         with tempfile.TemporaryDirectory() as directory:
