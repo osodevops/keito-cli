@@ -1149,6 +1149,13 @@ impl Scope {
     pub(crate) fn first_fault(&self) -> Option<ProtocolError> {
         self.core.owner.borrow().first_fault
     }
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn first_setup_trace(&self) -> Option<super::group::SetupTrace> {
+        self.core
+            .slots
+            .iter()
+            .find_map(|slot| slot.edge.setup_trace())
+    }
     pub(crate) fn begin_installer_preflight(&mut self, expected: usize) -> io::Result<()> {
         self.poll();
         let at = self.core.admission_clock(&mut now)?;

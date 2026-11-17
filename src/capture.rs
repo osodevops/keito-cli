@@ -832,6 +832,77 @@ pub struct CaptureFailure {
     pub reason: String,
     pub boundary_id: String,
     pub observed_at: i64,
+    #[cfg(feature = "dev-tools")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<HookFailureProbe>,
+}
+// Source-fixture diagnosis only. The default installed marker schema remains
+// unchanged. No path, error body, command, native identity or payload can enter.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFailurePhase {
+    Input,
+    Parse,
+    Repository,
+    Store,
+    Permit,
+    Clock,
+    Event,
+}
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookOwnerFault {
+    GroupDeadline,
+    GroupLifetime,
+    OperationDeadline,
+    ProofDeadline,
+    CleanupDeadline,
+    Clock,
+    Other,
+}
+#[cfg(feature = "dev-tools")]
+impl HookOwnerFault {
+    pub(crate) fn from_static(reason: &'static str) -> Self {
+        match reason {
+            "GROUP_DEADLINE" => Self::GroupDeadline,
+            "GROUP_LIFETIME" => Self::GroupLifetime,
+            "SCOPE_OPERATION_DEADLINE" => Self::OperationDeadline,
+            "SCOPE_PROOF_DEADLINE" => Self::ProofDeadline,
+            "SCOPE_CLEANUP_DEADLINE" => Self::CleanupDeadline,
+            "SCOPE_CLOCK" | "GROUP_CLOCK" => Self::Clock,
+            _ => Self::Other,
+        }
+    }
+}
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookReadyEdge {
+    BeforeReceive,
+    AfterReceive,
+}
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookSetupProbe {
+    pub ready_window_ns: Option<u64>,
+    pub pre_spawn_offset_ns: Option<u64>,
+    pub spawn_return_offset_ns: Option<u64>,
+    pub first_ready_poll_offset_ns: Option<u64>,
+    pub deadline_offset_ns: Option<u64>,
+    pub ready_frame_observed: bool,
+    pub ready_eof_observed: bool,
+    pub deadline_edge: Option<HookReadyEdge>,
+}
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookFailureProbe {
+    pub phase: HookFailurePhase,
+    pub owner_fault: Option<HookOwnerFault>,
+    pub setup: Option<HookSetupProbe>,
 }
 #[derive(Debug, Serialize)]
 pub struct Status {
@@ -2813,6 +2884,25 @@ fn sync_refusal(file: &fs::File) -> std::io::Result<()> {
 }
 
 pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Result<(), AppError> {
+    write_failure(directory, boundary_id, reason, |_| {})
+}
+#[cfg(feature = "dev-tools")]
+pub(crate) fn record_failure_probed(
+    directory: &Path,
+    boundary_id: &str,
+    reason: &str,
+    probe: HookFailureProbe,
+) -> Result<(), AppError> {
+    write_failure(directory, boundary_id, reason, |failure| {
+        failure.probe = Some(probe);
+    })
+}
+fn write_failure(
+    directory: &Path,
+    boundary_id: &str,
+    reason: &str,
+    enrich: impl FnOnce(&mut CaptureFailure),
+) -> Result<(), AppError> {
     if !matches!(
         reason,
         "STORAGE_UNAVAILABLE" | "QUEUE_LIMIT_REACHED" | "BOUNDARY_REFUSED"
@@ -2873,11 +2963,14 @@ pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Resu
     }
     let result = (|| {
         let mut file = options.open(&temporary).map_err(storage_error)?;
-        let failure = CaptureFailure {
+        let mut failure = CaptureFailure {
             reason: reason.into(),
             boundary_id: boundary_id.into(),
             observed_at: chrono::Utc::now().timestamp(),
+            #[cfg(feature = "dev-tools")]
+            probe: None,
         };
+        enrich(&mut failure);
         use std::io::Write;
         file.write_all(&serde_json::to_vec(&failure).map_err(storage_error)?)
             .map_err(storage_error)?;
@@ -2892,6 +2985,142 @@ pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Resu
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+#[cfg(test)]
+mod failure_probe_tests {
+    use super::*;
+
+    fn legacy() -> serde_json::Value {
+        serde_json::json!({
+            "reason": "STORAGE_UNAVAILABLE",
+            "boundary_id": "a".repeat(64),
+            "observed_at": 1794932360,
+        })
+    }
+
+    #[cfg(feature = "dev-tools")]
+    fn observed() -> serde_json::Value {
+        let mut value = legacy();
+        value["probe"] = serde_json::json!({
+            "phase": "repository",
+            "owner_fault": "group_deadline",
+            "setup": null,
+        });
+        value
+    }
+
+    #[test]
+    fn legacy_failure_keeps_exact_schema_without_a_probe() {
+        let failure: CaptureFailure = serde_json::from_value(legacy()).unwrap();
+        assert_eq!(serde_json::to_value(failure).unwrap(), legacy());
+    }
+
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn developer_failure_retains_closed_probe_provenance() {
+        let failure: CaptureFailure = serde_json::from_value(observed()).unwrap();
+        assert_eq!(serde_json::to_value(failure).unwrap(), observed());
+    }
+
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn developer_probe_refuses_unknown_fields_and_variants() {
+        for (key, value) in [
+            ("phase", serde_json::json!("PRIVATE_RAW_CANARY")),
+            ("owner_fault", serde_json::json!("PRIVATE_RAW_CANARY")),
+            ("unknown", serde_json::json!("PRIVATE_RAW_CANARY")),
+        ] {
+            let mut marker = observed();
+            marker["probe"][key] = value;
+            assert!(serde_json::from_value::<CaptureFailure>(marker).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn developer_setup_probe_is_strict_and_fits_the_existing_marker_limit() {
+        let mut marker = observed();
+        marker["probe"]["setup"] = serde_json::json!({
+            "ready_window_ns": u64::MAX,
+            "pre_spawn_offset_ns": u64::MAX,
+            "spawn_return_offset_ns": u64::MAX,
+            "first_ready_poll_offset_ns": u64::MAX,
+            "deadline_offset_ns": u64::MAX,
+            "ready_frame_observed": false,
+            "ready_eof_observed": false,
+            "deadline_edge": "before_receive",
+        });
+        let failure: CaptureFailure = serde_json::from_value(marker.clone()).unwrap();
+        assert!(serde_json::to_vec(&failure).unwrap().len() <= 1024);
+        assert_eq!(serde_json::to_value(failure).unwrap(), marker);
+        for (key, value) in [
+            ("deadline_edge", serde_json::json!("PRIVATE_RAW_CANARY")),
+            ("unknown", serde_json::json!("PRIVATE_RAW_CANARY")),
+        ] {
+            let mut invalid = marker.clone();
+            invalid["probe"]["setup"][key] = value;
+            assert!(serde_json::from_value::<CaptureFailure>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn developer_owner_fault_mapping_never_serializes_unselected_text() {
+        for (reason, expected) in [
+            ("GROUP_DEADLINE", HookOwnerFault::GroupDeadline),
+            ("GROUP_LIFETIME", HookOwnerFault::GroupLifetime),
+            (
+                "SCOPE_OPERATION_DEADLINE",
+                HookOwnerFault::OperationDeadline,
+            ),
+            ("SCOPE_PROOF_DEADLINE", HookOwnerFault::ProofDeadline),
+            ("SCOPE_CLEANUP_DEADLINE", HookOwnerFault::CleanupDeadline),
+            ("SCOPE_CLOCK", HookOwnerFault::Clock),
+            ("GROUP_CLOCK", HookOwnerFault::Clock),
+            ("PRIVATE_RAW_CANARY", HookOwnerFault::Other),
+        ] {
+            let fault = HookOwnerFault::from_static(reason);
+            assert_eq!(fault, expected);
+            assert!(!serde_json::to_string(&fault).unwrap().contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "dev-tools", unix))]
+    fn developer_probe_uses_one_existing_immutable_failure_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let failure: CaptureFailure = serde_json::from_value(observed()).unwrap();
+        record_failure_probed(
+            directory.path(),
+            &failure.boundary_id,
+            &failure.reason,
+            failure.probe.unwrap(),
+        )
+        .unwrap();
+        let markers = read_failure_markers(directory.path()).unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].1.reason, failure.reason);
+        assert_eq!(markers[0].1.boundary_id, failure.boundary_id);
+        assert!(markers[0].1.probe.is_some());
+        assert!(fs::read(&markers[0].0).unwrap().len() <= 1024);
+
+        let ordinary = tempfile::tempdir().unwrap();
+        record_failure(ordinary.path(), &failure.boundary_id, &failure.reason).unwrap();
+        let ordinary = read_failure_markers(ordinary.path()).unwrap();
+        assert_eq!(ordinary.len(), 1);
+        let value = serde_json::to_value(&ordinary[0].1).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert!(value.get("probe").is_none());
+    }
+
+    #[test]
+    #[cfg(not(feature = "dev-tools"))]
+    fn production_reader_rejects_source_fixture_probe_metadata() {
+        let mut marker = legacy();
+        marker["probe"] = serde_json::json!({ "phase": "repository" });
+        assert!(serde_json::from_value::<CaptureFailure>(marker).is_err());
+    }
 }
 
 #[cfg(all(test, unix))]

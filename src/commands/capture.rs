@@ -315,6 +315,8 @@ async fn run_inner(
                 .and_then(|fd| fd.parse::<i32>().ok())
                 .filter(|fd| *fd == 3 && crate::capture_invocations::protect_ack(*fd).is_ok());
             let mut accepted_store = None;
+            #[cfg(feature = "dev-tools")]
+            let mut failure_phase = capture::HookFailurePhase::Input;
             let result = (|| {
                 #[cfg(unix)]
                 let owner = command_owner.as_mut().ok_or_else(|| {
@@ -338,6 +340,10 @@ async fn run_inner(
                     }
                     bytes
                 };
+                #[cfg(feature = "dev-tools")]
+                {
+                    failure_phase = capture::HookFailurePhase::Parse;
+                }
                 let value: Value = serde_json::from_slice(&bytes)
                     .map_err(|_| AppError::InvalidInput("Malformed capture event".into()))?;
                 let source_id = value
@@ -366,13 +372,29 @@ async fn run_inner(
                     .get("cwd")
                     .and_then(Value::as_str)
                     .ok_or_else(|| AppError::InvalidInput("Missing repository identity".into()))?;
+                #[cfg(feature = "dev-tools")]
+                {
+                    failure_phase = capture::HookFailurePhase::Repository;
+                }
                 #[cfg(unix)]
                 let repo = Repository::resolve_with(Path::new(cwd), owner)?;
                 #[cfg(not(unix))]
                 let repo = Repository::resolve(Path::new(cwd))?;
+                #[cfg(feature = "dev-tools")]
+                {
+                    failure_phase = capture::HookFailurePhase::Store;
+                }
                 let mut store = Store::open(&directory()?)?;
+                #[cfg(feature = "dev-tools")]
+                {
+                    failure_phase = capture::HookFailurePhase::Permit;
+                }
                 if let Some(nonce) = &invocation_nonce {
                     store.hook_invocation(nonce)?;
+                }
+                #[cfg(feature = "dev-tools")]
+                {
+                    failure_phase = capture::HookFailurePhase::Clock;
                 }
                 #[cfg(unix)]
                 let clock = Clock::now_with(owner)?;
@@ -388,6 +410,10 @@ async fn run_inner(
                     event,
                     clock: &clock,
                 };
+                #[cfg(feature = "dev-tools")]
+                {
+                    failure_phase = capture::HookFailurePhase::Event;
+                }
                 #[cfg(unix)]
                 store.event_hook(
                     &repo,
@@ -416,6 +442,21 @@ async fn run_inner(
                     .clone()
                     .unwrap_or_else(|| capture::hash("UNIDENTIFIED_REFUSED_BOUNDARY"));
                 let saved = directory().ok().is_some_and(|directory| {
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        let probe = capture::HookFailureProbe {
+                            phase: failure_phase,
+                            owner_fault: None,
+                            setup: None,
+                        };
+                        #[cfg(unix)]
+                        let probe = command_owner
+                            .as_ref()
+                            .map_or(probe, |owner| owner.failure_probe(failure_phase));
+                        capture::record_failure_probed(&directory, &failure_identity, reason, probe)
+                            .is_ok()
+                    }
+                    #[cfg(not(feature = "dev-tools"))]
                     capture::record_failure(&directory, &failure_identity, reason).is_ok()
                 });
                 if saved && boundary_id.is_some() {

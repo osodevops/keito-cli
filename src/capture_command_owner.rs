@@ -301,6 +301,20 @@ impl<'a> CommandOwner<'a> {
     pub(crate) fn finish_clean(&mut self) -> bool {
         self.scope.finish().clean
     }
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn failure_probe(
+        &self,
+        phase: crate::capture::HookFailurePhase,
+    ) -> crate::capture::HookFailureProbe {
+        crate::capture::HookFailureProbe {
+            phase,
+            owner_fault: self
+                .scope
+                .first_fault()
+                .map(|fault| crate::capture::HookOwnerFault::from_static(fault.0)),
+            setup: self.scope.first_setup_trace().map(hook_setup_probe),
+        }
+    }
     pub(crate) fn finish<T>(&mut self, result: Result<T, AppError>) -> Result<T, AppError> {
         finish_result(result, self.finish_clean())
     }
@@ -367,6 +381,26 @@ impl<'a> CommandOwner<'a> {
         }
     }
 }
+#[cfg(feature = "dev-tools")]
+fn hook_setup_probe(
+    trace: crate::process_ownership::group::SetupTrace,
+) -> crate::capture::HookSetupProbe {
+    let offset = |at: u64| at.checked_sub(trace.setup_start_ns);
+    crate::capture::HookSetupProbe {
+        ready_window_ns: offset(trace.ready_end_ns),
+        pre_spawn_offset_ns: offset(trace.pre_spawn_ns),
+        spawn_return_offset_ns: trace.spawn_return_ns.and_then(offset),
+        first_ready_poll_offset_ns: trace.first_ready_poll_ns.and_then(offset),
+        deadline_offset_ns: trace.deadline_observed.and_then(|(_, at)| offset(at)),
+        ready_frame_observed: trace.ready_frame_observed,
+        ready_eof_observed: trace.ready_eof_observed,
+        deadline_edge: trace.deadline_observed.and_then(|(edge, _)| match edge {
+            "READY_BEFORE_RECEIVE" => Some(crate::capture::HookReadyEdge::BeforeReceive),
+            "READY_AFTER_RECEIVE" => Some(crate::capture::HookReadyEdge::AfterReceive),
+            _ => None,
+        }),
+    }
+}
 impl LeafRunner for CommandOwner<'_> {
     fn repository_outputs(
         &mut self,
@@ -413,6 +447,55 @@ impl LeafRunner for CommandOwner<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn hook_probe_preserves_setup_offsets_without_restarting_the_ready_window() {
+        let probe = hook_setup_probe(crate::process_ownership::group::SetupTrace {
+            setup_start_ns: 100,
+            ready_end_ns: 120,
+            pre_spawn_ns: 115,
+            spawn_return_ns: Some(125),
+            first_ready_poll_ns: Some(127),
+            last_ready_before_ns: Some(127),
+            last_ready_after_ns: None,
+            ready_frame_observed: false,
+            ready_eof_observed: false,
+            deadline_observed: Some(("READY_BEFORE_RECEIVE", 127)),
+        });
+        assert_eq!(probe.ready_window_ns, Some(20));
+        assert_eq!(probe.pre_spawn_offset_ns, Some(15));
+        assert_eq!(probe.spawn_return_offset_ns, Some(25));
+        assert_eq!(probe.first_ready_poll_offset_ns, Some(27));
+        assert_eq!(probe.deadline_offset_ns, Some(27));
+        assert!(matches!(
+            probe.deadline_edge,
+            Some(crate::capture::HookReadyEdge::BeforeReceive)
+        ));
+        assert!(!probe.ready_frame_observed);
+    }
+
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn hook_probe_does_not_invent_offsets_for_missing_or_backwards_observations() {
+        let probe = hook_setup_probe(crate::process_ownership::group::SetupTrace {
+            setup_start_ns: 100,
+            ready_end_ns: 99,
+            pre_spawn_ns: 0,
+            spawn_return_ns: None,
+            first_ready_poll_ns: Some(98),
+            last_ready_before_ns: None,
+            last_ready_after_ns: None,
+            ready_frame_observed: false,
+            ready_eof_observed: false,
+            deadline_observed: None,
+        });
+        assert!(probe.ready_window_ns.is_none());
+        assert!(probe.pre_spawn_offset_ns.is_none());
+        assert!(probe.spawn_return_offset_ns.is_none());
+        assert!(probe.first_ready_poll_offset_ns.is_none());
+        assert!(probe.deadline_offset_ns.is_none());
+        assert!(probe.deadline_edge.is_none());
+    }
     #[test]
     fn installer_dropped_unsealed_handle_keeps_its_borrowed_owner_failed() {
         let end = crate::process_ownership::scope::monotonic_now().unwrap() + 4_000_000_000;
