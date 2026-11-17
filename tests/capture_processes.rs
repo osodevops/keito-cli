@@ -235,9 +235,14 @@ fn assert_concurrent_hooks(count: usize, seed_age_seconds: i64) {
         .unwrap()
         .timestamp();
     assert_eq!(
-        segment.completeness, "COMPLETE",
-        "seconds={} attention={} stop_clock=[{},{}]",
-        segment.duration_seconds, sessions[0].needs_attention, earliest_stop_wall, latest_stop_wall
+        segment.completeness,
+        "COMPLETE",
+        "seconds={} attention={} stop_clock=[{},{}] remaining={}",
+        segment.duration_seconds,
+        sessions[0].needs_attention,
+        earliest_stop_wall,
+        latest_stop_wall,
+        capture_failure_diagnostics(&store)
     );
     assert!(
         !sessions[0].needs_attention,
