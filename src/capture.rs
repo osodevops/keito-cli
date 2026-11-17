@@ -862,7 +862,7 @@ pub enum HookOwnerFault {
     Clock,
     Other,
 }
-#[cfg(feature = "dev-tools")]
+#[cfg(all(feature = "dev-tools", any(unix, test)))]
 impl HookOwnerFault {
     pub(crate) fn from_static(reason: &'static str) -> Self {
         match reason {
