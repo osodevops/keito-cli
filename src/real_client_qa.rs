@@ -84,7 +84,7 @@ fn caps(operation: Operation) -> (usize, usize) {
     )
 }
 
-const STDERR_MARKERS: [(&str, &[u8]); 24] = [
+const STDERR_MARKERS: [(&str, &[u8]); 32] = [
     ("BUN_CRASH", b"oh no: Bun has crashed"),
     ("BUN_PANIC", b"panic("),
     ("UNREACHABLE", b"reached unreachable code"),
@@ -109,16 +109,33 @@ const STDERR_MARKERS: [(&str, &[u8]); 24] = [
     ("MEMORY_ALLOCATION", b"OutOfMemory"),
     ("SIGNAL_TRAP", b"Trace/BPT trap"),
     ("BUS_ERROR", b"Bus error"),
+    ("MAP_JIT", b"MAP_JIT"),
+    ("MMAP", b"mmap"),
+    ("MPROTECT", b"mprotect"),
+    ("JIT", b"JIT"),
+    ("GETRANDOM", b"getrandom"),
+    ("THREAD_SUSPEND", b"suspend thread"),
+    ("UV_THREAD_CREATE", b"uv_thread_create"),
+    ("ERROR_SYSTEM_RESOURCES", b"SystemResources"),
 ];
 #[derive(Serialize)]
 struct RuntimeDiagnostics {
     within_cap: bool,
     markers: std::collections::BTreeMap<&'static str, bool>,
 }
-fn runtime_diagnostics(_raw: &[u8]) -> RuntimeDiagnostics {
+fn runtime_diagnostics(raw: &[u8]) -> RuntimeDiagnostics {
+    let within_cap = raw.len() <= 8192;
     RuntimeDiagnostics {
-        within_cap: true,
-        markers: STDERR_MARKERS.iter().map(|(name, _)| (*name, false)).collect(),
+        within_cap,
+        // Only literal keys and booleans survive. Oversize input is not scanned
+        // or partially attributed; neither bytes nor a digest enter evidence.
+        markers: STDERR_MARKERS
+            .iter()
+            .map(|(name, needle)| {
+                let found = within_cap && raw.windows(needle.len()).any(|part| part == *needle);
+                (*name, found)
+            })
+            .collect(),
     }
 }
 
@@ -510,6 +527,7 @@ struct Observation {
     stderr_eof: bool,
     stdout_bytes: usize,
     stderr_bytes: usize,
+    stderr_diagnostic: RuntimeDiagnostics,
     accepted_ns: Option<u64>,
     native_integrity: &'static str,
     native_metadata: Stamp,
@@ -659,6 +677,7 @@ fn exercise(
             stderr_eof: facts.io.stderr_eof,
             stdout_bytes: facts.io.stdout_bytes,
             stderr_bytes: facts.io.stderr_bytes,
+            stderr_diagnostic: runtime_diagnostics(&result.output.stderr),
             accepted_ns: facts.accepted_at,
             native_integrity: "METADATA_AND_VERSION_ONLY",
             native_metadata: native.stamp,
@@ -1473,10 +1492,17 @@ mod tests {
     }
     #[test]
     fn offline_client_runtime_diagnostics_classify_only_fixed_public_markers() {
-        let value = runtime_diagnostics(b"PRIVATE_CANARY uv_cpu_info: EPERM; oh no: Bun has crashed");
+        let value = runtime_diagnostics(
+            b"PRIVATE_CANARY uv_cpu_info: EPERM; MAP_JIT mmap; oh no: Bun has crashed",
+        );
         assert!(value.within_cap);
-        assert!(value.markers["UV_CPU_INFO"] && value.markers["CODE_EPERM"] && value.markers["BUN_CRASH"]);
+        assert!(
+            value.markers["UV_CPU_INFO"]
+                && value.markers["CODE_EPERM"]
+                && value.markers["BUN_CRASH"]
+        );
         assert!(!value.markers["UV_INTERFACE_ADDRESSES"]);
+        assert!(value.markers["MAP_JIT"] && value.markers["MMAP"] && value.markers["JIT"]);
         let text = serde_json::to_string(&value).unwrap();
         assert!(!text.contains("PRIVATE_CANARY") && !text.contains("uv_cpu_info:"));
     }
@@ -1484,9 +1510,17 @@ mod tests {
     fn offline_client_runtime_diagnostics_unknown_text_has_no_dynamic_keys_or_content() {
         let value = runtime_diagnostics(b"PRIVATE_PROMPT_CANARY /private/PRIVATE_PATH_CANARY 1234");
         assert!(value.within_cap && value.markers.values().all(|x| !x));
-        let expected: std::collections::BTreeSet<_> = STDERR_MARKERS.iter().map(|(key, _)| *key).collect();
-        assert_eq!(value.markers.keys().copied().collect::<std::collections::BTreeSet<_>>(), expected);
-        assert_eq!(expected.len(), 24);
+        let expected: std::collections::BTreeSet<_> =
+            STDERR_MARKERS.iter().map(|(key, _)| *key).collect();
+        assert_eq!(
+            value
+                .markers
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(expected.len(), 32);
         let text = serde_json::to_string(&value).unwrap();
         assert!(!text.contains("PRIVATE") && !text.contains("1234"));
     }
@@ -1503,5 +1537,4 @@ mod tests {
         let value = runtime_diagnostics(b"");
         assert!(value.within_cap && value.markers.values().all(|x| !x));
     }
-
 }
