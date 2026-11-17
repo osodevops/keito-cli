@@ -365,7 +365,8 @@ struct NativePin {
     client: Client,
 }
 fn native_stamp_allowed(client: Client, stamp: Stamp, uid: u32) -> bool {
-    stamp.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+    // mode_t is u16 on Darwin and u32 on Linux; widen both without platform casts.
+    u64::from(stamp.mode) & u64::from(libc::S_IFMT) == u64::from(libc::S_IFREG)
         && stamp.uid == uid
         && stamp.links == 1
         && stamp.mode & 0o777 == 0o755
@@ -1490,7 +1491,7 @@ mod tests {
             device: 1,
             inode: 2,
             uid: 501,
-            mode: libc::S_IFREG as u32 | 0o755,
+            mode: 0o100755, // POSIX regular file with 0755 permissions.
             links: 1,
             bytes: Client::Claude21319.bytes(),
             modified: (1, 2),
@@ -1507,7 +1508,7 @@ mod tests {
         invalid.mode |= 0o020;
         assert!(!native_stamp_allowed(Client::Claude21319, invalid, 501));
         let mut invalid = valid;
-        invalid.mode = libc::S_IFLNK as u32 | 0o755;
+        invalid.mode = 0o120755; // POSIX symlink with the same permission bits.
         assert!(!native_stamp_allowed(Client::Claude21319, invalid, 501));
         let mut invalid = valid;
         invalid.bytes += 1;
