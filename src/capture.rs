@@ -868,7 +868,7 @@ impl HookOwnerFault {
         match reason {
             "GROUP_DEADLINE" => Self::GroupDeadline,
             "GROUP_LIFETIME" => Self::GroupLifetime,
-            "SCOPE_OPERATION_DEADLINE" => Self::OperationDeadline,
+            "SCOPE_OPERATION_DEADLINE" | "SCOPE_SETUP_DEADLINE" => Self::OperationDeadline,
             "SCOPE_PROOF_DEADLINE" => Self::ProofDeadline,
             "SCOPE_CLEANUP_DEADLINE" => Self::CleanupDeadline,
             "SCOPE_CLOCK" | "GROUP_CLOCK" => Self::Clock,
@@ -3101,6 +3101,7 @@ mod failure_probe_tests {
                 "SCOPE_OPERATION_DEADLINE",
                 HookOwnerFault::OperationDeadline,
             ),
+            ("SCOPE_SETUP_DEADLINE", HookOwnerFault::OperationDeadline),
             ("SCOPE_PROOF_DEADLINE", HookOwnerFault::ProofDeadline),
             ("SCOPE_CLEANUP_DEADLINE", HookOwnerFault::CleanupDeadline),
             ("SCOPE_CLOCK", HookOwnerFault::Clock),

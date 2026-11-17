@@ -8,6 +8,7 @@ use super::{
 };
 use std::{
     collections::BTreeMap,
+    fs::File,
     io,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -122,6 +123,101 @@ impl Stage {
         matches!(self, Self::Ready | Self::Park)
     }
 }
+// Scheduling only: this lock never proves command identity, consent or success.
+// Each admission opens an independent description; never duplicate the lock FD.
+const HOOK_SETUP_SLOTS: usize = 4;
+struct HookSetupAdmission {
+    file: File,
+    name: &'static [u8],
+}
+impl HookSetupAdmission {
+    fn open(directory: &File, slot: usize) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let parent = directory
+            .metadata()
+            .map_err(|_| error("SCOPE_SETUP_GATE"))?;
+        if !parent.is_dir()
+            || parent.uid() != unsafe { libc::geteuid() }
+            || parent.mode() & 0o777 != 0o700
+        {
+            return Err(error("SCOPE_SETUP_GATE"));
+        }
+        let name: &'static [u8] = match slot {
+            0 => b"capture-hook-setup-0.lock\0",
+            1 => b"capture-hook-setup-1.lock\0",
+            2 => b"capture-hook-setup-2.lock\0",
+            3 => b"capture-hook-setup-3.lock\0",
+            _ => return Err(error("SCOPE_SETUP_GATE")),
+        };
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr().cast(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NONBLOCK
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(error("SCOPE_SETUP_GATE"));
+        }
+        let admission = Self {
+            file: unsafe { File::from_raw_fd(fd) },
+            name,
+        };
+        admission.check(directory)?;
+        Ok(admission)
+    }
+    fn check(&self, directory: &File) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|_| error("SCOPE_SETUP_GATE"))?;
+        let name = self.name;
+        let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr().cast(),
+                current.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(error("SCOPE_SETUP_GATE"));
+        }
+        let current = unsafe { current.assume_init() };
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+            || metadata.len() != 0
+            || current.st_dev as u128 != u128::from(metadata.dev())
+            || current.st_ino as u128 != u128::from(metadata.ino())
+            || current.st_mode & libc::S_IFMT != libc::S_IFREG
+        {
+            return Err(error("SCOPE_SETUP_GATE"));
+        }
+        Ok(())
+    }
+    fn try_lock(&mut self, directory: &File) -> io::Result<bool> {
+        self.check(directory)?;
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            self.check(directory)?;
+            return Ok(true);
+        }
+        if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+            Ok(false)
+        } else {
+            Err(error("SCOPE_SETUP_GATE"))
+        }
+    }
+}
+
 struct GroupEdge {
     lease: GroupLease,
     command: Option<Command>,
@@ -130,6 +226,7 @@ struct GroupEdge {
     proof: bool,
     first_fault: Option<&'static str>,
     published: [bool; 4],
+    setup_admission: Option<HookSetupAdmission>,
 }
 impl GroupEdge {
     fn progress(&mut self) -> io::Result<()> {
@@ -166,6 +263,9 @@ impl GroupEdge {
             Stage::Park => {
                 if self.lease.poll_parked()? {
                     self.stage = Stage::Running;
+                    // PARK succeeded. Both child handles remain independently
+                    // owned; only the scheduling lock is released here.
+                    self.setup_admission.take();
                 }
             }
             Stage::Running => {
@@ -175,6 +275,7 @@ impl GroupEdge {
                 if self.lease.poll_local_cleanup()?.is_some() {
                     self.proof = true;
                     self.stage = Stage::Done;
+                    self.setup_admission.take();
                 }
             }
             Stage::Done => {}
@@ -1040,6 +1141,44 @@ fn await_repository_admission<E: Edge>(
     }
 }
 
+// Queue only inside the original containing end. Actual keeper preparation
+// still begins at GroupLease::spawn's unchanged timestamp and setup policy.
+fn await_hook_setup_capacity<E: Edge>(
+    core: &mut Core<E>,
+    progress: &mut impl FnMut(&mut Core<E>),
+    clock: &mut impl FnMut() -> io::Result<u64>,
+    attempt: &mut impl FnMut() -> io::Result<bool>,
+    pause: &mut impl FnMut(),
+) -> io::Result<()> {
+    loop {
+        progress(core);
+        let at = core.admission_clock(clock)?;
+        let ready = core.repository_admission_ready()?;
+        if at >= core.active_end().saturating_sub(RESERVE_NS) {
+            core.cancel(Some("SCOPE_SETUP_DEADLINE"), at, core.active_end());
+            return Err(error("SCOPE_SETUP_DEADLINE"));
+        }
+        if ready
+            && attempt().map_err(|_| {
+                core.poison("SCOPE_SETUP_GATE");
+                error("SCOPE_SETUP_GATE")
+            })?
+        {
+            // Parent cancellation, clock failure or shortening during flock
+            // cannot grant a stale admission after the descriptor was acquired.
+            progress(core);
+            let fresh = core.admission_clock(clock)?;
+            let ready = core.repository_admission_ready()?;
+            if !ready || fresh >= core.active_end().saturating_sub(RESERVE_NS) {
+                core.cancel(Some("SCOPE_SETUP_DEADLINE"), fresh, core.active_end());
+                return Err(error("SCOPE_SETUP_DEADLINE"));
+            }
+            return Ok(());
+        }
+        pause();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SlotReport {
     pub slot: usize,
@@ -1073,6 +1212,7 @@ pub struct Scope {
     upstream: Option<Endpoint>,
     ledger: BTreeMap<Registration, bool>,
     terminal_sent: bool,
+    hook_setup_directory: Option<File>,
     _signals: Option<super::signals::InstalledHandlers>,
 }
 
@@ -1108,6 +1248,7 @@ impl Scope {
             upstream: Some(endpoint),
             ledger: BTreeMap::new(),
             terminal_sent: false,
+            hook_setup_directory: None,
             _signals: Some(signals),
         }))
     }
@@ -1158,6 +1299,50 @@ impl Scope {
     pub(crate) fn owner_state(&self) -> SharedOwner {
         self.core.owner.clone()
     }
+    pub(crate) fn set_hook_setup_directory(&mut self, directory: File) -> io::Result<()> {
+        if self.hook_setup_directory.is_some() || !self.core.slots.is_empty() || self.core.finished
+        {
+            return Err(error("SCOPE_SETUP_GATE"));
+        }
+        self.core
+            .owner
+            .borrow()
+            .check_admission()
+            .map_err(|e| error(e.0))?;
+        self.hook_setup_directory = Some(directory);
+        Ok(())
+    }
+    fn await_hook_setup_admission(&mut self) -> io::Result<Option<HookSetupAdmission>> {
+        let Some(directory) = self.hook_setup_directory.as_ref() else {
+            return Ok(None);
+        };
+        // Duplicating the directory descriptor does not duplicate a lock.
+        let directory = directory
+            .try_clone()
+            .map_err(|_| error("SCOPE_SETUP_GATE"))?;
+        let mut candidates = (0..HOOK_SETUP_SLOTS)
+            .map(|slot| HookSetupAdmission::open(&directory, slot).map(Some))
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut selected = None;
+        let upstream = &mut self.upstream;
+        let ledger = &mut self.ledger;
+        await_hook_setup_capacity(
+            &mut self.core,
+            &mut |core| Self::poll_turn(core, upstream, ledger),
+            &mut now,
+            &mut || {
+                for candidate in &mut candidates {
+                    if candidate.as_mut().unwrap().try_lock(&directory)? {
+                        selected = candidate.take();
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            },
+            &mut || std::thread::sleep(std::time::Duration::from_millis(1)),
+        )?;
+        Ok(selected)
+    }
     pub(crate) fn first_fault(&self) -> Option<ProtocolError> {
         self.core.owner.borrow().first_fault
     }
@@ -1200,6 +1385,7 @@ impl Scope {
             upstream: None,
             ledger: BTreeMap::new(),
             terminal_sent: false,
+            hook_setup_directory: None,
             _signals: None,
         }
     }
@@ -1454,6 +1640,7 @@ impl Scope {
                     proof: false,
                     first_fault: None,
                     published: [false; 4],
+                    setup_admission: None,
                 }))
             });
         if result.is_err() {
@@ -1479,6 +1666,13 @@ impl Scope {
         create: impl FnOnce(SharedOwner, u64) -> io::Result<GroupLease>,
     ) -> io::Result<SlotId> {
         clear_parent_environment(&mut command);
+        let setup_admission = match self.await_hook_setup_admission() {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.begin_cancel(ProtocolError("SCOPE_SETUP_GATE"), self.core.hard_end);
+                return Err(error);
+            }
+        };
         let at = match now() {
             Ok(at) => at,
             Err(_) => {
@@ -1491,7 +1685,8 @@ impl Scope {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let hard_end = if installer {
+        let hook_setup = setup_admission.is_some();
+        let hard_end = if installer || hook_setup {
             self.core.active_end()
         } else {
             self.core.hard_end
@@ -1515,10 +1710,13 @@ impl Scope {
                 proof: false,
                 first_fault: None,
                 published: [false; 4],
+                setup_admission,
             }))
         };
         let result = if installer {
             self.core.admit_installer(at, capacity, create_edge)
+        } else if hook_setup {
+            self.core.admit_before(at, capacity, hard_end, create_edge)
         } else {
             self.core
                 .admit(at, capacity, |owner| create_edge(owner, hard_end))
@@ -2099,6 +2297,204 @@ mod tests {
             Some(("GROUP_DEADLINE", "AWAIT_READY"))
         );
         assert!(!selected.ready_frame_observed);
+    }
+
+    #[test]
+    fn hook_setup_gate_is_exclusive_cloexec_and_rejects_replaced_or_unsafe_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = std::fs::File::open(temp.path()).unwrap();
+        let mut first = HookSetupAdmission::open(&directory, 0).unwrap();
+        assert!(first.try_lock(&directory).unwrap());
+        assert_ne!(
+            unsafe { libc::fcntl(first.file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let mut second = HookSetupAdmission::open(&directory, 0).unwrap();
+        assert!(!second.try_lock(&directory).unwrap());
+        drop(first);
+        assert!(second.try_lock(&directory).unwrap());
+        let path = temp.path().join("capture-hook-setup-0.lock");
+        std::fs::rename(&path, temp.path().join("old-lock")).unwrap();
+        let replacement = HookSetupAdmission::open(&directory, 0).unwrap();
+        assert!(second.try_lock(&directory).is_err());
+        drop(second);
+        drop(replacement);
+        std::fs::remove_file(&path).unwrap();
+        let target = temp.path().join("owned-target");
+        std::fs::write(&target, b"PRIVATE_UNREAD_TARGET").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(HookSetupAdmission::open(&directory, 0).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"not-empty").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(HookSetupAdmission::open(&directory, 0).is_err());
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(HookSetupAdmission::open(&directory, 0).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&path, temp.path().join("extra-link")).unwrap();
+        assert!(HookSetupAdmission::open(&directory, 0).is_err());
+        std::fs::remove_file(temp.path().join("extra-link")).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        assert!(HookSetupAdmission::open(&directory, 0).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(HookSetupAdmission::open(&directory, 0).is_err());
+    }
+
+    #[test]
+    fn hook_setup_pool_has_exactly_four_independent_slots_and_releases_each_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = File::open(temp.path()).unwrap();
+        let mut held = Vec::new();
+        for slot in 0..HOOK_SETUP_SLOTS {
+            let mut admission = HookSetupAdmission::open(&directory, slot).unwrap();
+            assert!(admission.try_lock(&directory).unwrap());
+            held.push(admission);
+        }
+        assert!(HookSetupAdmission::open(&directory, HOOK_SETUP_SLOTS).is_err());
+        for slot in 0..HOOK_SETUP_SLOTS {
+            let mut waiter = HookSetupAdmission::open(&directory, slot).unwrap();
+            assert!(!waiter.try_lock(&directory).unwrap());
+        }
+        drop(held.remove(2));
+        let mut released = HookSetupAdmission::open(&directory, 2).unwrap();
+        assert!(released.try_lock(&directory).unwrap());
+        let mut still_held = HookSetupAdmission::open(&directory, 0).unwrap();
+        assert!(!still_held.try_lock(&directory).unwrap());
+    }
+
+    #[test]
+    fn hook_setup_capacity_progresses_and_never_renews_an_expired_or_tighter_end() {
+        use std::cell::Cell;
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        let polls = Cell::new(0);
+        let attempts = Cell::new(0);
+        let pauses = Cell::new(0);
+        await_hook_setup_capacity(
+            &mut core,
+            &mut |_| polls.set(polls.get() + 1),
+            &mut || Ok(100),
+            &mut || {
+                attempts.set(attempts.get() + 1);
+                Ok(attempts.get() == 2)
+            },
+            &mut || pauses.set(pauses.get() + 1),
+        )
+        .unwrap();
+        assert!(polls.get() >= 3);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(pauses.get(), 1);
+        assert_eq!(core.hard_end, 500_000_000);
+        for (hard_end, at) in [(500_000_000, 450_000_000), (100_000_000, 50_000_000)] {
+            let mut core: Core<Fake> = Core::new(Rc::default(), hard_end);
+            await_hook_setup_capacity(
+                &mut core,
+                &mut |_| {},
+                &mut || Ok(at),
+                &mut || panic!("expired setup admission attempted"),
+                &mut || panic!("expired pause"),
+            )
+            .unwrap_err();
+            assert_eq!(core.hard_end, hard_end);
+            assert!(core.owner.borrow().first_fault.is_some());
+        }
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        let reads = Cell::new(0);
+        await_hook_setup_capacity(
+            &mut core,
+            &mut |_| {},
+            &mut || {
+                reads.set(reads.get() + 1);
+                Ok(if reads.get() == 1 { 1 } else { 450_000_000 })
+            },
+            &mut || Ok(true),
+            &mut || panic!("locked pause"),
+        )
+        .unwrap_err();
+        assert!(core.owner.borrow().first_fault.is_some());
+    }
+
+    #[test]
+    fn hook_setup_capacity_rechecks_parent_after_lock_and_preserves_gate_errors() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        let owner = core.owner.clone();
+        await_hook_setup_capacity(
+            &mut core,
+            &mut |_| {},
+            &mut || Ok(1),
+            &mut || {
+                owner.borrow_mut().poison(ProtocolError("PARENT_CANCELLED"));
+                Ok(true)
+            },
+            &mut || panic!("post-lock cancelled pause"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            core.owner.borrow().first_fault,
+            Some(ProtocolError("PARENT_CANCELLED"))
+        );
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        await_hook_setup_capacity(
+            &mut core,
+            &mut |_| {},
+            &mut || Ok(1),
+            &mut || Err(error("PRIVATE_IO_CANARY")),
+            &mut || panic!("failed gate pause"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            core.owner.borrow().first_fault,
+            Some(ProtocolError("SCOPE_SETUP_GATE"))
+        );
+    }
+
+    #[test]
+    fn hook_setup_capacity_preserves_parent_fault_clock_failure_and_poll_shortening() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        core.poison("PARENT_CANCELLED");
+        await_hook_setup_capacity(
+            &mut core,
+            &mut |_| {},
+            &mut || Ok(1),
+            &mut || panic!("cancelled lock attempt"),
+            &mut || {},
+        )
+        .unwrap_err();
+        assert_eq!(
+            core.owner.borrow().first_fault,
+            Some(ProtocolError("PARENT_CANCELLED"))
+        );
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        await_hook_setup_capacity(
+            &mut core,
+            &mut |_| {},
+            &mut || Err(error("SCOPE_CLOCK")),
+            &mut || panic!("clock-failed lock attempt"),
+            &mut || {},
+        )
+        .unwrap_err();
+        assert_eq!(core.cancel_end, Some(0));
+        assert_eq!(
+            core.owner.borrow().first_fault,
+            Some(ProtocolError("SCOPE_CLOCK"))
+        );
+        let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
+        await_hook_setup_capacity(
+            &mut core,
+            &mut |core| core.hard_end = 50_000_001,
+            &mut || Ok(1),
+            &mut || panic!("shortened lock attempt"),
+            &mut || {},
+        )
+        .unwrap_err();
+        assert_eq!(core.hard_end, 50_000_001);
     }
 
     #[test]

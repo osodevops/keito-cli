@@ -89,6 +89,10 @@ pub fn directory() -> Result<PathBuf, AppError> {
     }
 }
 #[cfg(unix)]
+pub(crate) fn hook_setup_directory() -> Result<File, AppError> {
+    private_directory(&directory()?, 1)
+}
+#[cfg(unix)]
 fn private_directory(directory: &Path, private_components: usize) -> Result<File, AppError> {
     use std::ffi::CString;
     use std::os::{

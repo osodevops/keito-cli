@@ -291,6 +291,9 @@ impl<'a> CommandOwner<'a> {
             .min(at.saturating_add(HOOK_NS))
             .min(scope.hard_end());
         scope.tighten_end(end);
+        scope
+            .set_hook_setup_directory(crate::capture_invocations::hook_setup_directory()?)
+            .map_err(|_| refused())?;
         Ok(Self {
             scope: ScopeRef::Borrowed(scope),
             image: Image::Borrowed(runtime.keeper()),

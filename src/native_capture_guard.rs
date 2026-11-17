@@ -268,6 +268,18 @@ mod unix {
             }
         }
     }
+    fn flush_rename_publication_with(
+        publication: &File,
+        flags: &File,
+        flush: impl FnOnce(&File) -> Result<(), ()>,
+    ) -> Result<(), ()> {
+        // The preparing entry was already durable before rename. Namespace
+        // mutation stays exclusive, while its flush need not serialize other
+        // publishers. The marker remains EX-locked, and core launch still
+        // requires this flush to succeed. Unlink cleanup keeps its old barrier.
+        unlock(publication);
+        flush(flags)
+    }
     fn set_errno(value: i32) {
         #[cfg(target_os = "macos")]
         unsafe {
@@ -444,8 +456,7 @@ mod unix {
         {
             return Err(());
         }
-        sync(&flags)?;
-        unlock(&publication);
+        flush_rename_publication_with(&publication, &flags, sync)?;
         let initial = marker.metadata().map_err(|_| ())?;
         if crate::process_ownership::signals::pending()
             || started.elapsed() >= Duration::from_millis(600)
@@ -668,6 +679,161 @@ mod unix {
         let clean = scope.finish().clean && result.is_ok();
         scope.publish_terminal(clean);
         result
+    }
+    #[cfg(test)]
+    mod publication_tests {
+        use super::*;
+        use std::os::unix::fs::OpenOptionsExt;
+        fn owned_file(path: &Path) -> File {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap()
+        }
+        #[test]
+        fn rename_flush_releases_publication_but_retains_guardian_marker_lock() {
+            let temp = tempfile::tempdir().unwrap();
+            let flags = File::open(temp.path()).unwrap();
+            let publication_path = temp.path().join("publication.lock");
+            let marker_path = temp.path().join("pending");
+            let publication = owned_file(&publication_path);
+            let marker = owned_file(&marker_path);
+            assert!(lock(&publication));
+            assert!(lock(&marker));
+            flush_rename_publication_with(&publication, &flags, |_| {
+                let next_publisher = File::open(&publication_path).unwrap();
+                assert_eq!(
+                    unsafe {
+                        libc::flock(next_publisher.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+                    },
+                    0,
+                    "directory flush must not serialize another atomic publication"
+                );
+                let marker_probe = File::open(&marker_path).unwrap();
+                assert_ne!(
+                    unsafe { libc::flock(marker_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+        #[test]
+        fn pending_rename_blocks_real_delivery_during_paused_and_failed_flush() {
+            use keito_cli::capture::{self, Binding, Clock, Repository, Signal, Store};
+            use keito_cli::cli::capture::CaptureEvent::{Prompt, Stop};
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let mut store = Store::open(&root).unwrap();
+            let repository = Repository {
+                key: capture::hash("fixture"),
+                remote_hash: capture::hash("remote"),
+                hint_hash: capture::hash("hint"),
+                linked_without_hint: false,
+                disabled: false,
+            };
+            let binding = store
+                .approve(Binding {
+                    repository_key: repository.key.clone(),
+                    remote_hash: repository.remote_hash.clone(),
+                    hint_hash: repository.hint_hash.clone(),
+                    id: String::new(),
+                    version: 0,
+                    workspace_id: "co_fixture".into(),
+                    owner_id: "owner_fixture".into(),
+                    origin_hash: capture::hash("origin"),
+                    project_id: "project_fixture".into(),
+                    task_id: "task_fixture".into(),
+                    agents: vec!["codex".into()],
+                    paused: false,
+                    revoked: false,
+                })
+                .unwrap();
+            let clock = |n: i64| Clock {
+                wall: 1794067200 + n,
+                monotonic: 1000 + n,
+                boot: "fixture".into(),
+            };
+            for (event, n) in [(Prompt, 0), (Stop, 30)] {
+                store
+                    .event(
+                        &repository,
+                        Signal {
+                            source: "codex",
+                            resumed: false,
+                            source_id: "session_fixture",
+                            turn_id: Some("turn_fixture"),
+                            version: "0.167.0",
+                            event,
+                            clock: &clock(n),
+                        },
+                    )
+                    .unwrap();
+            }
+            assert!(store.has_ready(&binding, clock(31).wall).unwrap());
+            let flags_path = root.join("capture-invocations");
+            std::fs::create_dir_all(&flags_path).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&flags_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let flags = File::open(&flags_path).unwrap();
+            let publication = owned_file(&root.join("capture-invocations-publication.lock"));
+            let nonce = capture::hash("unlaunched-guard");
+            let preparing = flags_path.join(format!("{nonce}.preparing"));
+            let pending = flags_path.join(format!("{nonce}.pending"));
+            let mut marker = owned_file(&preparing);
+            assert!(lock(&marker));
+            marker.write_all(PENDING).unwrap();
+            sync(&marker).unwrap();
+            sync(&flags).unwrap();
+            assert!(lock(&publication));
+            std::fs::rename(&preparing, &pending).unwrap();
+            assert!(flush_rename_publication_with(&publication, &flags, |_| {
+                assert!(!store.has_ready(&binding, clock(31).wall).unwrap());
+                assert!(store.claim(&binding, clock(31).wall).unwrap().is_none());
+                Err(())
+            })
+            .is_err());
+            assert_eq!(std::fs::read(&pending).unwrap(), PENDING);
+            assert!(!store.has_ready(&binding, clock(31).wall).unwrap());
+            assert!(store.claim(&binding, clock(31).wall).unwrap().is_none());
+            drop(marker);
+            assert!(!store.has_ready(&binding, clock(32).wall).unwrap());
+            assert!(store.claim(&binding, clock(32).wall).unwrap().is_none());
+        }
+        #[test]
+        fn rename_flush_failure_stays_failure_without_relocking_or_removing_marker() {
+            let temp = tempfile::tempdir().unwrap();
+            let flags = File::open(temp.path()).unwrap();
+            let publication_path = temp.path().join("publication.lock");
+            let marker_path = temp.path().join("pending");
+            let publication = owned_file(&publication_path);
+            let mut marker = owned_file(&marker_path);
+            marker.write_all(PENDING).unwrap();
+            assert!(lock(&publication));
+            assert!(lock(&marker));
+            let mut called = 0;
+            assert!(flush_rename_publication_with(&publication, &flags, |_| {
+                called += 1;
+                let next_publisher = File::open(&publication_path).unwrap();
+                assert_eq!(
+                    unsafe {
+                        libc::flock(next_publisher.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+                    },
+                    0
+                );
+                Err(())
+            })
+            .is_err());
+            assert_eq!(called, 1);
+            assert_eq!(std::fs::read(&marker_path).unwrap(), PENDING);
+        }
     }
 }
 #[cfg(unix)]
