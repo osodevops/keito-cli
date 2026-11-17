@@ -259,7 +259,7 @@ fn inherited_descriptors() -> Result<Vec<i32>> {
     };
     if count <= 0
         || count as usize >= capacity
-        || count as usize % std::mem::size_of::<libc::proc_fdinfo>() != 0
+        || !(count as usize).is_multiple_of(std::mem::size_of::<libc::proc_fdinfo>())
     {
         return Err(Failure::Admission);
     }
