@@ -322,7 +322,7 @@ pub fn run_offline() -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn offline_plan_has_only_four_fixed_non_model_operations() {
+    fn offline_client_offline_plan_has_only_four_fixed_non_model_operations() {
         assert_eq!(PLAN.len(), 4);
         assert_eq!(arguments(Client::Claude21319, Operation::Version), ["--version"]);
         assert_eq!(arguments(Client::Claude21319, Operation::RequiredHelp), ["--help"]);
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(PLAN.iter().map(|(_,op)| { let(a,b)=caps(*op);a+b }).sum::<usize>(), 180_224);
     }
     #[test]
-    fn deadlines_are_not_renewed_and_inherited_parent_wins() {
+    fn offline_client_deadlines_are_not_renewed_and_inherited_parent_wins() {
         let mut state = PlanState::new(100, 2_000_000_100).unwrap();
         assert_eq!(state.admit(100, PLAN[0].0, PLAN[0].1).unwrap(), 1_000_000_100);
         assert_eq!(state.admit(1_500_000_100, PLAN[1].0, PLAN[1].1).unwrap(), 2_000_000_100);
@@ -339,7 +339,7 @@ mod tests {
         assert!(PlanState::new(u64::MAX, u64::MAX).is_err());
     }
     #[test]
-    fn duplicate_out_of_order_backwards_and_fifth_admission_fail_closed() {
+    fn offline_client_duplicate_out_of_order_backwards_and_fifth_admission_fail_closed() {
         let mut state = PlanState::new(100, u64::MAX).unwrap();
         assert!(state.admit(100, PLAN[1].0, PLAN[1].1).is_err());
         assert!(state.admit(100, PLAN[0].0, PLAN[0].1).is_err());
@@ -351,7 +351,7 @@ mod tests {
         assert!(state.admit(200, PLAN[0].0, PLAN[0].1).is_err());
     }
     #[test]
-    fn version_projection_refuses_near_versions_private_output_and_invalid_utf8() {
+    fn offline_client_version_projection_refuses_near_versions_private_output_and_invalid_utf8() {
         assert!(project_version(Client::Claude21319, b"2.1.319 (Claude Code)\n").is_ok());
         assert!(project_version(Client::Codex01670Native, b"codex-cli 0.167.0\n").is_ok());
         for raw in [&b"2.1.322 (Claude Code)"[..], &b"PRIVATE_token 0.167.0"[..], &[255][..]] {
@@ -359,7 +359,7 @@ mod tests {
         }
     }
     #[test]
-    fn native_pin_rejects_symlink_mode_owner_link_or_size_substitutes() {
+    fn offline_client_native_pin_rejects_symlink_mode_owner_link_or_size_substitutes() {
         let valid = Stamp { device: 1, inode: 2, uid: 501, mode: libc::S_IFREG as u32 | 0o755,
             links: 1, bytes: Client::Claude21319.bytes(), modified: (1,2), changed: (3,4) };
         assert!(native_stamp_allowed(Client::Claude21319, valid, 501));
@@ -370,7 +370,7 @@ mod tests {
         let mut invalid = valid; invalid.bytes += 1; assert!(!native_stamp_allowed(Client::Claude21319, invalid, 501));
     }
     #[test]
-    fn help_projection_does_not_treat_prose_as_a_capability_or_serialize_it() {
+    fn offline_client_help_projection_does_not_treat_prose_as_a_capability_or_serialize_it() {
         let value = project_help(b"PRIVATE_PROMPT --resume\n  --json  JSON\n  -m, --model <MODEL>\n").unwrap();
         assert!(value.structured_output && value.model && !value.resume);
         let text = serde_json::to_string(&value).unwrap();
