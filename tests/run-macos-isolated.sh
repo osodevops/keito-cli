@@ -44,11 +44,14 @@ verify_profile() {
 }
 trap verify_profile EXIT
 cd "$repo"
-CARGO_TARGET_DIR="$repo/target" CARGO_NET_OFFLINE=true cargo build --locked --features dev-tools --bin check-service-boundary
+target_dir=${CARGO_TARGET_DIR:-$repo/target}
+mkdir -p "$target_dir"
+target_dir=$(cd "$target_dir" && pwd -P)
+CARGO_TARGET_DIR="$target_dir" CARGO_NET_OFFLINE=true cargo build --locked --features dev-tools --bin check-service-boundary
 root=$(mktemp -d /tmp/keito-native-tests.XXXXXX)
 root=$(cd "$root" && pwd -P)
 chmod 700 "$root"
-"$repo/target/debug/check-service-boundary" prepare "$root"
+"$target_dir/debug/check-service-boundary" prepare "$root"
 printf 'Owned test boundary: %s\n' "$root"
 # Read-only source Git membership is collected before the kernel boundary.
 PYTHONDONTWRITEBYTECODE=1 python3 "$repo/tests/support/source_qa_manifest.py" collect \
@@ -58,7 +61,7 @@ source_manifest_parent=$root
 env -i HOME="$root/home" CODEX_HOME="$root/home/.codex" CLAUDE_CONFIG_DIR="$root/home/.claude" \
   KEITO_CAPTURE_HOME="$root/home/capture" XDG_CONFIG_HOME="$root/home/config" APPDATA="$root/home/AppData" \
   GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null PATH="$PATH" \
-  CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" CARGO_TARGET_DIR="$repo/target" \
+  CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" CARGO_TARGET_DIR="$target_dir" \
   CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS="$cargo_jobs" RUST_TEST_THREADS="$test_threads" RUSTFLAGS="${RUSTFLAGS:-}" RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}" \
   KEITO_TEST_RUSTC_BIN="$rustc_bin" \
   /usr/bin/sandbox-exec -f "$root/boundary.sb" /bin/bash "$repo/tests/support/run-inherited-suite.sh" \

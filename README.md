@@ -403,8 +403,24 @@ $ keito time list --limit 2
 git clone https://github.com/osodevops/keito-cli.git
 cd keito-cli
 cargo build --release
-cargo test --all-targets
 ```
+
+For tests, use the platform runners below. A plain source build intentionally
+cannot provide verified capture ownership.
+
+```sh
+# Linux: compile and verify source-fixture CLI/guard pairs, then run all targets.
+python3 -I -S -B tests/support/run_paired_tests.py "$(rustup which cargo)" "$(rustup which rustc)"
+# macOS: use the protected runner described below.
+# Windows: manual CLI tests; native capture remains unsupported.
+cargo test --all-features --all-targets
+```
+
+The Unix pair runner uses the existing opt2 source-fixture build settings so
+executable hashing fits the unchanged capture deadlines. Each capture test
+executable receives its own manifest and the actual compiled guard digest;
+tests of missing or unqualified release pairs retain their unpaired binaries.
+These fixtures do not qualify a release or a real agent client.
 
 ### Generate Man Pages
 

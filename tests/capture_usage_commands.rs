@@ -4,6 +4,8 @@
 #![cfg(unix)]
 #[path = "support/mutation_environment.rs"]
 mod isolation;
+#[path = "support/runtime_pair.rs"]
+mod runtime_pair;
 #[path = "support/service_boundary.rs"]
 mod service_boundary;
 
@@ -54,8 +56,23 @@ impl Fixture {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let core = root.join("keito-source-cli");
-        fs::copy(assert_cmd::cargo::cargo_bin!("keito"), &core).unwrap();
+        let pair = runtime_pair::pair();
+        fs::copy(&pair.core_path, &core).unwrap();
         fs::set_permissions(&core, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::copy(&pair.guard_path, root.join("keito-capture-guard")).unwrap();
+        fs::set_permissions(
+            root.join("keito-capture-guard"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::copy(
+            pair.core_path
+                .parent()
+                .unwrap()
+                .join("capture-runtime-manifest.json"),
+            root.join("capture-runtime-manifest.json"),
+        )
+        .unwrap();
         let fixture = Self {
             _temp: temp,
             root,
@@ -68,9 +85,13 @@ impl Fixture {
 
         // Only Git exists on this explicit PATH. No real harness, service or
         // credential helper can accidentally be selected from the operator PATH.
-        symlink("/usr/bin/git", fixture.root.join("bin/git")).unwrap();
+        let git = std::env::split_paths(&runtime_pair::process_path())
+            .next()
+            .unwrap()
+            .join("git");
+        symlink(&git, fixture.root.join("bin/git")).unwrap();
         let git = fixture
-            .command(Path::new("/usr/bin/git"))
+            .command(&git)
             .args(["init", "--quiet"])
             .output()
             .unwrap();
@@ -96,6 +117,13 @@ impl Fixture {
             })
             .unwrap();
         drop(store);
+        fixture
+    }
+
+    fn unpaired() -> Self {
+        let fixture = Self::new();
+        fs::remove_file(fixture.root.join("keito-capture-guard")).unwrap();
+        fs::remove_file(fixture.root.join("capture-runtime-manifest.json")).unwrap();
         fixture
     }
 
@@ -358,7 +386,7 @@ fn normal_numeric_disable_revokes_only_selected_namespace_without_opening_a_prof
             .unwrap();
         assert!(
             output.status.success(),
-            "explicit local numeric withdrawal must work without a qualified runtime/profile"
+            "explicit local numeric withdrawal must work without a qualified numeric profile"
         );
         let status: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(status["enabled"], false);
@@ -391,7 +419,7 @@ fn normal_numeric_disable_revokes_only_selected_namespace_without_opening_a_prof
 
 #[test]
 fn normal_numeric_enable_requires_an_embedded_pair_before_profile_or_version_work() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::unpaired();
     for (namespace, _) in NAMESPACES {
         let output = fixture
             .cli()
@@ -431,10 +459,14 @@ fn default_normal_hooks_remain_metadata_only_even_with_supported_version_and_act
         for event in ["prompt", "stop"] {
             let input = json!({"session_id":SESSION,"turn_id":"turn_synthetic","prompt_id":"turn_synthetic","cwd":fixture.repo,"transcript_path":fixture.source(namespace),"prompt":"PRIVATE_PROMPT_CANARY","tool_input":{"secret":"PRIVATE_TOOL_CANARY"}});
             let output = fixture
-                .cli()
+                .command(&fixture.root.join("keito-capture-guard"))
+                .env(
+                    "KEITO_CAPTURE_CORE_SHA256",
+                    capture::hash(fs::read(&fixture.core).unwrap()),
+                )
+                .arg("--core")
+                .arg(&fixture.core)
                 .args([
-                    "capture",
-                    "hook",
                     "--agent",
                     namespace,
                     "--event",

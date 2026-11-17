@@ -79,8 +79,13 @@ jobs:
       - name: Run macOS tests inside the proved service/network boundary
         if: runner.os == 'macOS'
         run: KEITO_TEST_REAL_PROFILE_HOME="$HOME" tests/run-macos-isolated.sh
+      - name: Run Linux tests with verified source-fixture runtime pairs
+        if: runner.os == 'Linux'
+        run: |
+          python3 -I -S -B tests/support/test_paired_test_runner.py
+          python3 -I -S -B tests/support/run_paired_tests.py "$(rustup which cargo)" "$(rustup which rustc)"
       - run: cargo test --all-features --all-targets
-        if: runner.os != 'macOS'
+        if: runner.os == 'Windows'
       - name: Verify normal numeric capture with an owned source-fixture pair
         if: runner.os == 'Linux'
         shell: bash

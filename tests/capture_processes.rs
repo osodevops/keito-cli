@@ -1,11 +1,143 @@
 #![cfg(unix)]
+#[path = "support/runtime_pair.rs"]
+mod runtime_pair;
+#[path = "support/service_boundary.rs"]
+mod service_boundary;
 use keito_cli::capture::{self, Binding, Clock, Repository, Signal, Store};
 use keito_cli::cli::capture::CaptureEvent::Prompt;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[cfg(feature = "dev-tools")]
+#[test]
+fn repository_cohort_with_cooperative_parent() {
+    use keito_cli::process_ownership::scope::Scope;
+    if let Some(root) = std::env::var_os("KEITO_TEST_COHORT_CHILD") {
+        let mut scope = Scope::entry_from_environment(500_000_000).unwrap().unwrap();
+        let result = keito_cli::source_qa_scope::diagnose_fixture_repository_cohort(
+            &mut scope,
+            &runtime_pair::pair().core_path,
+            std::path::Path::new(&root),
+            |_, _, _, _| Ok(()),
+        );
+        let report = scope.finish();
+        scope.publish_terminal(result.is_ok() && report.clean);
+        assert!(result.is_ok() && report.clean, "{result:?} {report:?}");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(temp.path())
+        .arg("init")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
+        0
+    );
+    let end = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64 + 600_000_000;
+    let mut scope = Scope::local_entry(end).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", runtime_pair::process_path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("KEITO_TEST_PAIR_CORE", runtime_pair::pair().core_path)
+        .args([
+            "--exact",
+            "repository_cohort_with_cooperative_parent",
+            "--nocapture",
+        ])
+        .env("KEITO_TEST_COHORT_CHILD", temp.path());
+    let slot = scope.start_cooperative(child).unwrap();
+    while !scope.slot_complete(&slot) && !scope.failed() {
+        scope.poll();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let report = scope.finish();
+    assert!(report.clean, "{report:?}");
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn verified_pair_repository_cohort_fits_the_hook_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(temp.path())
+        .arg("init")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let pair = runtime_pair::pair();
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
+        0
+    );
+    let end = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64 + 500_000_000;
+    let mut scope = keito_cli::process_ownership::scope::Scope::local_entry(end).unwrap();
+    let result = keito_cli::source_qa_scope::diagnose_fixture_repository_cohort(
+        &mut scope,
+        &pair.core_path,
+        temp.path(),
+        |_, _, _, _| Ok(()),
+    );
+    let report = scope.finish();
+    assert!(result.is_ok(), "cohort error={result:?} report={report:?}");
+    assert!(report.clean);
+}
+
+// Exercise the installed ownership entry rather than the now-refused bare hook.
+fn hook(root: &std::path::Path, capture: &std::path::Path, event: &str) -> Command {
+    let pair = runtime_pair::pair();
+    drop(service_boundary::command(&pair.guard_path));
+    let home = capture.parent().unwrap();
+    let mut command = Command::new(&pair.guard_path);
+    command
+        .env_clear()
+        .current_dir(root)
+        .env("HOME", home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("AppData"))
+        .env("PATH", runtime_pair::process_path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("KEITO_CAPTURE_HOME", capture)
+        .env("KEITO_CAPTURE_CORE_SHA256", &pair.core_sha256)
+        .arg("--core")
+        .arg(pair.core_path)
+        .args([
+            "--agent",
+            "codex",
+            "--event",
+            event,
+            "--harness-version",
+            "0.167.0",
+        ]);
+    command
+}
+
 #[test]
 fn concurrent_real_hook_processes_persist_once_and_discard_raw_content() {
+    assert_concurrent_hooks(20);
+}
+
+#[test]
+fn one_verified_guard_hook_accepts_the_seeded_boundary() {
+    assert_concurrent_hooks(1);
+}
+
+fn assert_concurrent_hooks(count: usize) {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("PRIVATE_PATH_CANARY");
     std::fs::create_dir(&repo_root).unwrap();
@@ -55,21 +187,9 @@ fn concurrent_real_hook_processes_persist_once_and_discard_raw_content() {
         )
         .unwrap();
     let body=serde_json::json!({"session_id":"session-fixture","turn_id":"turn-fixture","cwd":repo_root,"prompt":"PRIVATE_PROMPT_CANARY","last_assistant_message":"PRIVATE_ASSISTANT_CANARY","transcript_path":"/PRIVATE_TRANSCRIPT_CANARY","tool_input":{"secret":"PRIVATE_TOOL_CANARY"}}).to_string();
-    let children: Vec<_> = (0..20)
+    let children: Vec<_> = (0..count)
         .map(|_| {
-            let mut child = Command::new(assert_cmd::cargo::cargo_bin!("keito"))
-                .current_dir(&repo_root)
-                .env("KEITO_CAPTURE_HOME", &capture_dir)
-                .args([
-                    "capture",
-                    "hook",
-                    "--agent",
-                    "codex",
-                    "--event",
-                    "stop",
-                    "--harness-version",
-                    "0.167.0",
-                ])
+            let mut child = hook(&repo_root, &capture_dir, "stop")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -92,12 +212,30 @@ fn concurrent_real_hook_processes_persist_once_and_discard_raw_content() {
     }
     let sessions = store.preview("session-fixture").unwrap();
     assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].segments.len(), 1);
+    assert_eq!(
+        sessions[0].segments.len(),
+        1,
+        "synthetic session={} status={}",
+        serde_json::to_string(&sessions).unwrap(),
+        serde_json::to_string(&store.status().unwrap()).unwrap()
+    );
     assert!((90..=92).contains(&sessions[0].segments[0].duration_seconds));
     assert_eq!(sessions[0].revision, 1);
-    for entry in std::fs::read_dir(&capture_dir).unwrap() {
-        let bytes = std::fs::read(entry.unwrap().path()).unwrap();
-        assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE"));
+    assert_no_private_content(&capture_dir);
+}
+
+fn assert_no_private_content(directory: &std::path::Path) {
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(!metadata.file_type().is_symlink(), "fixture tree escaped");
+        if metadata.is_dir() {
+            assert_no_private_content(&path);
+        } else {
+            assert!(metadata.is_file());
+            let bytes = std::fs::read(path).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE"));
+        }
     }
 }
 
@@ -193,19 +331,7 @@ fn sqlite_contention_exposes_lost_boundary_as_storage_pause_in_status() {
     );
     drop(probe);
     let start = std::time::Instant::now();
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("keito"))
-        .current_dir(&root)
-        .env("KEITO_CAPTURE_HOME", &capture)
-        .args([
-            "capture",
-            "hook",
-            "--agent",
-            "codex",
-            "--event",
-            "prompt",
-            "--harness-version",
-            "0.167.0",
-        ])
+    let mut child = hook(&root, &capture, "prompt")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -222,7 +348,7 @@ fn sqlite_contention_exposes_lost_boundary_as_storage_pause_in_status() {
     authority.kill().unwrap();
     authority.wait().unwrap();
     database.execute_batch("ROLLBACK").unwrap();
-    let result = Command::new(assert_cmd::cargo::cargo_bin!("keito"))
+    let result = Command::new(runtime_pair::pair().core_path)
         .current_dir(&root)
         .env("KEITO_CAPTURE_HOME", &capture)
         .args(["capture", "status", "--json"])
@@ -288,20 +414,8 @@ fn refused_stop_under_real_lock_cannot_be_completed_by_another_hook_process() {
         .unwrap();
     let payload=serde_json::json!({"cwd":root,"session_id":"refused-native","turn_id":"refused-turn","prompt":"PRIVATE_CANARY"}).to_string();
     let database = rusqlite::Connection::open(capture.join("capture.sqlite3")).unwrap();
-    let hook = || {
-        let mut child = Command::new(assert_cmd::cargo::cargo_bin!("keito"))
-            .current_dir(&root)
-            .env("KEITO_CAPTURE_HOME", &capture)
-            .args([
-                "capture",
-                "hook",
-                "--agent",
-                "codex",
-                "--event",
-                "stop",
-                "--harness-version",
-                "0.167.0",
-            ])
+    let invoke_hook = || {
+        let mut child = hook(&root, &capture, "stop")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -316,11 +430,15 @@ fn refused_stop_under_real_lock_cannot_be_completed_by_another_hook_process() {
         child.wait_with_output().unwrap()
     };
     database.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let refused = hook();
+    let refused = invoke_hook();
     assert!(refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("refused this boundary"));
+    assert!(refused.stderr.is_empty(), "installed guard stays silent");
+    assert!(
+        store.status().unwrap().storage_paused,
+        "refusal must be durable"
+    );
     database.execute_batch("ROLLBACK").unwrap();
-    let duplicate = hook();
+    let duplicate = invoke_hook();
     assert!(duplicate.status.success());
     let session = &store.preview("refused-native").unwrap()[0];
     assert!(session.needs_attention);
@@ -328,6 +446,14 @@ fn refused_stop_under_real_lock_cannot_be_completed_by_another_hook_process() {
     assert_eq!(session.segments[0].duration_seconds, 0);
     assert_eq!(session.segments[0].completeness, "INCOMPLETE");
     assert!(store.status().unwrap().storage_paused);
+    assert!(
+        store
+            .claim(&binding, chrono::Utc::now().timestamp())
+            .unwrap()
+            .is_none(),
+        "a retained failed invocation must block transmission"
+    );
+    store.recover(&Clock::now().unwrap()).unwrap();
     let queued = store
         .claim(&binding, chrono::Utc::now().timestamp())
         .unwrap()

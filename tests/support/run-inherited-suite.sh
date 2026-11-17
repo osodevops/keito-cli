@@ -7,7 +7,9 @@ cargo_bin=$3
 shift 3
 "$checker" verify "$root"
 export KEITO_TEST_SERVICE_BOUNDARY_RECEIPT="$root/service-boundary-receipt.json"
-"$cargo_bin" test --locked --all-features --all-targets "$@"
+python3 -I -S -B tests/support/test_paired_test_runner.py
+python3 -I -S -B tests/support/run_paired_tests.py "$cargo_bin" \
+  "${KEITO_TEST_RUSTC_BIN:?Canonical rustc must be prepared before the boundary}" "$@"
 if [ "$#" -eq 0 ]; then
   mkdir -m 700 "$root/finite-manager-tmp"
   export TMPDIR="$root/finite-manager-tmp"

@@ -20,9 +20,23 @@ fn run() -> &'static Run {
     static RUN: OnceLock<Run> = OnceLock::new();
     RUN.get_or_init(||{
  let temp=tempfile::tempdir().unwrap();let root=temp.path().canonicalize().unwrap();let source=root.join("fake-core.rs");let core=root.join("fake-core");
- fs::write(&source,r#"use std::{fs::{self,File,OpenOptions},io::{Read,Write},os::fd::FromRawFd,time::Duration};
+ fs::write(&source,r#"use std::{fs::{self,File,OpenOptions},io::{Read,Write},os::{fd::FromRawFd,unix::net::UnixStream},net::Shutdown,time::Duration};
 unsafe extern "C"{fn fcntl(fd:i32,cmd:i32,...)->i32;}
-fn main(){let image_fd=std::env::var("KEITO_CAPTURE_IMAGE_FD").unwrap().parse::<i32>().unwrap();for fd in 4..256{if fd!=image_fd{assert_eq!(unsafe{fcntl(fd,1)},-1,"unexpected inherited descriptor {fd}");}}let image=unsafe{File::from_raw_fd(image_fd)};assert!(image.metadata().unwrap().is_file());drop(image);assert_eq!(unsafe{fcntl(image_fd,1)},-1,"image descriptor must close before core parsing");let mode=std::env::var("NATIVE_TEST_CORE_MODE").unwrap();let home=std::path::PathBuf::from(std::env::var_os("KEITO_CAPTURE_HOME").unwrap());let nonce=std::env::var("KEITO_CAPTURE_INVOCATION_NONCE").unwrap();let flag=home.join("capture-invocations").join(format!("{nonce}.pending"));assert!(flag.exists(),"core entered before durable flag");if mode=="stall"{std::thread::sleep(Duration::from_secs(5));return;}let mut bytes=Vec::new();std::io::stdin().read_to_end(&mut bytes).unwrap();if let Some(path)=std::env::var_os("NATIVE_TEST_INPUT_LOG"){fs::write(path,bytes).unwrap();}if mode=="edit"{let mut file=OpenOptions::new().write(true).truncate(true).open(&flag).unwrap();file.write_all(b"UNEXPECTED_SAME_INODE_EDIT").unwrap();file.sync_all().unwrap();}if mode!="missing"{let fd=std::env::var("KEITO_CAPTURE_ACK_FD").unwrap().parse::<i32>().unwrap();let mut file=unsafe{File::from_raw_fd(fd)};file.write_all(b"KEITO_CAPTURE_DURABLE_V1\n").unwrap();if mode=="extra"{file.write_all(b"extra").unwrap();}}if mode=="ack-stall"{std::thread::sleep(Duration::from_secs(5));}if mode=="nonzero"{std::process::exit(23);}}
+fn main(){
+assert_eq!(std::env::var("KEITO_PROCESS_OWNER_FD").unwrap(),"4");
+assert_eq!(std::env::var("KEITO_PROCESS_OWNER_CONTRACT").unwrap(),"2");
+let owner_nonce=std::env::var("KEITO_PROCESS_OWNER_NONCE").unwrap();
+assert_eq!(owner_nonce.len(),32);
+let mut owner=unsafe{UnixStream::from_raw_fd(4)};
+owner.write_all(format!("{}|LIVE|{}\n",owner_nonce,std::process::id()).as_bytes()).unwrap();
+let image_fd=std::env::var("KEITO_CAPTURE_IMAGE_FD").unwrap().parse::<i32>().unwrap();for fd in 4..256{if fd!=image_fd && fd!=4{assert_eq!(unsafe{fcntl(fd,1)},-1,"unexpected inherited descriptor {fd}");}}let image=unsafe{File::from_raw_fd(image_fd)};assert!(image.metadata().unwrap().is_file());drop(image);assert_eq!(unsafe{fcntl(image_fd,1)},-1,"image descriptor must close before core parsing");let mode=std::env::var("NATIVE_TEST_CORE_MODE").unwrap();let home=std::path::PathBuf::from(std::env::var_os("KEITO_CAPTURE_HOME").unwrap());let nonce=std::env::var("KEITO_CAPTURE_INVOCATION_NONCE").unwrap();let flag=home.join("capture-invocations").join(format!("{nonce}.pending"));assert!(flag.exists(),"core entered before durable flag");if mode=="stall"{std::thread::sleep(Duration::from_secs(5));return;}let mut bytes=Vec::new();std::io::stdin().read_to_end(&mut bytes).unwrap();if let Some(path)=std::env::var_os("NATIVE_TEST_INPUT_LOG"){fs::write(path,bytes).unwrap();}if mode=="edit"{let mut file=OpenOptions::new().write(true).truncate(true).open(&flag).unwrap();file.write_all(b"UNEXPECTED_SAME_INODE_EDIT").unwrap();file.sync_all().unwrap();}if mode!="missing"{let fd=std::env::var("KEITO_CAPTURE_ACK_FD").unwrap().parse::<i32>().unwrap();let mut file=unsafe{File::from_raw_fd(fd)};file.write_all(b"KEITO_CAPTURE_DURABLE_V1\n").unwrap();if mode=="extra"{file.write_all(b"extra").unwrap();}}if mode=="ack-stall"{std::thread::sleep(Duration::from_secs(5));}if mode=="nonzero"{std::process::exit(23);}
+// This inert core owns no descendants. A valid durable ACK alone is still
+// insufficient: separately settle its cooperative resource endpoint.
+if mode!="missing-terminal"{
+owner.write_all(format!("{}|SETTLED|{}\n",owner_nonce,std::process::id()).as_bytes()).unwrap();
+owner.shutdown(Shutdown::Write).unwrap();
+}}
+
 "#).unwrap();assert!(Command::new("rustc").args(["--edition=2021","-C","opt-level=s","-C","strip=symbols"]).arg(&source).arg("-o").arg(&core).status().unwrap().success());Run{_temp:temp,root,core}
 })
 }
@@ -126,7 +140,14 @@ impl Scope {
 }
 #[test]
 fn native_guard_publishes_before_core_and_cleans_only_exact_zero_exit_ack() {
-    for mode in ["ack", "missing", "extra", "nonzero", "edit"] {
+    for mode in [
+        "ack",
+        "missing",
+        "extra",
+        "nonzero",
+        "edit",
+        "missing-terminal",
+    ] {
         let scope = Scope::new();
         let log = scope.root.join("input.log");
         let mut command = scope.command(&run().core, mode);

@@ -1,6 +1,8 @@
 #![cfg(unix)]
 // Native consent/store/reader assertions require the supported POSIX authority.
 #![allow(deprecated)]
+#[path = "support/runtime_pair.rs"]
+mod runtime_pair;
 #[path = "support/service_boundary.rs"]
 mod service_boundary;
 use assert_cmd::Command;
@@ -22,21 +24,14 @@ fn init(root: &Path) {
         .success());
 }
 fn command(home: &Path, root: &Path, origin: &str) -> Command {
-    let mut cmd = service_boundary::command(assert_cmd::cargo::cargo_bin!("keito"));
+    let mut cmd = service_boundary::command(runtime_pair::pair().core_path);
     cmd.env_clear()
         .current_dir(root)
         .env("CODEX_HOME", home.join(".codex"))
         .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env(
-            "PATH",
-            if cfg!(windows) {
-                std::env::var_os("PATH").unwrap_or_default()
-            } else {
-                "/usr/bin:/bin".into()
-            },
-        )
+        .env("PATH", runtime_pair::process_path())
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("APPDATA", home.join("AppData/Roaming"))
@@ -485,5 +480,5 @@ async fn doctor_never_reuses_another_workspace_delivery_as_current_binding_proof
     assert_eq!(status["delivery_verified"], false);
     assert_eq!(status["capture"]["delivery_verified"], false);
     assert_eq!(status["ready"], false);
-    assert_eq!(status["capture_runtime"], "UNQUALIFIED_OR_STALE");
+    assert_eq!(status["capture_runtime"], "VERIFIED_RELEASE_PAIR");
 }
