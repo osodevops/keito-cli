@@ -524,6 +524,18 @@ impl<E: Edge> Core<E> {
         self.unfinished_end = self.unfinished_end.min(hard_end);
         Ok(id)
     }
+    #[cfg(feature = "dev-tools")]
+    fn admit_dev_client(
+        &mut self,
+        at: u64,
+        capacity: usize,
+        _selected_end: u64,
+        create: impl FnOnce(SharedOwner, u64) -> io::Result<E>,
+    ) -> io::Result<SlotId> {
+        // Baseline route retained for the new clipped-admission regression.
+        let end = self.hard_end;
+        self.admit(at, capacity, |owner| create(owner, end))
+    }
     fn begin_installer(&mut self, at: u64, expected: usize) -> io::Result<()> {
         if self.installer.is_some()
             || !self.slots.is_empty()
@@ -1344,6 +1356,38 @@ impl Scope {
             }
         })
     }
+    /// Closed developer offline-client caller only; not a product policy.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn start_dev_client_opaque_until(
+        &mut self,
+        mut command: Command,
+        plan: IoPlan,
+        image: &super::image::VerifiedKeeperImage,
+        selected_end: u64,
+    ) -> io::Result<SlotId> {
+        clear_parent_environment(&mut command);
+        let at = match now() {
+            Ok(at) => at,
+            Err(_) => {
+                self.core.cancel(Some("SCOPE_CLOCK"), 0, 0);
+                return Err(error("SCOPE_CLOCK"));
+            }
+        };
+        let capacity = plan.capacity();
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let result = self.core.admit_dev_client(at, capacity, selected_end, |owner, end| {
+            let pipes = plan.prepare().map_err(|_| error("SCOPE_IO_PREPARE"))?;
+            let lease = GroupLease::spawn_verified_keeper(owner, image, end)?;
+            Ok(ProductEdge::Group(GroupEdge {
+                lease, command: Some(command), pipes, stage: Stage::Ready,
+                proof: false, first_fault: None, published: [false; 4],
+            }))
+        });
+        if result.is_err() {
+            self.begin_cancel(ProtocolError("DEV_CLIENT_ADMISSION"), selected_end);
+        }
+        result
+    }
     fn start_with_lease(
         &mut self,
         mut command: Command,
@@ -1673,6 +1717,48 @@ impl Drop for Scope {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn offline_client_slot_and_keeper_share_the_earlier_leaf_end() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let captured = std::cell::Cell::new(0);
+        let mut core = Core::new(std::rc::Rc::default(), 4_000_000_000);
+        core.admit_dev_client(100, 8, 1_000_000_100, |_, end| {
+            captured.set(end);
+            Ok(fake("offline", events.clone()))
+        }).unwrap();
+        assert_eq!(core.hard_end, 4_000_000_000);
+        assert_eq!(core.slots[0].hard_end, 1_000_000_100);
+        assert_eq!(captured.get(), 1_000_000_100);
+    }
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn offline_client_does_not_admit_a_successor_with_unsettled_previous_slot() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut core = Core::new(std::rc::Rc::default(), 4_000_000_000);
+        core.admit_dev_client(100, 0, 1_000_000_100, |_, _| Ok(fake("first", events.clone()))).unwrap();
+        let created = std::cell::Cell::new(false);
+        assert!(core.admit_dev_client(200, 0, 1_000_000_200, |_, _| {
+            created.set(true);
+            Ok(fake("second", events.clone()))
+        }).is_err());
+        assert!(!created.get());
+        assert_eq!(core.slots.len(), 1);
+    }
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn offline_client_parent_end_and_closed_four_slot_maximum_are_enforced() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut core = Core::new(std::rc::Rc::default(), 700_000_000);
+        for i in 0..4 {
+            core.admit_dev_client(100, 0, 1_000_000_100, |_, end| {
+                assert_eq!(end, 700_000_000);
+                Ok(fake("parent", events.clone()))
+            }).unwrap();
+            core.slots[i].accepted_at = Some(101);
+        }
+        assert!(core.admit_dev_client(100, 0, 1_000_000_100, |_, _| Ok(fake("fifth", events.clone()))).is_err());
+    }
     use super::*;
     use std::{cell::RefCell, os::unix::process::ExitStatusExt};
     #[test]

@@ -61,6 +61,11 @@ name = "registry-api-actor"
 path = "examples/registry_api_actor.rs"
 required-features = ["dev-tools"]
 
+[[example]]
+name = "real-client-qa"
+path = "examples/real_client_qa.rs"
+required-features = ["dev-tools"]
+
 [dependencies]
 base64 = "0.22.1"
 clap = { version = "4", features = ["derive", "env", "string"] }

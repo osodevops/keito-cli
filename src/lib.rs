@@ -23,6 +23,8 @@ pub mod commands;
 pub mod config;
 pub mod error;
 pub mod output;
+#[cfg(all(feature = "dev-tools", unix))]
+pub mod real_client_qa;
 #[cfg(unix)]
 #[doc(hidden)]
 pub mod process_entry;
