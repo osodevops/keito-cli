@@ -14,8 +14,49 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import source_qa_manifest as inventory
 from source_qa_children import Cancelled, LegacyDirectChildren as OwnedChildren
+from source_qa_cargo import build_script_target
 
 BASE = None
+
+
+class CargoBuildTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="cargo-layout-", dir=BASE)
+        self.addCleanup(self.temp.cleanup)
+        self.profile = Path(self.temp.name) / "debug"
+
+    def output(self, relative, target):
+        path = self.profile / "build" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("cargo:rustc-env=KEITO_BUILD_TARGET=" + target + "\n")
+
+    def test_legacy_build_script_layout(self):
+        self.output("keito-cli-123/output", "x86_64-unknown-linux-gnu")
+        self.assertEqual(build_script_target(self.profile), "x86_64-unknown-linux-gnu")
+
+    def test_nested_build_script_layout(self):
+        self.output("keito-cli/123/run/stdout", "x86_64-unknown-linux-gnu")
+        self.assertEqual(build_script_target(self.profile), "x86_64-unknown-linux-gnu")
+
+    def test_same_target_across_layouts_is_consistent(self):
+        self.output("keito-cli-123/output", "aarch64-apple-darwin")
+        self.output("keito-cli/456/run/stdout", "aarch64-apple-darwin")
+        self.assertEqual(build_script_target(self.profile), "aarch64-apple-darwin")
+
+    def test_conflicting_targets_across_layouts_are_refused(self):
+        self.output("keito-cli-123/output", "aarch64-apple-darwin")
+        self.output("keito-cli/456/run/stdout", "x86_64-unknown-linux-gnu")
+        with self.assertRaisesRegex(RuntimeError, "exactly one source-build target"):
+            build_script_target(self.profile)
+
+    def test_no_matching_output_is_refused(self):
+        with self.assertRaisesRegex(RuntimeError, "exactly one source-build target"):
+            build_script_target(self.profile)
+
+    def test_dependency_output_is_not_target_authority(self):
+        self.output("dependency/123/run/stdout", "x86_64-unknown-linux-gnu")
+        with self.assertRaisesRegex(RuntimeError, "exactly one source-build target"):
+            build_script_target(self.profile)
 
 
 class RetainedDirectory:

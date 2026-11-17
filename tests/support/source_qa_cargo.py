@@ -9,6 +9,19 @@ import json
 import os
 
 
+def build_script_target(profile):
+    # Cargo's build-unit layout stores script stdout under run/stdout.
+    # Only this private source build's Keito package may name the pair target;
+    # inspect both layouts together so conflicting outputs still refuse.
+    outputs = [path for pattern in ("keito-cli-*/output", "keito-cli/*/run/stdout")
+               for path in (profile / "build").glob(pattern)]
+    targets = {line.split("=", 2)[2] for path in outputs for line in path.read_text().splitlines()
+               if line.startswith("cargo:rustc-env=KEITO_BUILD_TARGET=")}
+    if len(targets) != 1:
+        raise RuntimeError("Expected exactly one source-build target; found " + str(len(targets)))
+    return targets.pop()
+
+
 def cargo(root, repo, image, base_environment, label, arguments):
     from source_qa_build_owner import run, spec_read
     import source_qa_build_owner as owner_source

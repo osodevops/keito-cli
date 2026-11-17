@@ -15,7 +15,7 @@ import stat
 import sys
 
 sys.dont_write_bytecode = True
-from source_qa_cargo import cargo
+from source_qa_cargo import build_script_target, cargo
 from source_qa_manifest import ManifestLease
 assert sys.platform in ("darwin", "linux"), "Unix source QA is unsupported here"
 assert len(sys.argv) == 4, "run_guarded_usage_qa.py <private-run-root> <cargo> <rustc>"
@@ -118,11 +118,7 @@ with manifest:
            600, {"KEITO_RELEASE_GUARD_SHA256": guard_digest})
     shutil.copyfile(core_target / "keito", pair / "keito")
     (pair / "keito").chmod(0o700)
-    target_outputs = list((core_target / "build").glob("keito-cli-*/output"))
-    targets = {line.split("=", 2)[2] for path in target_outputs for line in path.read_text().splitlines()
-               if line.startswith("cargo:rustc-env=KEITO_BUILD_TARGET=")}
-    assert len(targets) == 1
-    host = targets.pop()
+    host = build_script_target(core_target)
     pair_manifest = {"manifest_contract": 1, "version": version, "target": host, "guard_contract": 2,
                 "files": {"keito": digest(pair / "keito"), "keito-capture-guard": guard_digest}}
     with (pair / "capture-runtime-manifest.json").open("x") as output:
