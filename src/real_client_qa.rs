@@ -143,7 +143,7 @@ impl PlanState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 struct Stamp {
     device: u64,
     inode: u64,
@@ -153,6 +153,14 @@ struct Stamp {
     bytes: u64,
     modified: (i64, i64),
     changed: (i64, i64),
+}
+// libc's stat integer widths differ across the supported Unix ABIs. Keep
+// normalization here; the pre-exec callback performs no allocation or logging.
+#[allow(clippy::unnecessary_cast)]
+fn stat_matches(m: &libc::stat, expected: Stamp) -> bool {
+    m.st_dev as u64 == expected.device && m.st_ino as u64 == expected.inode
+        && m.st_uid == expected.uid && m.st_mode as u32 == expected.mode
+        && m.st_nlink as u64 == expected.links && m.st_size as u64 == expected.bytes
 }
 impl Stamp {
     fn of(m: &Metadata) -> Self {
@@ -332,17 +340,17 @@ impl Roots {
                     return Err(io::Error::from_raw_os_error(libc::ESTALE));
                 }
                 let m = m.assume_init();
-                if m.st_dev as u64 != expected.device
-                    || m.st_ino as u64 != expected.inode
-                    || m.st_uid != expected.uid
-                    || m.st_mode as u32 != expected.mode
-                    || m.st_nlink as u64 != expected.links
-                    || m.st_size as u64 != expected.bytes
-                {
+                if !stat_matches(&m, expected) {
                     return Err(io::Error::from_raw_os_error(libc::ESTALE));
                 }
                 for fd in 3..limit as i32 {
                     let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::EBADF) {
+                            return Err(error);
+                        }
+                    }
                     if flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
                         return Err(io::Error::from_raw_os_error(libc::EBADF));
                     }
@@ -423,6 +431,7 @@ struct Observation {
     stderr_bytes: usize,
     accepted_ns: Option<u64>,
     native_integrity: &'static str,
+    native_metadata: Stamp,
     unregistered_descendants: &'static str,
     product_ack: &'static str,
 }
@@ -483,8 +492,22 @@ fn exercise(
     roots: &Roots,
     entry: u64,
     observations: &mut Vec<Observation>,
+    claimed: &mut bool,
 ) -> Result<()> {
     let mut state = PlanState::new(entry, scope.hard_end())?;
+    for name in ["FIRST.json", "FINAL.json", "operation-1.json", "operation-2.json", "operation-3.json", "operation-4.json"] {
+        match fs::symlink_metadata(roots.root.join(name)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            _ => return Err(Failure::Evidence),
+        }
+    }
+    // One durable, exclusive reservation prevents replay/concurrent launches
+    // of this root before any pair/native admission or client execution.
+    write_receipt(&roots.root, "START.json", &serde_json::json!({
+        "schema": 1, "entry_ns": entry, "end_ns": state.end,
+        "offline_only": true, "maximum_native_operations": 4,
+    }))?;
+    *claimed = true;
     let anchor = option_env!("KEITO_RELEASE_GUARD_SHA256").ok_or(Failure::Pair)?;
     let pair = crate::capture_runtime_pair::verify(
         &roots.root.join("pair/keito"),
@@ -546,6 +569,7 @@ fn exercise(
             stderr_bytes: facts.io.stderr_bytes,
             accepted_ns: facts.accepted_at,
             native_integrity: "METADATA_AND_VERSION_ONLY",
+            native_metadata: native.stamp,
             unregistered_descendants: "UNKNOWN",
             product_ack: "NOT_OBSERVED_OFFLINE",
         };
@@ -661,7 +685,7 @@ pub fn run_offline() -> bool {
     if !cfg!(target_os = "macos") {
         return false;
     }
-    let args: Vec<_> = std::env::args_os().collect();
+    let args: Vec<_> = std::env::args_os().take(3).collect();
     if args.len() != 2 {
         return false;
     }
@@ -676,15 +700,16 @@ pub fn run_offline() -> bool {
         return false;
     };
     let mut observations = Vec::with_capacity(4);
+    let mut claimed = false;
     let setup = Roots::open(root.clone());
     let mut primary = match setup.as_ref() {
-        Ok(roots) => exercise(&mut scope, roots, entry, &mut observations).err(),
+        Ok(roots) => exercise(&mut scope, roots, entry, &mut observations, &mut claimed).err(),
         Err(error) => Some(*error),
     };
     let mut first_attempted = false;
     if primary.is_some() {
         scope.begin_cancel(ProtocolError("DEV_CLIENT_OPERATION"), end);
-        if setup.is_ok() {
+        if claimed {
             first_attempted = true;
             let _ = write_receipt(
                 &root,
@@ -700,8 +725,7 @@ pub fn run_offline() -> bool {
     if !scope.publish_terminal(primary.is_none()) {
         primary.get_or_insert(Failure::Finality);
     }
-    if !first_attempted && setup.is_ok() {
-        if write_receipt(
+    if !first_attempted && claimed && write_receipt(
             &root,
             "FIRST.json",
             &receipt(primary, &report, &observations),
@@ -709,9 +733,8 @@ pub fn run_offline() -> bool {
         .is_err()
         {
             primary.get_or_insert(Failure::Evidence);
-        }
     }
-    if setup.is_ok()
+    if claimed
         && write_receipt(
             &root,
             "FINAL.json",
