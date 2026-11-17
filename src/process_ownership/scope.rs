@@ -548,8 +548,21 @@ impl<E: Edge> Core<E> {
         self.admit_before(at, capacity, selected_end.min(local), create)
     }
     #[cfg(feature = "dev-tools")]
-    fn release_dev_completed(&mut self, _ledgers_complete: bool) -> io::Result<()> {
-        // Baseline: the existing cache still includes completed leaf ends.
+    fn release_dev_completed(&mut self, ledgers_complete: bool) -> io::Result<()> {
+        if !ledgers_complete || self.installer.is_some() || self.slots.is_empty()
+            || self.cancel_end.is_some() || self.finish_called
+            || self.owner.borrow().check_admission().is_err()
+            || self.slots.iter().any(|slot| {
+                !slot.output_taken || !slot.edge.facts().resources_complete()
+                    || slot.accepted_at.is_none_or(|at| at >= slot.hard_end)
+            })
+        {
+            self.poison("DEV_CLIENT_COLLECTION");
+            return Err(error("DEV_CLIENT_COLLECTION"));
+        }
+        // Only the cache of UNFINISHED ends is released. Original owner/slot
+        // ends and all immutable acceptance facts remain unchanged.
+        self.unfinished_end = self.hard_end;
         Ok(())
     }
     fn begin_installer(&mut self, at: u64, expected: usize) -> io::Result<()> {

@@ -203,7 +203,7 @@ fn project_version(client: Client, raw: &[u8]) -> Result<()> {
 struct Observation {
     client: Client, operation: Operation, entry: &'static str, expected_version: &'static str,
     version_matches: Option<bool>, capabilities: Option<Capabilities>, started_ns: u64, end_ns: u64,
-    scope_original_end_ns: u64, exit: Option<i32>, signal: Option<i32>, waits_known: bool,
+    scope_original_end_ns: u64, receipt_finished_ns: Option<u64>, exit: Option<i32>, signal: Option<i32>, waits_known: bool,
     group_absent: bool, control_eof: bool, stdin_closed: bool, stdout_eof: bool, stderr_eof: bool,
     stdout_bytes: usize, stderr_bytes: usize, accepted_ns: Option<u64>,
     native_integrity: &'static str, unregistered_descendants: &'static str, product_ack: &'static str,
@@ -257,7 +257,7 @@ fn exercise(scope: &mut Scope, roots: &Roots, entry: u64, observations: &mut Vec
         let facts = report.slots.last().ok_or(Failure::Finality)?;
         let mut observation = Observation {
             client, operation, entry: "DIRECT_NATIVE", expected_version: client.version(), version_matches: None,
-            capabilities: None, started_ns: started, end_ns: end, scope_original_end_ns: state.end,
+            capabilities: None, started_ns: started, end_ns: end, scope_original_end_ns: state.end, receipt_finished_ns: None,
             exit: result.status.code(), signal: result.status.signal(), waits_known: facts.waits_known,
             group_absent: facts.group_absent, control_eof: facts.terminal_eof, stdin_closed: facts.io.stdin_closed,
             stdout_eof: facts.io.stdout_eof, stderr_eof: facts.io.stderr_eof, stdout_bytes: facts.io.stdout_bytes,
@@ -274,16 +274,32 @@ fn exercise(scope: &mut Scope, roots: &Roots, entry: u64, observations: &mut Vec
         observations.push(observation);
         projection?;
         write_receipt(&roots.root, &format!("operation-{}.json", observations.len()), observations.last().ok_or(Failure::Evidence)?)?;
+        let durable = monotonic_now().map_err(|_| Failure::Clock)?;
+        if durable >= end { return Err(Failure::Clock); }
+        observations.last_mut().ok_or(Failure::Evidence)?.receipt_finished_ns = Some(durable);
     }
     Ok(())
 }
 
 #[derive(Serialize)]
-struct Receipt<'a> { passed: bool, primary: Option<Failure>, scope_clean: bool, resources_known: bool,
+struct Physical {
+    slot: usize, exit: Option<i32>, signal: Option<i32>, waits_known: bool, group_absent: bool,
+    control_eof: bool, stdin_closed: bool, stdout_eof: bool, stderr_eof: bool,
+    stdout_bytes: usize, stderr_bytes: usize, accepted_ns: Option<u64>, completion_end_ns: Option<u64>, fault: bool,
+}
+#[derive(Serialize)]
+struct Receipt<'a> { passed: bool, primary: Option<Failure>, scope_clean: bool, resources_known: bool, physical_slots: Vec<Physical>,
     observations: &'a [Observation], detached_descendants: &'static str, product_qualification: bool }
 fn receipt<'a>(primary: Option<Failure>, report: &ScopeReport, observations: &'a [Observation]) -> Receipt<'a> {
     Receipt { passed: primary.is_none() && report.clean && observations.len() == 4, primary,
         scope_clean: report.clean, resources_known: report.all_resources, observations,
+        physical_slots: report.slots.iter().map(|slot| Physical {
+            slot: slot.slot, exit: slot.status.and_then(|s| s.code()), signal: slot.status.and_then(|s| s.signal()),
+            waits_known: slot.waits_known, group_absent: slot.group_absent, control_eof: slot.terminal_eof,
+            stdin_closed: slot.io.stdin_closed, stdout_eof: slot.io.stdout_eof, stderr_eof: slot.io.stderr_eof,
+            stdout_bytes: slot.io.stdout_bytes, stderr_bytes: slot.io.stderr_bytes, accepted_ns: slot.accepted_at,
+            completion_end_ns: slot.completion_end, fault: slot.first_fault.is_some() || slot.io.first_fault.is_some(),
+        }).collect(),
         detached_descendants: "UNKNOWN", product_qualification: false }
 }
 /// Fixed CLI shape: exactly one fresh private case root. No program/argv/budget input.
