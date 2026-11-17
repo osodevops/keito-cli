@@ -83,6 +83,45 @@ fn caps(operation: Operation) -> (usize, usize) {
         8192,
     )
 }
+
+const STDERR_MARKERS: [(&str, &[u8]); 24] = [
+    ("BUN_CRASH", b"oh no: Bun has crashed"),
+    ("BUN_PANIC", b"panic("),
+    ("UNREACHABLE", b"reached unreachable code"),
+    ("ASSERTION_FAILED", b"Assertion failed"),
+    ("UV_INTERFACE_ADDRESSES", b"uv_interface_addresses"),
+    ("UV_CPU_INFO", b"uv_cpu_info"),
+    ("UV_USER_INFO", b"uv_os_get_passwd"),
+    ("UV_CWD", b"uv_cwd"),
+    ("GETIFADDRS", b"getifaddrs"),
+    ("GETPWUID", b"getpwuid"),
+    ("GETCWD", b"getcwd"),
+    ("SYSCTL", b"sysctl"),
+    ("MACH_LOOKUP", b"mach-lookup"),
+    ("CORE_FOUNDATION", b"CoreFoundation"),
+    ("JAVA_SCRIPT_CORE", b"JavaScriptCore"),
+    ("OPERATION_NOT_PERMITTED", b"Operation not permitted"),
+    ("PERMISSION_DENIED", b"Permission denied"),
+    ("ERROR_ACCESS_DENIED", b"AccessDenied"),
+    ("ERROR_PERMISSION_DENIED", b"PermissionDenied"),
+    ("CODE_EPERM", b"EPERM"),
+    ("CODE_EACCES", b"EACCES"),
+    ("MEMORY_ALLOCATION", b"OutOfMemory"),
+    ("SIGNAL_TRAP", b"Trace/BPT trap"),
+    ("BUS_ERROR", b"Bus error"),
+];
+#[derive(Serialize)]
+struct RuntimeDiagnostics {
+    within_cap: bool,
+    markers: std::collections::BTreeMap<&'static str, bool>,
+}
+fn runtime_diagnostics(_raw: &[u8]) -> RuntimeDiagnostics {
+    RuntimeDiagnostics {
+        within_cap: true,
+        markers: STDERR_MARKERS.iter().map(|(name, _)| (*name, false)).collect(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum Failure {
@@ -1432,4 +1471,37 @@ mod tests {
             .contains_key("setup"));
         assert_eq!(value["physical_slots"][0]["setup"], serde_json::Value::Null);
     }
+    #[test]
+    fn offline_client_runtime_diagnostics_classify_only_fixed_public_markers() {
+        let value = runtime_diagnostics(b"PRIVATE_CANARY uv_cpu_info: EPERM; oh no: Bun has crashed");
+        assert!(value.within_cap);
+        assert!(value.markers["UV_CPU_INFO"] && value.markers["CODE_EPERM"] && value.markers["BUN_CRASH"]);
+        assert!(!value.markers["UV_INTERFACE_ADDRESSES"]);
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(!text.contains("PRIVATE_CANARY") && !text.contains("uv_cpu_info:"));
+    }
+    #[test]
+    fn offline_client_runtime_diagnostics_unknown_text_has_no_dynamic_keys_or_content() {
+        let value = runtime_diagnostics(b"PRIVATE_PROMPT_CANARY /private/PRIVATE_PATH_CANARY 1234");
+        assert!(value.within_cap && value.markers.values().all(|x| !x));
+        let expected: std::collections::BTreeSet<_> = STDERR_MARKERS.iter().map(|(key, _)| *key).collect();
+        assert_eq!(value.markers.keys().copied().collect::<std::collections::BTreeSet<_>>(), expected);
+        assert_eq!(expected.len(), 24);
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(!text.contains("PRIVATE") && !text.contains("1234"));
+    }
+    #[test]
+    fn offline_client_runtime_diagnostics_refuse_oversize_without_matching_prefix() {
+        let mut raw = b"oh no: Bun has crashed".to_vec();
+        raw.resize(8193, b'x');
+        let value = runtime_diagnostics(&raw);
+        assert!(!value.within_cap);
+        assert!(value.markers.values().all(|x| !x));
+    }
+    #[test]
+    fn offline_client_runtime_diagnostics_empty_is_bounded_without_a_cause() {
+        let value = runtime_diagnostics(b"");
+        assert!(value.within_cap && value.markers.values().all(|x| !x));
+    }
+
 }
