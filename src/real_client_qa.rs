@@ -803,19 +803,17 @@ fn finalize_terminal(
     end: u64,
     mut primary: Option<Failure>,
 ) -> bool {
-    // RED scaffold retains the former premature-publication behavior. The
-    // finite fault tests below must reject it before the acceptance repair.
-    if !io.publish(primary.is_none()) {
-        primary.get_or_insert(Failure::Finality);
-    }
+    let mut last = entry;
+    terminal_checkpoint(io, entry, end, &mut last, &mut primary);
     if let Err(error) = io.outcomes(primary) {
         primary.get_or_insert(error);
     }
+    let after_outcomes = terminal_checkpoint(io, entry, end, &mut last, &mut primary);
     let candidate = AcceptanceCandidate {
         kind: "PROVISIONAL_OFFLINE_ACCEPTANCE",
         entry_ns: entry,
         end_ns: end,
-        after_outcome_persistence_ns: None,
+        after_outcome_persistence_ns: after_outcomes,
         primary,
         acceptance_requires_exit_zero: true,
         product_qualification: false,
@@ -823,6 +821,17 @@ fn finalize_terminal(
     if let Err(error) = io.candidate(&candidate) {
         primary.get_or_insert(error);
     }
+    // Every durable write is now behind us. A candidate is never accepted
+    // solely because it exists: late fsync/cancellation refuses terminal
+    // success and exit zero. Preserve the original fault on all later errors.
+    terminal_checkpoint(io, entry, end, &mut last, &mut primary);
+    if !io.publish(primary.is_none()) {
+        primary.get_or_insert(Failure::Finality);
+    }
+    // Publication can itself observe cancellation or consume the remaining
+    // budget. This last observation is the acceptance linearization point;
+    // there is no receipt persistence after it.
+    terminal_checkpoint(io, entry, end, &mut last, &mut primary);
     primary.is_none()
 }
 /// Fixed CLI shape: exactly one fresh private case root. No program/argv/budget input.
