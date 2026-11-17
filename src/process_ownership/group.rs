@@ -654,6 +654,12 @@ enum KeeperProgram<'a> {
     Verified(&'a super::image::VerifiedKeeperImage),
 }
 impl GroupLease {
+    pub(super) fn setup_wait_source(&self) -> (i32, u64) {
+        (
+            self.channel.stream.as_raw_fd(),
+            self.park_end.unwrap_or(self.ready_end),
+        )
+    }
     pub fn spawn_keeper(
         owner: SharedOwner,
         run_root: &Path,

@@ -117,6 +117,9 @@ trait Edge {
     fn setup_pending(&self) -> bool {
         false
     }
+    fn setup_wait_source(&self) -> Option<(i32, u64)> {
+        None
+    }
     #[cfg(feature = "dev-tools")]
     fn setup_trace(&self) -> Option<super::group::SetupTrace> {
         None
@@ -306,6 +309,11 @@ impl Edge for GroupEdge {
     fn setup_pending(&self) -> bool {
         self.stage.setup_pending()
     }
+    fn setup_wait_source(&self) -> Option<(i32, u64)> {
+        self.stage
+            .setup_pending()
+            .then(|| self.lease.setup_wait_source())
+    }
     fn begin(&mut self, end: u64) -> io::Result<()> {
         self.command.take();
         self.pipes.cancel_input();
@@ -481,6 +489,12 @@ enum ProductEdge {
     Cooperative(CooperativeEdge),
 }
 impl Edge for ProductEdge {
+    fn setup_wait_source(&self) -> Option<(i32, u64)> {
+        match self {
+            Self::Group(edge) => edge.setup_wait_source(),
+            Self::Cooperative(edge) => edge.setup_wait_source(),
+        }
+    }
     #[cfg(feature = "dev-tools")]
     fn setup_trace(&self) -> Option<super::group::SetupTrace> {
         match self {
@@ -1072,6 +1086,61 @@ impl<E: Edge> Core<E> {
             .iter()
             .any(|slot| slot.accepted_at.is_none() && slot.edge.setup_pending()))
     }
+    fn wait_repository_setup(
+        &mut self,
+        clock: &mut impl FnMut() -> io::Result<u64>,
+        poll: &mut impl FnMut(&mut [libc::pollfd], i32) -> io::Result<i32>,
+    ) -> io::Result<()> {
+        let sources: Vec<_> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.accepted_at.is_none() && slot.edge.setup_pending())
+            .filter_map(|slot| slot.edge.setup_wait_source())
+            .collect();
+        if sources.is_empty() || sources.iter().any(|(fd, _)| *fd < 0) {
+            self.poison("SCOPE_SETUP_WAIT");
+            return Err(error("SCOPE_SETUP_WAIT"));
+        }
+        let end = sources
+            .iter()
+            .map(|(_, end)| *end)
+            .min()
+            .unwrap()
+            .min(self.active_end().saturating_sub(RESERVE_NS));
+        let mut descriptors: Vec<_> = sources
+            .iter()
+            .map(|(fd, _)| libc::pollfd {
+                fd: *fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let at = self.admission_clock(clock)?;
+        if at >= end {
+            return Ok(());
+        }
+        // Block only while at least a full millisecond remains. Readable
+        // protocol traffic wakes immediately; the original last submillisecond
+        // remains nonblocking, and no absolute end is reset or extended.
+        let timeout = ((end - at) / 1_000_000).min(1) as i32;
+        match poll(&mut descriptors, timeout) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
+            Ok(count)
+                if count >= 0
+                    && descriptors
+                        .iter()
+                        .all(|fd| fd.revents & libc::POLLNVAL == 0) =>
+            {
+                Ok(())
+            }
+            _ => {
+                self.poison("SCOPE_SETUP_WAIT");
+                Err(error("SCOPE_SETUP_WAIT"))
+            }
+        }
+        // Readiness/timeout/HUP/EINTR never advance a protocol state. The next
+        // original progress turn parses frames and checks deadlines/signals.
+    }
     // Validate the entire fixed cohort BEFORE consuming any result. An earlier
     // accepted sibling cannot leak output while another is pending or invalid.
     fn take_repository_results(
@@ -1142,16 +1211,14 @@ impl<E: Edge> Core<E> {
 fn await_repository_admission<E: Edge>(
     core: &mut Core<E>,
     progress: &mut impl FnMut(&mut Core<E>),
-    pause: &mut impl FnMut(std::time::Duration),
+    pause: &mut impl FnMut(&mut Core<E>) -> io::Result<()>,
 ) -> io::Result<()> {
     loop {
         progress(core);
         if core.repository_admission_ready()? {
             return Ok(());
         }
-        // A fixed sleep can skip the remaining READY/PARK window. Yield the
-        // entry thread, then repeat the SAME bounded progress/fault checks.
-        pause(std::time::Duration::ZERO);
+        pause(core)?;
     }
 }
 
@@ -1817,12 +1884,17 @@ impl Scope {
                 await_repository_admission(
                     &mut self.core,
                     &mut |core| Self::poll_turn(core, upstream, ledger),
-                    &mut |duration| {
-                        if duration.is_zero() {
-                            std::thread::yield_now();
-                        } else {
-                            std::thread::sleep(duration);
-                        }
+                    &mut |core| {
+                        core.wait_repository_setup(&mut now, &mut |fds, timeout| {
+                            let result = unsafe {
+                                libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout)
+                            };
+                            if result < 0 {
+                                Err(io::Error::last_os_error())
+                            } else {
+                                Ok(result)
+                            }
+                        })
                     },
                 )?;
                 *slot = Some(self.start_verified_opaque(command, plan, image)?);
@@ -2232,6 +2304,7 @@ mod tests {
         fail_begin: bool,
         begin_ends: Vec<u64>,
         setup_pending: bool,
+        setup_wait_source: Option<(i32, u64)>,
         #[cfg(feature = "dev-tools")]
         setup_trace: Option<super::super::group::SetupTrace>,
     }
@@ -2242,6 +2315,9 @@ mod tests {
         }
         fn setup_pending(&self) -> bool {
             self.setup_pending
+        }
+        fn setup_wait_source(&self) -> Option<(i32, u64)> {
+            self.setup_wait_source
         }
         fn take_events(&mut self) -> Vec<String> {
             self.events
@@ -2291,6 +2367,7 @@ mod tests {
             fail_begin: false,
             begin_ends: vec![],
             setup_pending: false,
+            setup_wait_source: None,
             #[cfg(feature = "dev-tools")]
             setup_trace: None,
         }
@@ -2584,6 +2661,7 @@ mod tests {
             .unwrap();
         core.slots[slot.index].edge.setup_pending = true;
         let end = 20_000_000u64;
+        core.slots[slot.index].edge.setup_wait_source = Some((7, end));
         let ready_at = end - 30_000;
         let clock = std::cell::Cell::new(end - 49_000);
         let mut turns = 0;
@@ -2598,10 +2676,12 @@ mod tests {
                     core.slots[slot.index].edge.setup_pending = false;
                 }
             },
-            &mut |duration| {
-                // A yield permits one bounded microsecond of peer progress;
-                // a deliberate millisecond sleep skips this original window.
-                clock.set(clock.get() + (duration.as_nanos() as u64).max(1_000));
+            &mut |core| {
+                core.wait_repository_setup(&mut || Ok(clock.get()), &mut |_, timeout| {
+                    assert_eq!(timeout, 0, "do not round up a submillisecond remainder");
+                    clock.set(clock.get() + 1_000);
+                    Ok(0)
+                })
             },
         );
         assert!(result.is_ok(), "READY before original deadline was missed");
@@ -2628,7 +2708,10 @@ mod tests {
                     core.poison("ORIGINAL_WAIT_FAULT");
                 }
             },
-            &mut |_| pauses += 1,
+            &mut |_| {
+                pauses += 1;
+                Ok(())
+            },
         );
         assert!(result.is_err());
         assert_eq!((turns, pauses), (2, 1));
@@ -2660,6 +2743,85 @@ mod tests {
         );
         assert!(core.slots[slot.index].completion_end.is_none());
         assert!(core.slots[slot.index].accepted_at.is_none());
+    }
+    #[test]
+    fn repository_setup_readiness_wait_blocks_only_within_original_ends() {
+        for (setup_end, parent_end, at, expected) in [
+            (20_000_000, 500_000_000, 10_000_000, Some(1)),
+            (20_000_000, 500_000_000, 19_000_001, Some(0)),
+            (20_000_000, 50_500_000, 0, Some(0)),
+            (20_000_000, 50_000_000, 0, None),
+            (20_000_000, 500_000_000, 20_000_000, None),
+        ] {
+            let mut core = Core::new(Rc::default(), 500_000_000);
+            let id = core
+                .admit(0, 0, |_| Ok(fake("wait", Rc::default())))
+                .unwrap();
+            core.hard_end = parent_end;
+            core.slots[id.index].edge.setup_pending = true;
+            core.slots[id.index].edge.setup_wait_source = Some((7, setup_end));
+            let mut observed = None;
+            core.wait_repository_setup(&mut || Ok(at), &mut |fds, timeout| {
+                assert_eq!(fds.len(), 1);
+                assert_eq!((fds[0].fd, fds[0].events), (7, libc::POLLIN));
+                observed = Some(timeout);
+                fds[0].revents = libc::POLLIN | libc::POLLHUP;
+                Ok(1)
+            })
+            .unwrap();
+            assert_eq!(observed, expected);
+            assert_eq!(core.hard_end, parent_end);
+            assert!(core.slots[id.index].edge.setup_pending);
+            assert!(core.slots[id.index].accepted_at.is_none());
+            assert!(!core.slots[id.index].output_taken);
+        }
+    }
+    #[test]
+    fn repository_setup_readiness_wait_interrupt_returns_to_progress_and_faults_refuse() {
+        for condition in ["interrupt", "invalid", "error"] {
+            let mut core = Core::new(Rc::default(), 500_000_000);
+            let id = core
+                .admit(1, 0, |_| Ok(fake("wait", Rc::default())))
+                .unwrap();
+            core.slots[id.index].edge.setup_pending = true;
+            core.slots[id.index].edge.setup_wait_source = Some((7, 20_000_000));
+            let result =
+                core.wait_repository_setup(&mut || Ok(10_000_000), &mut |fds, _| match condition {
+                    "interrupt" => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                    "invalid" => {
+                        fds[0].revents = libc::POLLNVAL;
+                        Ok(1)
+                    }
+                    _ => Err(io::Error::from_raw_os_error(libc::EIO)),
+                });
+            assert_eq!(result.is_ok(), condition == "interrupt");
+            assert_eq!(
+                core.owner.borrow().first_fault.is_none(),
+                condition == "interrupt"
+            );
+            assert!(core.slots[id.index].accepted_at.is_none());
+            assert!(!core.slots[id.index].output_taken);
+        }
+    }
+    #[test]
+    fn repository_setup_readiness_wait_clock_failure_cancels_existing_owner_at_zero() {
+        let mut core = Core::new(Rc::default(), 500_000_000);
+        let id = core
+            .admit(1, 0, |_| Ok(fake("wait", Rc::default())))
+            .unwrap();
+        core.slots[id.index].edge.setup_pending = true;
+        core.slots[id.index].edge.setup_wait_source = Some((7, 20_000_000));
+        assert!(core
+            .wait_repository_setup(&mut || Err(error("INJECTED_CLOCK")), &mut |_, _| panic!(
+                "clock failure cannot wait"
+            ),)
+            .is_err());
+        assert_eq!(core.cancel_end, Some(0));
+        assert_eq!(core.slots[id.index].completion_end, Some(0));
+        assert_eq!(
+            core.owner.borrow().first_fault,
+            Some(ProtocolError("SCOPE_CLOCK"))
+        );
     }
     #[test]
     fn repository_admission_sticky_fault_never_reopens_for_a_ready_sibling() {
