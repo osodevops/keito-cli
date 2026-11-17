@@ -118,6 +118,33 @@ const STDERR_MARKERS: [(&str, &[u8]); 32] = [
     ("UV_THREAD_CREATE", b"uv_thread_create"),
     ("ERROR_SYSTEM_RESOURCES", b"SystemResources"),
 ];
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum RuntimePanicKind {
+    SegmentationFault,
+    IllegalInstruction,
+    BusError,
+    FloatingPointError,
+    UnalignedMemory,
+    StackOverflow,
+    OutOfMemory,
+    Unreachable,
+    CppException,
+    AbortCalled,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct BunVersion {
+    major: u16,
+    minor: u16,
+    patch: u16,
+}
+fn runtime_panic_kind(_raw: &[u8]) -> Option<RuntimePanicKind> {
+    None
+}
+fn runtime_bun_version(_raw: &[u8]) -> Option<BunVersion> {
+    None
+}
 #[derive(Serialize)]
 struct RuntimeDiagnostics {
     within_cap: bool,
@@ -1537,4 +1564,38 @@ mod tests {
         let value = runtime_diagnostics(b"");
         assert!(value.within_cap && value.markers.values().all(|x| !x));
     }
+    #[test]
+    fn offline_client_panic_kind_projects_public_family_without_address_or_message() {
+        assert_eq!(runtime_panic_kind(b"panic(main thread): Segmentation fault at address 0xDEADBEEF\n"), Some(RuntimePanicKind::SegmentationFault));
+        assert_eq!(runtime_panic_kind(b"panic(main thread): A C++ exception occurred\n"), Some(RuntimePanicKind::CppException));
+    }
+    #[test]
+    fn offline_client_panic_kind_first_malformed_candidate_blocks_later_fake() {
+        assert_eq!(runtime_panic_kind(b"panic(main thread):\npanic(main thread): A C++ exception occurred\n"), Some(RuntimePanicKind::Unknown));
+        assert_eq!(runtime_panic_kind(b"PRIVATE panic hidden\npanic(main thread): Stack overflow\n"), Some(RuntimePanicKind::Unknown));
+    }
+    #[test]
+    fn offline_client_panic_kind_private_suffix_or_oversize_is_unknown() {
+        assert_eq!(runtime_panic_kind(b"panic(main thread): Segmentation fault at address 0x1 PRIVATE_PATH\n"), Some(RuntimePanicKind::Unknown));
+        let mut raw=b"panic(main thread): A C++ exception occurred\n".to_vec(); raw.resize(8193,b'x');
+        assert_eq!(runtime_panic_kind(&raw), None);
+    }
+    #[test]
+    fn offline_client_bun_version_projects_numeric_components_only() {
+        assert_eq!(runtime_bun_version(b"Bun v1.3.0 (PRIVATE_HASH) macOS Silicon\n"), Some(BunVersion { major:1,minor:3,patch:0 }));
+        let text=serde_json::to_string(&runtime_bun_version(b"Bun v1.3.0 (PRIVATE_HASH)\n")).unwrap();
+        assert!(!text.contains("PRIVATE") && !text.contains("macOS"));
+    }
+    #[test]
+    fn offline_client_bun_version_first_invalid_candidate_cannot_fall_through() {
+        assert_eq!(runtime_bun_version(b"Bun vPRIVATE\nBun v1.3.0 (fake)\n"), None);
+        assert_eq!(runtime_bun_version(b"PRIVATE Bun v1.3.0\nBun v1.3.0 (fake)\n"), None);
+        assert_eq!(runtime_bun_version(b"Bun v1.3.0PRIVATE\n"), None);
+    }
+    #[test]
+    fn offline_client_bun_version_rejects_overflow_non_ascii_empty_and_oversize() {
+        for raw in [b"Bun v65536.3.0".as_slice(), b"Bun v1.03.0", b"Bun v1.3.0\xff", b""] { assert_eq!(runtime_bun_version(raw),None); }
+        let mut raw=b"Bun v1.3.0\n".to_vec();raw.resize(8193,b'x');assert_eq!(runtime_bun_version(&raw),None);
+    }
+
 }
