@@ -139,21 +139,117 @@ struct BunVersion {
     minor: u16,
     patch: u16,
 }
-fn runtime_panic_kind(_raw: &[u8]) -> Option<RuntimePanicKind> {
-    None
+fn runtime_panic_kind(raw: &[u8]) -> Option<RuntimePanicKind> {
+    if raw.len() > 8192 {
+        return None;
+    }
+    // Choose before validating. A malformed first candidate cannot authorize
+    // attribution from a later fake header in arbitrary diagnostic prose.
+    let line = raw
+        .split(|byte| *byte == b'\n')
+        .find(|line| line.windows(5).any(|part| part == b"panic"))?;
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.len() > 512 || !line.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        return Some(RuntimePanicKind::Unknown);
+    }
+    let Some(message) = line
+        .strip_prefix(b"panic(main thread): ")
+        .or_else(|| line.strip_prefix(b"panic: "))
+    else {
+        return Some(RuntimePanicKind::Unknown);
+    };
+    for (prefix, kind) in [
+        (
+            b"Segmentation fault at address 0x".as_slice(),
+            RuntimePanicKind::SegmentationFault,
+        ),
+        (
+            b"Illegal instruction at address 0x".as_slice(),
+            RuntimePanicKind::IllegalInstruction,
+        ),
+        (
+            b"Bus error at address 0x".as_slice(),
+            RuntimePanicKind::BusError,
+        ),
+        (
+            b"Floating point error at address 0x".as_slice(),
+            RuntimePanicKind::FloatingPointError,
+        ),
+    ] {
+        if let Some(address) = message.strip_prefix(prefix) {
+            return Some(
+                if !address.is_empty()
+                    && address.len() <= 16
+                    && address.iter().all(u8::is_ascii_hexdigit)
+                {
+                    kind
+                } else {
+                    RuntimePanicKind::Unknown
+                },
+            );
+        }
+    }
+    // Only a closed category survives; no exception type/message or address.
+    if message.windows(13).any(|part| part == b"C++ exception") {
+        return Some(RuntimePanicKind::CppException);
+    }
+    Some(match message {
+        b"Unaligned memory access" => RuntimePanicKind::UnalignedMemory,
+        b"Stack overflow" => RuntimePanicKind::StackOverflow,
+        b"Bun ran out of memory" => RuntimePanicKind::OutOfMemory,
+        b"reached unreachable code" => RuntimePanicKind::Unreachable,
+        b"abort() called" => RuntimePanicKind::AbortCalled,
+        _ => RuntimePanicKind::Unknown,
+    })
 }
-fn runtime_bun_version(_raw: &[u8]) -> Option<BunVersion> {
-    None
+fn runtime_bun_version(raw: &[u8]) -> Option<BunVersion> {
+    if raw.len() > 8192 {
+        return None;
+    }
+    let line = raw
+        .split(|byte| *byte == b'\n')
+        .find(|line| line.windows(5).any(|part| part == b"Bun v"))?;
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.len() > 256 || !line.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        return None;
+    }
+    let rest = line.strip_prefix(b"Bun v")?;
+    let token = rest.split(u8::is_ascii_whitespace).next()?;
+    let mut parts = token.split(|byte| *byte == b'.');
+    let mut component = || {
+        let value = parts.next()?;
+        if value.is_empty()
+            || value.len() > 4
+            || (value.len() > 1 && value[0] == b'0')
+            || !value.iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        std::str::from_utf8(value).ok()?.parse::<u16>().ok()
+    };
+    let version = BunVersion {
+        major: component()?,
+        minor: component()?,
+        patch: component()?,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(version)
 }
 #[derive(Serialize)]
 struct RuntimeDiagnostics {
     within_cap: bool,
+    panic_kind: Option<RuntimePanicKind>,
+    bun_version: Option<BunVersion>,
     markers: std::collections::BTreeMap<&'static str, bool>,
 }
 fn runtime_diagnostics(raw: &[u8]) -> RuntimeDiagnostics {
     let within_cap = raw.len() <= 8192;
     RuntimeDiagnostics {
         within_cap,
+        panic_kind: runtime_panic_kind(raw),
+        bun_version: runtime_bun_version(raw),
         // Only literal keys and booleans survive. Oversize input is not scanned
         // or partially attributed; neither bytes nor a digest enter evidence.
         markers: STDERR_MARKERS
@@ -1566,36 +1662,78 @@ mod tests {
     }
     #[test]
     fn offline_client_panic_kind_projects_public_family_without_address_or_message() {
-        assert_eq!(runtime_panic_kind(b"panic(main thread): Segmentation fault at address 0xDEADBEEF\n"), Some(RuntimePanicKind::SegmentationFault));
-        assert_eq!(runtime_panic_kind(b"panic(main thread): A C++ exception occurred\n"), Some(RuntimePanicKind::CppException));
+        assert_eq!(
+            runtime_panic_kind(b"panic(main thread): Segmentation fault at address 0xDEADBEEF\n"),
+            Some(RuntimePanicKind::SegmentationFault)
+        );
+        assert_eq!(
+            runtime_panic_kind(b"panic(main thread): A C++ exception occurred\n"),
+            Some(RuntimePanicKind::CppException)
+        );
     }
     #[test]
     fn offline_client_panic_kind_first_malformed_candidate_blocks_later_fake() {
-        assert_eq!(runtime_panic_kind(b"panic(main thread):\npanic(main thread): A C++ exception occurred\n"), Some(RuntimePanicKind::Unknown));
-        assert_eq!(runtime_panic_kind(b"PRIVATE panic hidden\npanic(main thread): Stack overflow\n"), Some(RuntimePanicKind::Unknown));
+        assert_eq!(
+            runtime_panic_kind(
+                b"panic(main thread):\npanic(main thread): A C++ exception occurred\n"
+            ),
+            Some(RuntimePanicKind::Unknown)
+        );
+        assert_eq!(
+            runtime_panic_kind(b"PRIVATE panic hidden\npanic(main thread): Stack overflow\n"),
+            Some(RuntimePanicKind::Unknown)
+        );
     }
     #[test]
     fn offline_client_panic_kind_private_suffix_or_oversize_is_unknown() {
-        assert_eq!(runtime_panic_kind(b"panic(main thread): Segmentation fault at address 0x1 PRIVATE_PATH\n"), Some(RuntimePanicKind::Unknown));
-        let mut raw=b"panic(main thread): A C++ exception occurred\n".to_vec(); raw.resize(8193,b'x');
+        assert_eq!(
+            runtime_panic_kind(
+                b"panic(main thread): Segmentation fault at address 0x1 PRIVATE_PATH\n"
+            ),
+            Some(RuntimePanicKind::Unknown)
+        );
+        let mut raw = b"panic(main thread): A C++ exception occurred\n".to_vec();
+        raw.resize(8193, b'x');
         assert_eq!(runtime_panic_kind(&raw), None);
     }
     #[test]
     fn offline_client_bun_version_projects_numeric_components_only() {
-        assert_eq!(runtime_bun_version(b"Bun v1.3.0 (PRIVATE_HASH) macOS Silicon\n"), Some(BunVersion { major:1,minor:3,patch:0 }));
-        let text=serde_json::to_string(&runtime_bun_version(b"Bun v1.3.0 (PRIVATE_HASH)\n")).unwrap();
+        assert_eq!(
+            runtime_bun_version(b"Bun v1.3.0 (PRIVATE_HASH) macOS Silicon\n"),
+            Some(BunVersion {
+                major: 1,
+                minor: 3,
+                patch: 0
+            })
+        );
+        let text =
+            serde_json::to_string(&runtime_bun_version(b"Bun v1.3.0 (PRIVATE_HASH)\n")).unwrap();
         assert!(!text.contains("PRIVATE") && !text.contains("macOS"));
     }
     #[test]
     fn offline_client_bun_version_first_invalid_candidate_cannot_fall_through() {
-        assert_eq!(runtime_bun_version(b"Bun vPRIVATE\nBun v1.3.0 (fake)\n"), None);
-        assert_eq!(runtime_bun_version(b"PRIVATE Bun v1.3.0\nBun v1.3.0 (fake)\n"), None);
+        assert_eq!(
+            runtime_bun_version(b"Bun vPRIVATE\nBun v1.3.0 (fake)\n"),
+            None
+        );
+        assert_eq!(
+            runtime_bun_version(b"PRIVATE Bun v1.3.0\nBun v1.3.0 (fake)\n"),
+            None
+        );
         assert_eq!(runtime_bun_version(b"Bun v1.3.0PRIVATE\n"), None);
     }
     #[test]
     fn offline_client_bun_version_rejects_overflow_non_ascii_empty_and_oversize() {
-        for raw in [b"Bun v65536.3.0".as_slice(), b"Bun v1.03.0", b"Bun v1.3.0\xff", b""] { assert_eq!(runtime_bun_version(raw),None); }
-        let mut raw=b"Bun v1.3.0\n".to_vec();raw.resize(8193,b'x');assert_eq!(runtime_bun_version(&raw),None);
+        for raw in [
+            b"Bun v65536.3.0".as_slice(),
+            b"Bun v1.03.0",
+            b"Bun v1.3.0\xff",
+            b"",
+        ] {
+            assert_eq!(runtime_bun_version(raw), None);
+        }
+        let mut raw = b"Bun v1.3.0\n".to_vec();
+        raw.resize(8193, b'x');
+        assert_eq!(runtime_bun_version(&raw), None);
     }
-
 }
