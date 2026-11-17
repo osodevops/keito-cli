@@ -160,6 +160,12 @@ fn publication(directory: &Path) -> Result<crate::capture_authority::AuthorityGu
     crate::capture_authority::AuthorityGuard::publication(&private_directory(directory, 1)?)
 }
 #[cfg(unix)]
+fn publication_read(
+    directory: &Path,
+) -> Result<crate::capture_authority::PublicationReadGuard, AppError> {
+    crate::capture_authority::AuthorityGuard::publication_read(&private_directory(directory, 1)?)
+}
+#[cfg(unix)]
 fn names(root: &File) -> Result<Vec<String>, AppError> {
     use std::ffi::CStr;
     use std::os::fd::AsRawFd;
@@ -269,7 +275,9 @@ fn inspect_file(root: &File, nonce: &str, preparing: bool) -> Result<(Marker, Fi
     if (!preparing && bytes != PENDING) || (preparing && !PENDING.starts_with(&bytes)) {
         return Err(refused());
     }
-    let code = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    // Guardians hold EX. Dead-marker readers must use SH so another reader
+    // cannot mistake a temporary probe lock for a live guardian.
+    let code = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
     let live = if code == 0 {
         false
     } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
@@ -354,7 +362,9 @@ impl Permit {
     pub fn new(directory: &Path, nonce: &str) -> Result<Self, AppError> {
         #[cfg(unix)]
         {
-            let _publication = publication(directory)?;
+            // Known pending files are immutable. Share reads, but retain the
+            // publication barrier against writers and legacy EX reader probes.
+            let _publication = publication_read(directory)?;
             let (m, file) = inspect_file(&root(directory)?, nonce, false)?;
             if !m.live {
                 return Err(refused());
@@ -485,6 +495,104 @@ mod permit_tests {
             );
         }
         file
+    }
+
+    fn shared_publication(root: &Path) -> File {
+        drop(publication(root).unwrap());
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("capture-invocations-publication.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+            0
+        );
+        file
+    }
+
+    #[test]
+    fn known_live_nonce_validation_shares_publication_with_other_readers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let nonce = crate::capture::hash("already-published-live-nonce");
+        let _guardian = marker(&root, &nonce, true);
+        let held_publication = shared_publication(&root);
+        let permit = Permit::new(&root, &nonce).unwrap();
+        permit.validate(&root).unwrap();
+        // A namespace snapshot still needs serialization; this optimization
+        // is solely for the already-published, immutable known nonce.
+        assert!(snapshot(&root).is_err());
+        drop(held_publication);
+        let markers = snapshot(&root).unwrap();
+        assert_eq!(markers.len(), 1);
+        assert!(markers[0].live);
+        assert!(remove_dead(&root, &markers).is_err());
+        permit.validate(&root).unwrap();
+    }
+
+    #[test]
+    fn shared_nonce_reads_keep_content_liveness_and_inode_refusals() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let nonce = crate::capture::hash("retained-inode-under-publication");
+        let guardian = marker(&root, &nonce, true);
+        let permit = Permit::new(&root, &nonce).unwrap();
+        let _held_publication = shared_publication(&root);
+        permit.validate(&root).unwrap();
+        let path = root.join(format!("capture-invocations/{nonce}.pending"));
+        fs::write(&path, b"PRIVATE_MALFORMED_CANARY").unwrap();
+        assert!(Permit::new(&root, &nonce).is_err());
+        assert!(permit.validate(&root).is_err());
+        fs::write(&path, PENDING).unwrap();
+        permit.validate(&root).unwrap();
+        drop(guardian);
+        assert!(Permit::new(&root, &nonce).is_err());
+        assert!(permit.validate(&root).is_err());
+        fs::remove_file(&path).unwrap();
+        let _replacement_guardian = marker(&root, &nonce, true);
+        assert!(permit.validate(&root).is_err());
+        assert!(Permit::new(&root, &nonce).is_ok());
+    }
+
+    #[test]
+    fn legacy_exclusive_reader_probe_cannot_impersonate_a_guardian() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let nonce = crate::capture::hash("legacy-dead-reader-probe");
+        drop(marker(&root, &nonce, false));
+        let held_publication = publication(&root).unwrap();
+        let legacy_probe =
+            File::open(root.join(format!("capture-invocations/{nonce}.pending"))).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(legacy_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(Permit::new(&root, &nonce).is_err());
+        drop(legacy_probe);
+        drop(held_publication);
+        assert!(Permit::new(&root, &nonce).is_err());
+    }
+
+    #[test]
+    fn concurrent_dead_reader_probes_are_not_live_and_do_not_block_dead_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let nonce = crate::capture::hash("overlapping-dead-reader-probes");
+        drop(marker(&root, &nonce, false));
+        let held_publication = shared_publication(&root);
+        let (observed, dead_probe) =
+            inspect_file(&super::root(&root).unwrap(), &nonce, false).unwrap();
+        assert!(!observed.live);
+        assert!(Permit::new(&root, &nonce).is_err());
+        drop(held_publication);
+        remove_dead(&root, &[observed]).unwrap();
+        assert_eq!(dead_probe.metadata().unwrap().len(), PENDING.len() as u64);
+        assert!(Permit::new(&root, &nonce).is_err());
     }
 
     #[test]
