@@ -89,12 +89,12 @@ struct RepositoryCohortDiagnostic<F> {
 }
 impl<F> crate::process_ownership::probes::LeafRunner for RepositoryCohortDiagnostic<F>
 where
-    F: FnMut([Command; 3]) -> io::Result<[crate::process_ownership::scope::CommandResult; 3]>,
+    F: FnMut([Command; 2]) -> io::Result<[crate::process_ownership::scope::CommandResult; 2]>,
 {
     fn repository_outputs(
         &mut self,
-        commands: [Command; 3],
-    ) -> Option<io::Result<[crate::process_ownership::scope::CommandResult; 3]>> {
+        commands: [Command; 2],
+    ) -> Option<io::Result<[crate::process_ownership::scope::CommandResult; 2]>> {
         Some((self.run)(commands))
     }
     fn output(
@@ -638,18 +638,22 @@ mod hook_probe_diagnostic_tests {
     }
 
     #[test]
-    fn repository_cohort_diagnostic_routes_original_three_commands_once() {
+    fn repository_cohort_diagnostic_routes_two_commands_and_three_facts_once() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap();
-        let bytes = root.to_str().unwrap().as_bytes().to_vec();
+        let bytes = format!("{}\n{}\n", root.display(), root.display()).into_bytes();
         let mut calls = 0;
         let mut runner = RepositoryCohortDiagnostic {
-            run: |commands: [Command; 3]| {
+            run: |commands: [Command; 2]| {
                 calls += 1;
                 assert_eq!(calls, 1);
                 let expected = [
-                    vec!["rev-parse", "--show-toplevel"],
-                    vec!["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    vec![
+                        "rev-parse",
+                        "--path-format=absolute",
+                        "--show-toplevel",
+                        "--git-common-dir",
+                    ],
                     vec!["config", "--get-regexp", "^remote\\..*\\.url$"],
                 ];
                 for (command, arguments) in commands.iter().zip(expected) {
@@ -659,11 +663,7 @@ mod hook_probe_diagnostic_tests {
                     assert_eq!(actual[1], root.as_os_str());
                     assert_eq!(actual[2..], arguments);
                 }
-                Ok([
-                    cohort_reply(0, bytes.clone()),
-                    cohort_reply(0, bytes.clone()),
-                    cohort_reply(1, Vec::new()),
-                ])
+                Ok([cohort_reply(0, bytes.clone()), cohort_reply(1, Vec::new())])
             },
         };
         let repository = crate::capture::Repository::resolve_with(&root, &mut runner).unwrap();
@@ -678,10 +678,10 @@ mod hook_probe_diagnostic_tests {
         let mut scope = Scope::with_owner(Default::default(), end);
         let mut called = false;
         let mut runner = RepositoryCohortDiagnostic {
-            run: |_: [Command; 3]| {
+            run: |_: [Command; 2]| {
                 called = true;
                 scope.begin_cancel(ProtocolError("GROUP_DEADLINE"), end);
-                let original: io::Result<[crate::process_ownership::scope::CommandResult; 3]> =
+                let original: io::Result<[crate::process_ownership::scope::CommandResult; 2]> =
                     Err(io::Error::new(io::ErrorKind::TimedOut, "GROUP_DEADLINE"));
                 let result = probe_observation(&mut scope, original, |report| {
                     assert_eq!(report.first_fault, Some(ProtocolError("GROUP_DEADLINE")));

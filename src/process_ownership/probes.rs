@@ -7,8 +7,8 @@ pub(crate) trait LeafRunner {
     /// resolver, including short-circuiting before later commands are executed.
     fn repository_outputs(
         &mut self,
-        _commands: [Command; 3],
-    ) -> Option<io::Result<[CommandResult; 3]>> {
+        _commands: [Command; 2],
+    ) -> Option<io::Result<[CommandResult; 2]>> {
         None
     }
     fn output(
@@ -21,6 +21,14 @@ pub(crate) trait LeafRunner {
 /// Git config --get-regexp uses exit1 with empty output for no matches. Every
 /// ownership/read/deadline error is propagated BEFORE reaching this classifier.
 pub(crate) fn text(result: CommandResult, allow_empty_exit_one: bool) -> io::Result<String> {
+    text_untrimmed(result, allow_empty_exit_one).map(|s| s.trim().to_owned())
+}
+/// Retain framing until a multi-value caller has checked raw field boundaries
+/// and byte limits. Scalar callers keep their existing trimming through text().
+pub(crate) fn text_untrimmed(
+    result: CommandResult,
+    allow_empty_exit_one: bool,
+) -> io::Result<String> {
     if !result.status.success()
         && !(allow_empty_exit_one
             && result.status.code() == Some(1)
@@ -29,9 +37,7 @@ pub(crate) fn text(result: CommandResult, allow_empty_exit_one: bool) -> io::Res
     {
         return Err(io::Error::other("PROBE_EXIT"));
     }
-    String::from_utf8(result.output.stdout)
-        .map(|s| s.trim().to_owned())
-        .map_err(|_| io::Error::other("PROBE_UTF8"))
+    String::from_utf8(result.output.stdout).map_err(|_| io::Error::other("PROBE_UTF8"))
 }
 #[cfg(test)]
 mod tests {

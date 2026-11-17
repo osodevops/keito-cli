@@ -603,7 +603,7 @@ mod unix {
                     Ok(())
                 });
             }
-            let child = scope.start_cooperative(command).map_err(|_| ())?;
+            let child = scope.start_hook_core(command, leaf_end).map_err(|_| ())?;
             drop(writer);
             let mut reader = File::from(reader);
             let mut bytes = Vec::with_capacity(ACK.len() + 1);

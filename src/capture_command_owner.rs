@@ -424,8 +424,8 @@ fn hook_setup_probe(
 impl LeafRunner for CommandOwner<'_> {
     fn repository_outputs(
         &mut self,
-        commands: [Command; 3],
-    ) -> Option<io::Result<[CommandResult; 3]>> {
+        commands: [Command; 2],
+    ) -> Option<io::Result<[CommandResult; 2]>> {
         if self.policy != CleanupPolicy::HookShort {
             return None;
         }

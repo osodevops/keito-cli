@@ -246,33 +246,85 @@ impl Repository {
     ) -> Result<Self, AppError> {
         let root_args = &["rev-parse", "--show-toplevel"];
         let common_args = &["rev-parse", "--path-format=absolute", "--git-common-dir"];
+        let identity_args = &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ];
         let remotes_args = &["config", "--get-regexp", "^remote\\..*\\.url$"];
-        let mut cohort = runner
+        let cohort = runner
             .repository_outputs([
-                repository_command(directory, root_args),
-                repository_command(directory, common_args),
+                repository_command(directory, identity_args),
                 repository_command(directory, remotes_args),
             ])
             .transpose()
-            .map_err(repository_ownership_error)?
-            .map(IntoIterator::into_iter);
-        let mut git = |args: &[&str], empty_no_match| match &mut cohort {
-            Some(results) => repository_text(
-                results.next().expect("fixed repository result count"),
-                empty_no_match,
-            ),
-            None => git_with(runner, directory, args, empty_no_match),
+            .map_err(repository_ownership_error)?;
+        let (root, common, remotes) = match cohort {
+            Some([identity, remotes]) => {
+                let identity = crate::process_ownership::probes::text_untrimmed(identity, false)
+                    .map_err(|_| {
+                        AppError::Config("Capture requires an identifiable Git repository".into())
+                    })?;
+                let remotes = repository_text(remotes, true)?;
+                let framed = identity.strip_suffix('\n').unwrap_or(&identity);
+                let mut lines = framed.split('\n');
+                let root = lines.next().unwrap_or_default();
+                let common = lines.next().ok_or_else(|| {
+                    AppError::Config("Capture requires an identifiable Git repository".into())
+                })?;
+                let (root, common) = if lines.next().is_some() {
+                    // Git does not quote these paths, even with --sq. Never
+                    // guess a newline-containing pathname's field boundary.
+                    // Read the original two commands under the SAME owner/end.
+                    (
+                        git_with(runner, directory, root_args, false)?,
+                        git_with(runner, directory, common_args, false)?,
+                    )
+                } else if root.is_empty()
+                    || common.is_empty()
+                    || root.len() >= 8192
+                    || common.len() >= 8192
+                {
+                    return Err(AppError::Config(
+                        "Capture requires an identifiable Git repository".into(),
+                    ));
+                } else {
+                    // Match the legacy classifier for EACH scalar; approval
+                    // and hooks must select the same mapping/disabled policy.
+                    let root = root.trim();
+                    let common = common.trim();
+                    if root.is_empty() || common.is_empty() {
+                        return Err(AppError::Config(
+                            "Capture requires an identifiable Git repository".into(),
+                        ));
+                    }
+                    (root.to_owned(), common.to_owned())
+                };
+                (
+                    PathBuf::from(root).canonicalize().map_err(storage_error)?,
+                    PathBuf::from(common)
+                        .canonicalize()
+                        .map_err(storage_error)?,
+                    remotes,
+                )
+            }
+            None => {
+                let root = PathBuf::from(git_with(runner, directory, root_args, false)?)
+                    .canonicalize()
+                    .map_err(storage_error)?;
+                let common = PathBuf::from(git_with(runner, directory, common_args, false)?)
+                    .canonicalize()
+                    .map_err(storage_error)?;
+                (
+                    root,
+                    common,
+                    git_with(runner, directory, remotes_args, true)?,
+                )
+            }
         };
-        let root = PathBuf::from(git(root_args, false)?)
-            .canonicalize()
-            .map_err(storage_error)?;
-        let common = git(common_args, false)?;
-        let common = PathBuf::from(common)
-            .canonicalize()
-            .map_err(storage_error)?;
         // All remotes participate in consent; adding/replacing one invalidates it.
         // Raw remotes may contain credentials. Only their digest is ever retained.
-        let remotes = git(remotes_args, true)?;
         let mut remotes: Vec<_> = remotes.lines().collect();
         remotes.sort_unstable();
         let key = hash(common.to_string_lossy().as_bytes());
@@ -3292,16 +3344,21 @@ mod owned_probe_tests {
     }
     struct CohortReplies {
         directory: PathBuf,
-        results: Option<io::Result<[CommandResult; 3]>>,
+        results: Option<io::Result<[CommandResult; 2]>>,
+        fallback: VecDeque<io::Result<CommandResult>>,
     }
     impl LeafRunner for CohortReplies {
         fn repository_outputs(
             &mut self,
-            commands: [Command; 3],
-        ) -> Option<io::Result<[CommandResult; 3]>> {
-            let expected: [&[&str]; 3] = [
-                &["rev-parse", "--show-toplevel"],
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            commands: [Command; 2],
+        ) -> Option<io::Result<[CommandResult; 2]>> {
+            let expected: [&[&str]; 2] = [
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--show-toplevel",
+                    "--git-common-dir",
+                ],
                 &["config", "--get-regexp", "^remote\\..*\\.url$"],
             ];
             for (command, args) in commands.into_iter().zip(expected) {
@@ -3317,15 +3374,39 @@ mod owned_probe_tests {
             }
             Some(self.results.take().expect("one repository cohort"))
         }
-        fn output(&mut self, _: Command, _: usize, _: usize) -> io::Result<CommandResult> {
-            panic!("cohort must never fall back to another process");
+        fn output(
+            &mut self,
+            command: Command,
+            stdout_cap: usize,
+            stderr_cap: usize,
+        ) -> io::Result<CommandResult> {
+            assert_eq!(command.get_program(), "git");
+            assert_eq!((stdout_cap, stderr_cap), (8192, 8192));
+            let arguments = command.get_args().collect::<Vec<_>>();
+            assert_eq!(arguments[0], "-C");
+            assert_eq!(arguments[1], self.directory.as_os_str());
+            let expected: &[&str] = if self.fallback.len() == 2 {
+                &["rev-parse", "--show-toplevel"]
+            } else {
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"]
+            };
+            assert_eq!(
+                arguments[2..],
+                expected
+                    .iter()
+                    .map(std::ffi::OsStr::new)
+                    .collect::<Vec<_>>()
+            );
+            self.fallback
+                .pop_front()
+                .expect("unexpected sequential repository lookup")
         }
     }
     #[test]
     fn repository_cohort_resolver_preserves_commands_remote_sorting_and_empty_exit() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let path = root.to_str().unwrap().as_bytes().to_vec();
+        let path = format!("{}\n{}\n", root.display(), root.display()).into_bytes();
         for remotes in [
             reply(1, Vec::new()).unwrap(),
             reply(0, b"z url2\na url1\n".to_vec()).unwrap(),
@@ -3337,11 +3418,8 @@ mod owned_probe_tests {
             };
             let mut runner = CohortReplies {
                 directory: root.clone(),
-                results: Some(Ok([
-                    reply(0, path.clone()).unwrap(),
-                    reply(0, path.clone()).unwrap(),
-                    remotes,
-                ])),
+                fallback: VecDeque::new(),
+                results: Some(Ok([reply(0, path.clone()).unwrap(), remotes])),
             };
             let result = Repository::resolve_with(&root, &mut runner).unwrap();
             assert_eq!(result.key, hash(root.to_string_lossy().as_bytes()));
@@ -3353,21 +3431,21 @@ mod owned_probe_tests {
     fn repository_cohort_resolver_retains_ownership_and_text_refusals() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let path = root.to_str().unwrap().as_bytes().to_vec();
+        let path = format!("{}\n{}\n", root.display(), root.display()).into_bytes();
         for refusal in ["owner", "root", "common", "remote"] {
             let mut results = [
-                reply(0, path.clone()).unwrap(),
                 reply(0, path.clone()).unwrap(),
                 reply(1, Vec::new()).unwrap(),
             ];
             match refusal {
                 "root" => results[0] = reply(128, Vec::new()).unwrap(),
-                "common" => results[1] = reply(0, vec![255]).unwrap(),
-                "remote" => results[2].output.stderr = b"private error never published".to_vec(),
+                "common" => results[0] = reply(0, vec![255]).unwrap(),
+                "remote" => results[1].output.stderr = b"private error never published".to_vec(),
                 _ => (),
             }
             let mut runner = CohortReplies {
                 directory: root.clone(),
+                fallback: VecDeque::new(),
                 results: Some(if refusal == "owner" {
                     Err(io::Error::other("private owner error"))
                 } else {
@@ -3377,6 +3455,157 @@ mod owned_probe_tests {
             let error = Repository::resolve_with(&root, &mut runner).unwrap_err();
             assert!(!error.to_string().contains("private"));
         }
+    }
+    #[test]
+    fn repository_cohort_newline_paths_use_original_queries_without_guessing_or_hiding_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("line\nbreak");
+        let common = temp.path().join("common");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&common).unwrap();
+        let root = root.canonicalize().unwrap();
+        let common = common.canonicalize().unwrap();
+        for fail in [false, true] {
+            let mut runner = CohortReplies {
+                directory: root.clone(),
+                results: Some(Ok([
+                    reply(
+                        0,
+                        format!("{}\n{}\n", root.display(), common.display()).into_bytes(),
+                    )
+                    .unwrap(),
+                    reply(0, b"z url2\na url1\n".to_vec()).unwrap(),
+                ])),
+                fallback: [
+                    if fail {
+                        Err(io::Error::other("PRIVATE_OWNER_ERROR"))
+                    } else {
+                        reply(0, root.to_str().unwrap().as_bytes().to_vec())
+                    },
+                    reply(0, common.to_str().unwrap().as_bytes().to_vec()),
+                ]
+                .into(),
+            };
+            let result = Repository::resolve_with(&root, &mut runner);
+            if fail {
+                assert!(!result.unwrap_err().to_string().contains("PRIVATE"));
+                assert_eq!(runner.fallback.len(), 1);
+            } else {
+                let repository = result.unwrap();
+                assert_eq!(repository.key, hash(common.to_string_lossy().as_bytes()));
+                assert_eq!(repository.remote_hash, hash("a url1\nz url2"));
+                assert!(runner.fallback.is_empty());
+            }
+        }
+    }
+    #[test]
+    fn repository_cohort_matches_scalar_trimming_and_hint_selection_for_sibling_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = temp.path().join("repo");
+        let actual = temp.path().join("repo ");
+        fs::create_dir_all(selected.join(".keito")).unwrap();
+        fs::create_dir_all(actual.join(".git")).unwrap();
+        fs::write(
+            selected.join(".keito/config.yml"),
+            b"agent_tracking:\n  enabled: false\n",
+        )
+        .unwrap();
+        let actual = actual.canonicalize().unwrap();
+        let common = actual.join(".git");
+        let mut scalar = Replies {
+            values: [
+                reply(0, format!("{}\n", actual.display()).into_bytes()),
+                reply(0, format!("{}\n", common.display()).into_bytes()),
+                reply(1, Vec::new()),
+            ]
+            .into(),
+            calls: 0,
+        };
+        let expected = Repository::resolve_with(&actual, &mut scalar).unwrap();
+        assert!(expected.disabled);
+        let mut cohort = CohortReplies {
+            directory: actual.clone(),
+            results: Some(Ok([
+                reply(
+                    0,
+                    format!("{}\n{}\n", actual.display(), common.display()).into_bytes(),
+                )
+                .unwrap(),
+                reply(1, Vec::new()).unwrap(),
+            ])),
+            fallback: VecDeque::new(),
+        };
+        let observed = Repository::resolve_with(&actual, &mut cohort).unwrap();
+        assert_eq!(observed.key, expected.key);
+        assert_eq!(observed.remote_hash, expected.remote_hash);
+        assert_eq!(observed.disabled, expected.disabled);
+        assert_eq!(observed.hint_hash, expected.hint_hash);
+        assert_eq!(observed.linked_without_hint, expected.linked_without_hint);
+    }
+    #[test]
+    fn repository_cohort_refused_remote_does_not_start_ambiguous_path_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut runner = CohortReplies {
+            directory: root.clone(),
+            results: Some(Ok([
+                reply(0, b"/ambiguous\npath\n/common\n".to_vec()).unwrap(),
+                reply(128, Vec::new()).unwrap(),
+            ])),
+            fallback: VecDeque::new(),
+        };
+        assert!(Repository::resolve_with(&root, &mut runner).is_err());
+        assert!(runner.fallback.is_empty());
+    }
+    #[test]
+    fn repository_cohort_missing_invalid_and_oversized_identity_does_not_fall_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for identity in [
+            Vec::new(),
+            b"one".to_vec(),
+            b"\n\n".to_vec(),
+            b" \n \n".to_vec(),
+            vec![255],
+            format!("{}\n{}", root.display(), "a".repeat(8192)).into_bytes(),
+            format!(
+                "{}\n{}{}\n",
+                root.display(),
+                root.display(),
+                " ".repeat(8192)
+            )
+            .into_bytes(),
+        ] {
+            let mut runner = CohortReplies {
+                directory: root.clone(),
+                results: Some(Ok([
+                    reply(0, identity).unwrap(),
+                    reply(1, Vec::new()).unwrap(),
+                ])),
+                fallback: VecDeque::new(),
+            };
+            assert!(Repository::resolve_with(&root, &mut runner).is_err());
+            assert!(runner.fallback.is_empty());
+        }
+    }
+    #[test]
+    fn repository_default_canonicalization_refusal_does_not_start_later_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runner = Replies {
+            values: [reply(
+                0,
+                temp.path()
+                    .join("absent")
+                    .to_str()
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            )]
+            .into(),
+            calls: 0,
+        };
+        assert!(Repository::resolve_with(temp.path(), &mut runner).is_err());
+        assert_eq!(runner.calls, 1);
     }
     #[test]
     fn repository_cohort_default_runner_still_short_circuits_invalid_root() {

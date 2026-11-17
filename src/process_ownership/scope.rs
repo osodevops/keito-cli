@@ -39,6 +39,21 @@ pub(super) fn dev_client_keeper_policy() -> CleanupPolicy {
 fn error(reason: &'static str) -> io::Error {
     io::Error::other(reason)
 }
+fn spawn_cooperative_before<T>(
+    hard_end: u64,
+    admission_ceiling: Option<u64>,
+    fresh: u64,
+    spawn: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let admission_end = admission_ceiling
+        .unwrap_or(hard_end)
+        .min(hard_end)
+        .saturating_sub(RESERVE_NS);
+    if fresh >= admission_end || super::signals::pending() {
+        return Err(error("SCOPE_ADMISSION"));
+    }
+    spawn()
+}
 fn clear_parent_environment(command: &mut Command) {
     for key in [
         "KEITO_PROCESS_OWNER_FD",
@@ -1061,8 +1076,8 @@ impl<E: Edge> Core<E> {
     // accepted sibling cannot leak output while another is pending or invalid.
     fn take_repository_results(
         &mut self,
-        slots: &[SlotId; 3],
-    ) -> io::Result<Option<[CommandResult; 3]>> {
+        slots: &[SlotId; 2],
+    ) -> io::Result<Option<[CommandResult; 2]>> {
         let fault = self.owner.borrow().first_fault;
         if let Some(reason) = fault {
             return Err(error(reason.0));
@@ -1101,7 +1116,6 @@ impl<E: Edge> Core<E> {
         Ok(Some([
             self.take_result(&slots[0])?,
             self.take_result(&slots[1])?,
-            self.take_result(&slots[2])?,
         ]))
     }
     fn take_result(&mut self, id: &SlotId) -> io::Result<CommandResult> {
@@ -1443,7 +1457,17 @@ impl Scope {
     /// signals. Its own entry owner must settle descendants and close the wire.
     /// Caller-specified stdin/stdout/stderr and pre_exec are preserved.
     pub fn start_cooperative(&mut self, mut command: Command) -> io::Result<SlotId> {
-        self.start_cooperative_inner(&mut command, None)
+        self.start_cooperative_inner(&mut command, None, None)
+    }
+    /// Guardian-only admission ceiling. This cannot lengthen the containing
+    /// owner or shorten its retained-child cleanup budget.
+    #[allow(dead_code)] // The standalone guardian links its own copy of Scope.
+    pub(crate) fn start_hook_core(
+        &mut self,
+        mut command: Command,
+        leaf_end: u64,
+    ) -> io::Result<SlotId> {
+        self.start_cooperative_inner(&mut command, None, Some(leaf_end))
     }
     pub fn start_cooperative_with_io(
         &mut self,
@@ -1454,12 +1478,13 @@ impl Scope {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        self.start_cooperative_inner(&mut command, Some(plan))
+        self.start_cooperative_inner(&mut command, Some(plan), None)
     }
     fn start_cooperative_inner(
         &mut self,
         command: &mut Command,
         plan: Option<IoPlan>,
+        admission_ceiling: Option<u64>,
     ) -> io::Result<SlotId> {
         self.poll();
         let at = self.core.admission_clock(&mut now)?;
@@ -1503,7 +1528,7 @@ impl Scope {
             });
         }
         let mask = super::signals::AdmissionMask::block(command)?;
-        let admission_end = self.core.hard_end.saturating_sub(RESERVE_NS);
+        let hard_end = self.core.hard_end;
         let capacity = plan.as_ref().map(IoPlan::capacity).unwrap_or(0);
         let mut clock_failed = false;
         let result = self.core.admit(at, capacity, |owner| {
@@ -1518,10 +1543,8 @@ impl Scope {
                     return Err(error("SCOPE_CLOCK"));
                 }
             };
-            if fresh >= admission_end || super::signals::pending() {
-                return Err(error("SCOPE_ADMISSION"));
-            }
-            let child = command.spawn()?;
+            let child =
+                spawn_cooperative_before(hard_end, admission_ceiling, fresh, || command.spawn())?;
             // The edge owns the actual handle before identity publication.
             let mut edge = CooperativeEdge {
                 child,
@@ -1771,23 +1794,22 @@ impl Scope {
         self.run_started(started)
     }
     /// Fixed read-only repository cohort, used only by the HookShort owner.
-    /// Commands are the original three Git values; no shell or worker thread.
+    /// Three Git facts use two commands; no shell or worker thread.
     pub(crate) fn run_verified_repository(
         &mut self,
-        commands: [Command; 3],
+        commands: [Command; 2],
         image: &super::image::VerifiedKeeperImage,
-    ) -> io::Result<[CommandResult; 3]> {
+    ) -> io::Result<[CommandResult; 2]> {
         let result = (|| {
             // All IO plans exist before the first child. Actual allocation and
             // capacity reservation still precede each registered edge's spawn.
             let plans = [
-                IoPlan::new(Vec::new(), 8192, 8192)?,
-                IoPlan::new(Vec::new(), 8192, 8192)?,
+                IoPlan::new(Vec::new(), 16384, 8192)?,
                 IoPlan::new(Vec::new(), 1024 * 1024, 8192)?,
             ];
-            let mut slots = [None, None, None];
+            let mut slots = [None, None];
             for ((command, plan), slot) in commands.into_iter().zip(plans).zip(&mut slots) {
-                // The private fixed cohort has at most three edges here.
+                // The private fixed cohort has at most two edges here.
                 // A blocking sibling spawn must not consume an earlier
                 // keeper's already-running short setup window.
                 let upstream = &mut self.upstream;
@@ -1809,7 +1831,7 @@ impl Scope {
                     return Err(error(reason.0));
                 }
             }
-            let slots = slots.map(|slot| slot.expect("three admitted repository slots"));
+            let slots = slots.map(|slot| slot.expect("two admitted repository slots"));
             loop {
                 self.poll();
                 if let Some(results) = self.core.take_repository_results(&slots)? {
@@ -1998,6 +2020,36 @@ impl Drop for Scope {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cooperative_late_preparation_cannot_lose_a_tighter_hook_admission_ceiling() {
+        use std::cell::Cell;
+        let spawned = Cell::new(false);
+        // Preparation began within the leaf window but returned after its
+        // admission ceiling, still before the longer guard's admission end.
+        let result = spawn_cooperative_before(600_000_000, Some(500_000_000), 450_000_000, || {
+            spawned.set(true);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!spawned.get(), "late prepared command was spawned");
+        for (hard, selected, fresh, allowed) in [
+            (600_000_000, Some(500_000_000), 449_999_999, true),
+            (600_000_000, Some(500_000_000), 525_000_000, false),
+            (400_000_000, Some(500_000_000), 350_000_000, false),
+            (400_000_000, Some(u64::MAX), 350_000_000, false),
+            (600_000_000, None, 549_999_999, true),
+            (600_000_000, None, 550_000_000, false),
+            (600_000_000, Some(0), 0, false),
+        ] {
+            spawned.set(false);
+            let result = spawn_cooperative_before(hard, selected, fresh, || {
+                spawned.set(true);
+                Ok(())
+            });
+            assert_eq!(result.is_ok(), allowed);
+            assert_eq!(spawned.get(), allowed);
+        }
+    }
     #[cfg(feature = "dev-tools")]
     #[test]
     fn offline_client_completed_leaf_cache_releases_only_after_proven_collection() {
@@ -2641,9 +2693,9 @@ mod tests {
             assert_eq!(core.slots.len(), 1);
         }
     }
-    fn repository_cohort() -> (Core<Fake>, [SlotId; 3]) {
+    fn repository_cohort() -> (Core<Fake>, [SlotId; 2]) {
         let mut core: Core<Fake> = Core::new(Rc::default(), 500_000_000);
-        let slots = ["root", "common", "remotes"].map(|name| {
+        let slots = ["identity", "remotes"].map(|name| {
             let id = core
                 .admit(1, 32, |_| Ok(fake(name, Rc::default())))
                 .unwrap();
@@ -2663,22 +2715,19 @@ mod tests {
     #[test]
     fn repository_cohort_pending_sibling_consumes_no_outputs_or_authority() {
         let (mut core, slots) = repository_cohort();
-        core.slots[2].accepted_at = None;
+        core.slots[1].accepted_at = None;
         assert!(matches!(core.take_repository_results(&slots), Ok(None)));
         assert!(core.slots.iter().all(|slot| !slot.output_taken));
         assert!(core.owner.borrow().first_fault.is_none());
-        core.slots[2].accepted_at = Some(3);
+        core.slots[1].accepted_at = Some(3);
         assert!(core.take_repository_results(&slots).unwrap().is_some());
     }
     #[test]
     fn repository_cohort_preserves_request_order_and_consumes_exactly_once() {
         let (mut core, slots) = repository_cohort();
-        let reordered = [slots[2].clone(), slots[0].clone(), slots[1].clone()];
+        let reordered = [slots[1].clone(), slots[0].clone()];
         let results = core.take_repository_results(&reordered).unwrap().unwrap();
-        assert_eq!(
-            results.map(|r| r.status.code()),
-            [Some(2), Some(0), Some(1)]
-        );
+        assert_eq!(results.map(|r| r.status.code()), [Some(1), Some(0)]);
         assert!(core.slots.iter().all(|slot| slot.output_taken));
         assert!(core.take_repository_results(&slots).is_err());
     }
@@ -2687,12 +2736,13 @@ mod tests {
         for invalid in ["foreign", "duplicate", "consumed"] {
             let (mut core, mut slots) = repository_cohort();
             match invalid {
-                "foreign" => slots[2].scope = Rc::new(()),
-                "duplicate" => slots[2] = slots[1].clone(),
-                _ => core.slots[2].output_taken = true,
+                "foreign" => slots[1].scope = Rc::new(()),
+                "duplicate" => slots[1] = slots[0].clone(),
+                _ => core.slots[1].output_taken = true,
             }
             assert!(core.take_repository_results(&slots).is_err());
-            assert!(!core.slots[0].output_taken && !core.slots[1].output_taken);
+            assert!(!core.slots[0].output_taken);
+            assert_eq!(core.slots[1].output_taken, invalid == "consumed");
             assert!(core.owner.borrow().first_fault.is_some());
         }
     }
@@ -2701,11 +2751,11 @@ mod tests {
         for missing in ["proof", "wait", "status", "group", "terminal", "fault"] {
             let (mut core, slots) = repository_cohort();
             match missing {
-                "proof" => core.slots[2].edge.facts.resource_proof = false,
-                "wait" => core.slots[2].edge.facts.waits_known = false,
-                "status" => core.slots[2].edge.facts.status = None,
-                "group" => core.slots[2].edge.facts.group_absent = false,
-                "terminal" => core.slots[2].edge.facts.terminal_eof = false,
+                "proof" => core.slots[1].edge.facts.resource_proof = false,
+                "wait" => core.slots[1].edge.facts.waits_known = false,
+                "status" => core.slots[1].edge.facts.status = None,
+                "group" => core.slots[1].edge.facts.group_absent = false,
+                "terminal" => core.slots[1].edge.facts.terminal_eof = false,
                 _ => core.poison("ORIGINAL_FAULT"),
             }
             assert!(core.take_repository_results(&slots).is_err());

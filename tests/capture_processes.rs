@@ -142,9 +142,18 @@ fn guarded_hook_preserves_an_older_seeded_interval_without_a_startup_speed_assum
     assert_concurrent_hooks(1, 93);
 }
 
+#[test]
+fn guarded_hook_preserves_newline_quoted_unicode_repository_paths() {
+    assert_concurrent_hooks_in(1, 93, "PRIVATE_PATH_CANARY ' ü\nline");
+}
+
 fn assert_concurrent_hooks(count: usize, seed_age_seconds: i64) {
+    assert_concurrent_hooks_in(count, seed_age_seconds, "PRIVATE_PATH_CANARY");
+}
+
+fn assert_concurrent_hooks_in(count: usize, seed_age_seconds: i64, repository_name: &str) {
     let temp = tempfile::tempdir().unwrap();
-    let repo_root = temp.path().join("PRIVATE_PATH_CANARY");
+    let repo_root = temp.path().join(repository_name);
     std::fs::create_dir(&repo_root).unwrap();
     assert!(Command::new("git")
         .arg("-C")
