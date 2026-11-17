@@ -48,7 +48,7 @@ fn main() {
     #[cfg(unix)]
     let mut entry_scope = None;
     let mut parser_exit = None;
-    let mut result = capture_runtime_pair::bootstrap_image().and_then(|()| {
+    let result = capture_runtime_pair::bootstrap_image().and_then(|()| {
         #[cfg(unix)]
         let pending = keito_cli::process_entry::PendingEntry::attach()
             .map_err(|_| AppError::Config("Command ownership attachment refused".into()))?;
@@ -98,16 +98,20 @@ fn main() {
             ))
     });
     #[cfg(unix)]
-    if let Some(scope) = entry_scope.as_mut() {
+    let result = if let Some(scope) = entry_scope.as_mut() {
         let resources = scope.finish().clean;
         if !scope.publish_terminal(resources && result.is_ok() && parser_exit.unwrap_or(0) == 0)
             && result.is_ok()
         {
-            result = Err(AppError::Config(
+            Err(AppError::Config(
                 "Command ownership did not settle; collection remains paused".into(),
-            ));
+            ))
+        } else {
+            result
         }
-    }
+    } else {
+        result
+    };
     if let Some(code) = parser_exit {
         std::process::exit(code);
     }
