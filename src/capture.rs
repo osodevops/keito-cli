@@ -2546,6 +2546,15 @@ impl Store {
             .next()
             .map(|(_, failure)| failure))
     }
+    /// Source-fixture failure diagnosis only; status retains its earliest refusal.
+    /// Reuse the bounded strict marker reader and expose no paths or raw bodies.
+    #[cfg(feature = "dev-tools")]
+    pub fn developer_failure_probes(&self) -> Result<Vec<HookFailureProbe>, AppError> {
+        Ok(read_failure_markers(&self.directory)?
+            .into_iter()
+            .filter_map(|(_, failure)| failure.probe)
+            .collect())
+    }
     pub fn recover(&mut self, clock: &Clock) -> Result<(), AppError> {
         let tx = self.transaction()?;
         let invocations = capture_invocations::snapshot(&tx.directory)?;
@@ -3130,6 +3139,53 @@ mod failure_probe_tests {
         let value = serde_json::to_value(&ordinary[0].1).unwrap();
         assert_eq!(value.as_object().unwrap().len(), 3);
         assert!(value.get("probe").is_none());
+    }
+
+    #[test]
+    #[cfg(all(feature = "dev-tools", unix))]
+    fn developer_failure_probes_keep_later_core_diagnostics_after_an_earlier_guard_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut first = legacy();
+        first["reason"] = serde_json::json!("BOUNDARY_REFUSED");
+        first["observed_at"] = serde_json::json!(1);
+        let first_path = directory.path().join("capture-failure.json");
+        let original = serde_json::to_vec(&first).unwrap();
+        fs::write(&first_path, &original).unwrap();
+        let mut expected = Vec::new();
+        for phase in [HookFailurePhase::Repository, HookFailurePhase::Permit] {
+            let probe = HookFailureProbe {
+                phase,
+                owner_fault: Some(HookOwnerFault::GroupDeadline),
+                setup: None,
+            };
+            expected.push(serde_json::to_value(probe).unwrap());
+            record_failure_probed(
+                directory.path(),
+                &"a".repeat(64),
+                "STORAGE_UNAVAILABLE",
+                probe,
+            )
+            .unwrap();
+        }
+        assert_eq!(store.failure().unwrap().unwrap().reason, "BOUNDARY_REFUSED");
+        let probes = store.developer_failure_probes().unwrap();
+        let mut actual = probes
+            .into_iter()
+            .map(|probe| serde_json::to_value(probe).unwrap())
+            .collect::<Vec<_>>();
+        // Same-second immutable marker filename ordering is not phase ordering.
+        actual.sort_by_key(|value| value.to_string());
+        expected.sort_by_key(|value| value.to_string());
+        assert_eq!(actual, expected);
+        assert_eq!(fs::read(&first_path).unwrap(), original);
+        assert_eq!(read_failure_markers(directory.path()).unwrap().len(), 3);
+        fs::write(
+            directory.path().join("capture-refusal-malformed.json"),
+            b"PRIVATE_MALFORMED_CANARY",
+        )
+        .unwrap();
+        assert!(store.developer_failure_probes().is_err());
     }
 
     #[test]

@@ -277,7 +277,14 @@ fn capture_failure_diagnostics(store: &Store) -> serde_json::Value {
         }),
         Err(error) => serde_json::json!({ "error": error.to_string() }),
     };
-    serde_json::json!({ "status": status, "descendant_finality": "UNPROVED" })
+    #[cfg(feature = "dev-tools")]
+    let probes = match store.developer_failure_probes() {
+        Ok(probes) => serde_json::json!({ "state": "observed", "values": probes }),
+        Err(_) => serde_json::json!({ "state": "unavailable" }),
+    };
+    #[cfg(not(feature = "dev-tools"))]
+    let probes = serde_json::json!({ "state": "not_enabled" });
+    serde_json::json!({ "status": status, "developer_probes": probes, "descendant_finality": "UNPROVED" })
 }
 
 fn assert_no_private_content(directory: &std::path::Path) {
