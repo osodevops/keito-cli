@@ -664,6 +664,86 @@ fn exercise(
     Ok(())
 }
 
+// Closed developer diagnostics only. Never serialize a supplied error string.
+fn fault_code(reason: Option<&'static str>) -> Option<&'static str> {
+    match reason {
+        None => None,
+        Some(
+            code @ ("GROUP_DEADLINE"
+            | "GROUP_EOF"
+            | "GROUP_READY"
+            | "GROUP_PARK"
+            | "GROUP_STATE"
+            | "GROUP_CLOCK"
+            | "GROUP_ADMISSION"
+            | "GROUP_START_STATE"
+            | "GROUP_SPAWN"
+            | "GROUP_KEEPER_FAILED"
+            | "GROUP_EARLY_EOF"
+            | "GROUP_CLEANUP_DEADLINE"
+            | "GROUP_WORKLOAD_WAIT"
+            | "GROUP_KEEPER_WAIT"
+            | "GROUP_FRAME"
+            | "GROUP_NONCE"
+            | "GROUP_FRAME_LIMIT"
+            | "GROUP_WIRE_LIMIT"
+            | "GROUP_TRUNCATED"
+            | "GROUP_READ"
+            | "GROUP_WRITE"
+            | "GROUP_SHORT_WRITE"
+            | "GROUP_TERMINAL"
+            | "GROUP_SHUTDOWN"
+            | "GROUP_BOUND_SEALED"
+            | "GROUP_IO"
+            | "SCOPE_CLOCK"
+            | "SCOPE_EDGE"
+            | "SCOPE_BEGIN"
+            | "SCOPE_OPERATION_DEADLINE"
+            | "SCOPE_CLEANUP_DEADLINE"
+            | "SCOPE_RESULT"
+            | "SCOPE_IO_ATTACH"
+            | "DEV_CLIENT_OPERATION"),
+        ) => Some(code),
+        Some(_) => Some("UNKNOWN"),
+    }
+}
+#[derive(Serialize)]
+struct SetupTiming {
+    setup_start_ns: u64,
+    ready_end_ns: u64,
+    pre_spawn_ns: u64,
+    spawn_return_ns: Option<u64>,
+    first_ready_poll_ns: Option<u64>,
+    last_ready_before_ns: Option<u64>,
+    last_ready_after_ns: Option<u64>,
+    ready_frame_observed: bool,
+    ready_eof_observed: bool,
+    deadline_observed: Option<(&'static str, u64)>,
+}
+impl From<crate::process_ownership::group::SetupTrace> for SetupTiming {
+    fn from(trace: crate::process_ownership::group::SetupTrace) -> Self {
+        Self {
+            setup_start_ns: trace.setup_start_ns,
+            ready_end_ns: trace.ready_end_ns,
+            pre_spawn_ns: trace.pre_spawn_ns,
+            spawn_return_ns: trace.spawn_return_ns,
+            first_ready_poll_ns: trace.first_ready_poll_ns,
+            last_ready_before_ns: trace.last_ready_before_ns,
+            last_ready_after_ns: trace.last_ready_after_ns,
+            ready_frame_observed: trace.ready_frame_observed,
+            ready_eof_observed: trace.ready_eof_observed,
+            deadline_observed: trace.deadline_observed.map(|(point, at)| {
+                let point = match point {
+                    "READY_BEFORE_RECEIVE" => "READY_BEFORE_RECEIVE",
+                    "READY_AFTER_RECEIVE" => "READY_AFTER_RECEIVE",
+                    _ => "UNKNOWN",
+                };
+                (point, at)
+            }),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Physical {
     slot: usize,
@@ -680,12 +760,15 @@ struct Physical {
     accepted_ns: Option<u64>,
     completion_end_ns: Option<u64>,
     fault: bool,
+    fault_code: Option<&'static str>,
+    setup: Option<SetupTiming>,
 }
 #[derive(Serialize)]
 struct Receipt<'a> {
     checks_passed_before_persistence: bool,
     acceptance_requires_exit_zero: bool,
     primary: Option<Failure>,
+    scope_fault_code: Option<&'static str>,
     scope_clean: bool,
     resources_known: bool,
     physical_slots: Vec<Physical>,
@@ -704,6 +787,7 @@ fn receipt<'a>(
             && observations.len() == 4,
         acceptance_requires_exit_zero: true,
         primary,
+        scope_fault_code: fault_code(report.first_fault.map(|reason| reason.0)),
         scope_clean: report.clean,
         resources_known: report.all_resources,
         observations,
@@ -725,6 +809,8 @@ fn receipt<'a>(
                 accepted_ns: slot.accepted_at,
                 completion_end_ns: slot.completion_end,
                 fault: slot.first_fault.is_some() || slot.io.first_fault.is_some(),
+                fault_code: fault_code(slot.first_fault.or(slot.io.first_fault)),
+                setup: slot.setup_trace.map(SetupTiming::from),
             })
             .collect(),
         detached_descendants: "UNKNOWN",
@@ -1256,7 +1342,10 @@ mod tests {
         assert!(!text.contains("PRIVATE") && !text.contains("MODEL"));
         assert!(project_help(b"PRIVATE_prose only").is_err());
     }
-    fn diagnostic_report(scope_fault: Option<&'static str>, slot_fault: Option<&'static str>) -> ScopeReport {
+    fn diagnostic_report(
+        scope_fault: Option<&'static str>,
+        slot_fault: Option<&'static str>,
+    ) -> ScopeReport {
         ScopeReport {
             first_fault: scope_fault.map(ProtocolError),
             admission_closed: true,
@@ -1264,14 +1353,26 @@ mod tests {
             all_resources: false,
             clean: false,
             slots: vec![crate::process_ownership::scope::SlotReport {
-                slot: 0, status: None, waits_known: false, group_absent: false,
-                terminal_eof: false, io_required: false, io: Default::default(),
-                accepted_at: None, completion_end: Some(80), first_fault: slot_fault,
+                slot: 0,
+                status: None,
+                waits_known: false,
+                group_absent: false,
+                terminal_eof: false,
+                io_required: false,
+                io: Default::default(),
+                accepted_at: None,
+                completion_end: Some(80),
+                first_fault: slot_fault,
                 setup_trace: Some(crate::process_ownership::group::SetupTrace {
-                    setup_start_ns: 10, ready_end_ns: 30, pre_spawn_ns: 11,
-                    spawn_return_ns: Some(12), first_ready_poll_ns: Some(14),
-                    last_ready_before_ns: Some(29), last_ready_after_ns: None,
-                    ready_frame_observed: false, ready_eof_observed: true,
+                    setup_start_ns: 10,
+                    ready_end_ns: 30,
+                    pre_spawn_ns: 11,
+                    spawn_return_ns: Some(12),
+                    first_ready_poll_ns: Some(14),
+                    last_ready_before_ns: Some(29),
+                    last_ready_after_ns: None,
+                    ready_frame_observed: false,
+                    ready_eof_observed: true,
                     deadline_observed: Some(("READY_BEFORE_RECEIVE", 31)),
                 }),
             }],
@@ -1284,20 +1385,34 @@ mod tests {
         assert_eq!(value["scope_fault_code"], "GROUP_DEADLINE");
         assert_eq!(value["physical_slots"][0]["fault_code"], "GROUP_EOF");
         assert_eq!(value["physical_slots"][0]["setup"]["ready_end_ns"], 30);
-        assert_eq!(value["physical_slots"][0]["setup"]["ready_eof_observed"], true);
-        assert_eq!(value["physical_slots"][0]["setup"]["deadline_observed"][0], "READY_BEFORE_RECEIVE");
+        assert_eq!(
+            value["physical_slots"][0]["setup"]["ready_eof_observed"],
+            true
+        );
+        assert_eq!(
+            value["physical_slots"][0]["setup"]["deadline_observed"][0],
+            "READY_BEFORE_RECEIVE"
+        );
         assert_eq!(value["primary"], "OPERATION");
         assert_eq!(value["resources_known"], false);
         assert_eq!(value["observations"], serde_json::json!([]));
     }
     #[test]
     fn offline_client_failure_receipt_refuses_unknown_reason_and_phase_text() {
-        let mut report = diagnostic_report(Some("PRIVATE_SCOPE_CANARY"), Some("PRIVATE_SLOT_CANARY"));
-        report.slots[0].setup_trace.as_mut().unwrap().deadline_observed = Some(("PRIVATE_PHASE_CANARY", 31));
+        let mut report =
+            diagnostic_report(Some("PRIVATE_SCOPE_CANARY"), Some("PRIVATE_SLOT_CANARY"));
+        report.slots[0]
+            .setup_trace
+            .as_mut()
+            .unwrap()
+            .deadline_observed = Some(("PRIVATE_PHASE_CANARY", 31));
         let value = serde_json::to_value(receipt(Some(Failure::Operation), &report, &[])).unwrap();
         assert_eq!(value["scope_fault_code"], "UNKNOWN");
         assert_eq!(value["physical_slots"][0]["fault_code"], "UNKNOWN");
-        assert_eq!(value["physical_slots"][0]["setup"]["deadline_observed"][0], "UNKNOWN");
+        assert_eq!(
+            value["physical_slots"][0]["setup"]["deadline_observed"][0],
+            "UNKNOWN"
+        );
         assert!(!value.to_string().contains("PRIVATE"));
     }
     #[test]
@@ -1307,9 +1422,14 @@ mod tests {
         let value = serde_json::to_value(receipt(Some(Failure::Finality), &report, &[])).unwrap();
         assert!(value.as_object().unwrap().contains_key("scope_fault_code"));
         assert_eq!(value["scope_fault_code"], serde_json::Value::Null);
-        assert!(value["physical_slots"][0].as_object().unwrap().contains_key("fault_code"));
-        assert!(value["physical_slots"][0].as_object().unwrap().contains_key("setup"));
+        assert!(value["physical_slots"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("fault_code"));
+        assert!(value["physical_slots"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("setup"));
         assert_eq!(value["physical_slots"][0]["setup"], serde_json::Value::Null);
     }
-
 }
