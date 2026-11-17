@@ -882,6 +882,8 @@ impl HookOwnerFault {
 pub enum HookReadyEdge {
     BeforeReceive,
     AfterReceive,
+    ParkBeforeReceive,
+    ParkAfterReceive,
 }
 #[cfg(feature = "dev-tools")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -911,6 +913,14 @@ pub struct HookSetupProbe {
     pub ready_frame_observed: bool,
     pub ready_eof_observed: bool,
     pub deadline_edge: Option<HookReadyEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub park_end_offset_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_spawn_return_offset_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_park_poll_offset_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub park_frame_observed: Option<bool>,
 }
 #[cfg(feature = "dev-tools")]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -3074,12 +3084,28 @@ mod failure_probe_tests {
             "deadline_offset_ns": u64::MAX,
             "ready_frame_observed": false,
             "ready_eof_observed": false,
-            "deadline_edge": "before_receive",
+            "deadline_edge": "park_after_receive",
             "fault_state": "await_ready",
+            "park_end_offset_ns": u64::MAX,
+            "workload_spawn_return_offset_ns": u64::MAX,
+            "first_park_poll_offset_ns": u64::MAX,
+            "park_frame_observed": true,
         });
         let failure: CaptureFailure = serde_json::from_value(marker.clone()).unwrap();
         assert!(serde_json::to_vec(&failure).unwrap().len() <= 1024);
         assert_eq!(serde_json::to_value(failure).unwrap(), marker);
+        let mut older = marker.clone();
+        older["probe"]["setup"]["deadline_edge"] = serde_json::json!("before_receive");
+        for key in [
+            "park_end_offset_ns",
+            "workload_spawn_return_offset_ns",
+            "first_park_poll_offset_ns",
+            "park_frame_observed",
+        ] {
+            older["probe"]["setup"].as_object_mut().unwrap().remove(key);
+        }
+        let failure: CaptureFailure = serde_json::from_value(older.clone()).unwrap();
+        assert_eq!(serde_json::to_value(failure).unwrap(), older);
         for (key, value) in [
             ("deadline_edge", serde_json::json!("PRIVATE_RAW_CANARY")),
             ("fault_state", serde_json::json!("PRIVATE_RAW_CANARY")),

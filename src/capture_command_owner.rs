@@ -411,8 +411,14 @@ fn hook_setup_probe(
         deadline_edge: trace.deadline_observed.and_then(|(edge, _)| match edge {
             "READY_BEFORE_RECEIVE" => Some(crate::capture::HookReadyEdge::BeforeReceive),
             "READY_AFTER_RECEIVE" => Some(crate::capture::HookReadyEdge::AfterReceive),
+            "PARK_BEFORE_RECEIVE" => Some(crate::capture::HookReadyEdge::ParkBeforeReceive),
+            "PARK_AFTER_RECEIVE" => Some(crate::capture::HookReadyEdge::ParkAfterReceive),
             _ => None,
         }),
+        park_end_offset_ns: trace.park_end_ns.and_then(offset),
+        workload_spawn_return_offset_ns: trace.workload_spawn_return_ns.and_then(offset),
+        first_park_poll_offset_ns: trace.first_park_poll_ns.and_then(offset),
+        park_frame_observed: trace.park_end_ns.map(|_| trace.park_frame_observed),
     }
 }
 impl LeafRunner for CommandOwner<'_> {
@@ -476,6 +482,7 @@ mod tests {
             ready_eof_observed: false,
             deadline_observed: Some(("READY_BEFORE_RECEIVE", 127)),
             fault_origin: None,
+            ..Default::default()
         });
         assert_eq!(probe.ready_window_ns, Some(20));
         assert_eq!(probe.pre_spawn_offset_ns, Some(15));
@@ -504,6 +511,7 @@ mod tests {
             ready_eof_observed: false,
             deadline_observed: None,
             fault_origin: None,
+            ..Default::default()
         });
         assert!(probe.ready_window_ns.is_none());
         assert!(probe.pre_spawn_offset_ns.is_none());
@@ -538,6 +546,58 @@ mod tests {
             assert_eq!(probe.fault_state, Some(expected));
             assert!(!serde_json::to_string(&probe).unwrap().contains("PRIVATE"));
         }
+    }
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn hook_probe_retains_late_park_observations_without_rebasing_the_end() {
+        use crate::capture::{HookGroupState, HookReadyEdge};
+        use crate::process_ownership::group::SetupTrace;
+        let probe = hook_setup_probe(SetupTrace {
+            setup_start_ns: 100,
+            park_end_ns: Some(150),
+            workload_spawn_return_ns: Some(155),
+            first_park_poll_ns: Some(158),
+            deadline_observed: Some(("PARK_BEFORE_RECEIVE", 158)),
+            fault_origin: Some(("GROUP_DEADLINE", "JOINED")),
+            ..Default::default()
+        });
+        assert_eq!(probe.fault_state, Some(HookGroupState::Joined));
+        assert_eq!(probe.park_end_offset_ns, Some(50));
+        assert_eq!(probe.workload_spawn_return_offset_ns, Some(55));
+        assert_eq!(probe.first_park_poll_offset_ns, Some(58));
+        assert_eq!(probe.deadline_offset_ns, Some(58));
+        assert_eq!(probe.park_frame_observed, Some(false));
+        assert!(matches!(
+            probe.deadline_edge,
+            Some(HookReadyEdge::ParkBeforeReceive)
+        ));
+        let observed = hook_setup_probe(SetupTrace {
+            setup_start_ns: 100,
+            park_end_ns: Some(150),
+            park_frame_observed: true,
+            deadline_observed: Some(("PARK_AFTER_RECEIVE", 151)),
+            ..Default::default()
+        });
+        assert_eq!(observed.park_frame_observed, Some(true));
+        assert!(matches!(
+            observed.deadline_edge,
+            Some(HookReadyEdge::ParkAfterReceive)
+        ));
+        let missing = hook_setup_probe(SetupTrace::default());
+        assert!(missing.park_end_offset_ns.is_none());
+        assert!(missing.workload_spawn_return_offset_ns.is_none());
+        assert!(missing.first_park_poll_offset_ns.is_none());
+        assert!(missing.park_frame_observed.is_none());
+        let backwards = hook_setup_probe(SetupTrace {
+            setup_start_ns: 100,
+            park_end_ns: Some(99),
+            workload_spawn_return_ns: Some(98),
+            first_park_poll_ns: Some(97),
+            ..Default::default()
+        });
+        assert!(backwards.park_end_offset_ns.is_none());
+        assert!(backwards.workload_spawn_return_offset_ns.is_none());
+        assert!(backwards.first_park_poll_offset_ns.is_none());
     }
     #[test]
     fn installer_dropped_unsealed_handle_keeps_its_borrowed_owner_failed() {

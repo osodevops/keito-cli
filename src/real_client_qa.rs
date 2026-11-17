@@ -1557,6 +1557,7 @@ mod tests {
                     ready_eof_observed: true,
                     deadline_observed: Some(("READY_BEFORE_RECEIVE", 31)),
                     fault_origin: None,
+                    ..Default::default()
                 }),
             }],
         }

@@ -602,6 +602,10 @@ pub struct SetupTrace {
     pub ready_eof_observed: bool,
     pub deadline_observed: Option<(&'static str, u64)>,
     pub fault_origin: Option<(&'static str, &'static str)>,
+    pub park_end_ns: Option<u64>,
+    pub workload_spawn_return_ns: Option<u64>,
+    pub first_park_poll_ns: Option<u64>,
+    pub park_frame_observed: bool,
 }
 
 #[cfg(feature = "dev-tools")]
@@ -837,6 +841,7 @@ impl GroupLease {
             ready_eof_observed: false,
             deadline_observed: None,
             fault_origin: None,
+            ..Default::default()
         });
         #[cfg(feature = "dev-tools")]
         let mut settlement = Box::new(if policy == CleanupPolicy::Legacy {
@@ -1081,7 +1086,18 @@ impl GroupLease {
             if at >= end {
                 return Err(refused("GROUP_DEADLINE"));
             }
-            self.spawn_joined(command)?;
+            #[cfg(feature = "dev-tools")]
+            {
+                self.setup_trace.park_end_ns = Some(end);
+            }
+            let joined = self.spawn_joined(command);
+            #[cfg(feature = "dev-tools")]
+            if self.workload.is_some() {
+                // The actual Child is already retained. This optional sample
+                // cannot change admission, time bounds or ownership on error.
+                self.setup_trace.workload_spawn_return_ns = now().ok();
+            }
+            joined?;
             self.park_end = Some(end);
             self.settlement.expected_park = Some(format!(
                 "PARKED|{}|{}|{}",
@@ -1099,11 +1115,27 @@ impl GroupLease {
                 return Err(refused("GROUP_STATE"));
             }
             let end = self.park_end.ok_or_else(|| refused("GROUP_STATE"))?;
-            if now()? >= end {
+            let before = now()?;
+            #[cfg(feature = "dev-tools")]
+            self.setup_trace.first_park_poll_ns.get_or_insert(before);
+            if before >= end {
+                #[cfg(feature = "dev-tools")]
+                self.setup_trace
+                    .deadline_observed
+                    .get_or_insert(("PARK_BEFORE_RECEIVE", before));
                 return Err(refused("GROUP_DEADLINE"));
             }
             let body = self.channel.receive()?;
-            if now()? >= end {
+            let after = now()?;
+            #[cfg(feature = "dev-tools")]
+            {
+                self.setup_trace.park_frame_observed |= body.is_some();
+            }
+            if after >= end {
+                #[cfg(feature = "dev-tools")]
+                self.setup_trace
+                    .deadline_observed
+                    .get_or_insert(("PARK_AFTER_RECEIVE", after));
                 return Err(refused("GROUP_DEADLINE"));
             }
             let Some(body) = body else {
