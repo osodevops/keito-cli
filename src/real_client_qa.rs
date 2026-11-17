@@ -1256,4 +1256,60 @@ mod tests {
         assert!(!text.contains("PRIVATE") && !text.contains("MODEL"));
         assert!(project_help(b"PRIVATE_prose only").is_err());
     }
+    fn diagnostic_report(scope_fault: Option<&'static str>, slot_fault: Option<&'static str>) -> ScopeReport {
+        ScopeReport {
+            first_fault: scope_fault.map(ProtocolError),
+            admission_closed: true,
+            finish_called: true,
+            all_resources: false,
+            clean: false,
+            slots: vec![crate::process_ownership::scope::SlotReport {
+                slot: 0, status: None, waits_known: false, group_absent: false,
+                terminal_eof: false, io_required: false, io: Default::default(),
+                accepted_at: None, completion_end: Some(80), first_fault: slot_fault,
+                setup_trace: Some(crate::process_ownership::group::SetupTrace {
+                    setup_start_ns: 10, ready_end_ns: 30, pre_spawn_ns: 11,
+                    spawn_return_ns: Some(12), first_ready_poll_ns: Some(14),
+                    last_ready_before_ns: Some(29), last_ready_after_ns: None,
+                    ready_frame_observed: false, ready_eof_observed: true,
+                    deadline_observed: Some(("READY_BEFORE_RECEIVE", 31)),
+                }),
+            }],
+        }
+    }
+    #[test]
+    fn offline_client_failure_receipt_preserves_first_fault_and_setup_without_output() {
+        let report = diagnostic_report(Some("GROUP_DEADLINE"), Some("GROUP_EOF"));
+        let value = serde_json::to_value(receipt(Some(Failure::Operation), &report, &[])).unwrap();
+        assert_eq!(value["scope_fault_code"], "GROUP_DEADLINE");
+        assert_eq!(value["physical_slots"][0]["fault_code"], "GROUP_EOF");
+        assert_eq!(value["physical_slots"][0]["setup"]["ready_end_ns"], 30);
+        assert_eq!(value["physical_slots"][0]["setup"]["ready_eof_observed"], true);
+        assert_eq!(value["physical_slots"][0]["setup"]["deadline_observed"][0], "READY_BEFORE_RECEIVE");
+        assert_eq!(value["primary"], "OPERATION");
+        assert_eq!(value["resources_known"], false);
+        assert_eq!(value["observations"], serde_json::json!([]));
+    }
+    #[test]
+    fn offline_client_failure_receipt_refuses_unknown_reason_and_phase_text() {
+        let mut report = diagnostic_report(Some("PRIVATE_SCOPE_CANARY"), Some("PRIVATE_SLOT_CANARY"));
+        report.slots[0].setup_trace.as_mut().unwrap().deadline_observed = Some(("PRIVATE_PHASE_CANARY", 31));
+        let value = serde_json::to_value(receipt(Some(Failure::Operation), &report, &[])).unwrap();
+        assert_eq!(value["scope_fault_code"], "UNKNOWN");
+        assert_eq!(value["physical_slots"][0]["fault_code"], "UNKNOWN");
+        assert_eq!(value["physical_slots"][0]["setup"]["deadline_observed"][0], "UNKNOWN");
+        assert!(!value.to_string().contains("PRIVATE"));
+    }
+    #[test]
+    fn offline_client_failure_receipt_keeps_absent_fault_and_setup_null() {
+        let mut report = diagnostic_report(None, None);
+        report.slots[0].setup_trace = None;
+        let value = serde_json::to_value(receipt(Some(Failure::Finality), &report, &[])).unwrap();
+        assert!(value.as_object().unwrap().contains_key("scope_fault_code"));
+        assert_eq!(value["scope_fault_code"], serde_json::Value::Null);
+        assert!(value["physical_slots"][0].as_object().unwrap().contains_key("fault_code"));
+        assert!(value["physical_slots"][0].as_object().unwrap().contains_key("setup"));
+        assert_eq!(value["physical_slots"][0]["setup"], serde_json::Value::Null);
+    }
+
 }
