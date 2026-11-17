@@ -809,6 +809,7 @@ fn permission_denied(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
 }
 fn policy_controls(scope: &mut Scope, root: PathBuf, entry: u64, end: u64) -> bool {
+    let end = end.min(scope.hard_end());
     let Ok(roots) = Roots::open(root) else {
         scope.begin_cancel(ProtocolError("DEV_CLIENT_POLICY_ROOT"), end);
         scope.finish();
