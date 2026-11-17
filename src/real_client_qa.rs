@@ -225,6 +225,38 @@ struct Roots {
     root: PathBuf,
     held: Vec<(PathBuf, File, u64, u64)>,
 }
+fn normalize_descriptors(mut fds: Vec<i32>) -> Result<Vec<i32>> {
+    if fds.len() >= 4096 || fds.iter().any(|fd| *fd < 0) {
+        return Err(Failure::Admission);
+    }
+    fds.sort_unstable();
+    if fds.windows(2).any(|pair| pair[0] == pair[1])
+        || [0, 1, 2].iter().any(|fd| !fds.contains(fd)) {
+        return Err(Failure::Admission);
+    }
+    fds.retain(|fd| *fd >= 3);
+    Ok(fds)
+}
+#[cfg(target_os = "macos")]
+fn inherited_descriptors() -> Result<Vec<i32>> {
+    // Only this process's numeric FD table, never other processes, descriptor
+    // paths or contents. A lowered soft rlimit cannot conceal inherited FDs.
+    let mut rows: Vec<libc::proc_fdinfo> = Vec::with_capacity(4096);
+    rows.resize_with(4096, || unsafe { std::mem::zeroed() });
+    let capacity = std::mem::size_of_val(rows.as_slice());
+    let count = unsafe { libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDLISTFDS, 0,
+        rows.as_mut_ptr().cast(), capacity as i32) };
+    if count <= 0 || count as usize >= capacity
+        || count as usize % std::mem::size_of::<libc::proc_fdinfo>() != 0 {
+        return Err(Failure::Admission);
+    }
+    rows.truncate(count as usize / std::mem::size_of::<libc::proc_fdinfo>());
+    normalize_descriptors(rows.into_iter().map(|row| row.proc_fd).collect())
+}
+#[cfg(not(target_os = "macos"))]
+fn inherited_descriptors() -> Result<Vec<i32>> {
+    Err(Failure::Admission)
+}
 impl Roots {
     fn open(root: PathBuf) -> Result<Self> {
         if root.parent() != Some(Path::new(ROOT_PARENT))
@@ -323,14 +355,7 @@ impl Roots {
         );
         let path = CString::new(pin.client.path()).map_err(|_| Failure::NativePin)?;
         let expected = pin.stamp;
-        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
-            return Err(Failure::Admission);
-        }
-        let limit = unsafe { limit.assume_init() }.rlim_cur;
-        if limit > 65_536 {
-            return Err(Failure::Admission);
-        }
+        let descriptors = inherited_descriptors()?;
         // These callbacks execute before the existing group join/mask restore.
         // Only async-signal-safe syscalls; do not close Rust's exec-error pipe.
         unsafe {
@@ -343,7 +368,10 @@ impl Roots {
                 if !stat_matches(&m, expected) {
                     return Err(io::Error::from_raw_os_error(libc::ESTALE));
                 }
-                for fd in 3..limit as i32 {
+                // Subsequent Scope/Command-owned pipes and sockets are created
+                // CLOEXEC. Mark the retained entry-thread snapshot as well;
+                // this includes inherited descriptors above a lowered rlimit.
+                for &fd in &descriptors {
                     let flags = libc::fcntl(fd, libc::F_GETFD);
                     if flags < 0 {
                         let error = io::Error::last_os_error();
@@ -750,6 +778,14 @@ pub fn run_offline() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn offline_client_descriptor_projection_covers_high_fds_and_rejects_ambiguous_tables() {
+        assert_eq!(normalize_descriptors(vec![2000, 0, 2, 1]).unwrap(), [2000]);
+        assert!(normalize_descriptors(vec![0, 1, 2, 4, 4]).is_err());
+        assert!(normalize_descriptors(vec![0, 1, 2, -1]).is_err());
+        assert!(normalize_descriptors(vec![1, 2, 4]).is_err());
+        assert!(normalize_descriptors(vec![0; 4096]).is_err());
+    }
     #[test]
     fn offline_client_offline_plan_has_only_four_fixed_non_model_operations() {
         assert_eq!(PLAN.len(), 4);
