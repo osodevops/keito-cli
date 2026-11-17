@@ -815,11 +815,17 @@ fn policy_controls(scope: &mut Scope, root: PathBuf, entry: u64, end: u64) -> bo
         scope.publish_terminal(false);
         return false;
     };
-    let canary = Path::new(ROOT_PARENT).join(format!("{}-denied-canary", roots.root.file_name().unwrap().to_string_lossy()));
+    let canary = Path::new(ROOT_PARENT).join(format!(
+        "{}-denied-canary",
+        roots.root.file_name().unwrap().to_string_lossy()
+    ));
     // The preparer must attest this new run-owned canary exists. Never read its
     // body, even on a policy failure; no original profile/service is probed.
     let file_denied = match File::open(canary) {
-        Ok(file) => { drop(file); false },
+        Ok(file) => {
+            drop(file);
+            false
+        }
         Err(error) => permission_denied(&error),
     };
     #[cfg(target_os = "macos")]
@@ -832,8 +838,10 @@ fn policy_controls(scope: &mut Scope, root: PathBuf, entry: u64, end: u64) -> bo
             // Own the returned socket before any fallible operation. UDP
             // connect does not send a datagram; there is no send/listen call.
             let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-            let denied = socket.connect((std::net::Ipv4Addr::LOCALHOST, 9))
-                .err().is_some_and(|error| permission_denied(&error));
+            let denied = socket
+                .connect((std::net::Ipv4Addr::LOCALHOST, 9))
+                .err()
+                .is_some_and(|error| permission_denied(&error));
             drop(socket);
             denied
         }
@@ -842,7 +850,9 @@ fn policy_controls(scope: &mut Scope, root: PathBuf, entry: u64, end: u64) -> bo
     let udp_denied = false;
     let within_end = monotonic_now().is_ok_and(|at| entry <= at && at < end);
     let operation_clean = file_denied && udp_denied && within_end && roots.check().is_ok();
-    if !operation_clean { scope.begin_cancel(ProtocolError("DEV_CLIENT_POLICY_DENIAL"), end); }
+    if !operation_clean {
+        scope.begin_cancel(ProtocolError("DEV_CLIENT_POLICY_DENIAL"), end);
+    }
     let report = scope.finish();
     let terminal = scope.publish_terminal(operation_clean && report.clean);
     let receipt = serde_json::json!({
@@ -855,7 +865,10 @@ fn policy_controls(scope: &mut Scope, root: PathBuf, entry: u64, end: u64) -> bo
         "effective_policy_for_actual_clients": "NOT_YET_QUALIFIED",
     });
     let saved = write_receipt(&roots.root, "POLICY-CONTROLS.json", &receipt).is_ok();
-    operation_clean && report.clean && terminal && saved
+    operation_clean
+        && report.clean
+        && terminal
+        && saved
         && monotonic_now().is_ok_and(|at| entry <= at && at < end)
 }
 
