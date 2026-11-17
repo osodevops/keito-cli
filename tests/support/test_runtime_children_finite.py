@@ -80,6 +80,42 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertEqual(len(self.a["stdout"]), 8)
         self.assertNotIn("PRIVATE", str(self.a.get("output_limit_first")))
 
+    def test_output_limit_exception_exposes_only_first_sanitized_observation(self):
+        import json
+        raw = json.dumps({"error": True, "code": 8,
+                          "message": "Configuration error: Repository command ownership unavailable; capture paused"}).encode()
+        blocks = [raw, b""]
+        with patch("os.read", side_effect=lambda fd, count: blocks.pop(0) if fd == 102 else b""):
+            self.manager._poll_slot(self.a, False)
+        first = self.manager.first_error
+        self.assertIn("stream=stderr", str(first))
+        self.assertIn("observed_bytes=" + str(len(raw)), str(first))
+        self.assertIn("allowed_bytes=0", str(first))
+        self.assertIn("category=REPOSITORY_OWNERSHIP", str(first))
+        self.assertNotIn("message", str(first))
+        blocks = [b"PRIVATE_LATER_CANARY", b""]
+        with patch("os.read", side_effect=lambda fd, count: blocks.pop(0) if fd == 101 else b""):
+            self.manager._poll_slot(self.b, False)
+        self.assertIs(self.manager.first_error, first)
+        self.assertNotIn("PRIVATE", str(first))
+        self.assertIn("stream=stderr", str(first))
+        self.assertEqual(self.owner.first_fault, "RUNTIME_OUTPUT_LIMIT")
+
+    def test_output_limit_exception_rejects_unselected_or_malformed_diagnostics(self):
+        from source_qa_children import RuntimeOutputLimit
+        valid = {"stream": "stdout", "observed_bytes": 9, "allowed_bytes": 8, "error_category": None}
+        error = RuntimeOutputLimit()
+        error.observation = valid
+        self.assertIn("category=UNKNOWN", str(error))
+        for key, value in [("stream", "PRIVATE_CANARY"), ("error_category", "PRIVATE_CANARY"),
+                           ("observed_bytes", True), ("observed_bytes", -1),
+                           ("observed_bytes", 2**64), ("allowed_bytes", "PRIVATE_CANARY"),
+                           ("extra", "PRIVATE_CANARY")]:
+            error.observation = {**valid, key: value}
+            self.assertEqual(str(error), "runtime output limit")
+        error.observation = None
+        self.assertEqual(str(error), "runtime output limit")
+
     def test_stderr_limit_stays_zero_and_retains_only_closed_error_category(self):
         import json
         raw = json.dumps({"error": True, "code": 8,

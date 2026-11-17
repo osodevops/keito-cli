@@ -66,6 +66,32 @@ class ChildFailure(RuntimeError):
     pass
 
 
+class RuntimeOutputLimit(ChildFailure):
+    """Expose bounded metadata in a traceback, never captured output content."""
+    def __init__(self):
+        super().__init__("runtime output limit")
+        self.observation = None
+
+    def __str__(self):
+        value = self.observation
+        categories = {"REPOSITORY_OWNERSHIP", "COMMAND_OWNERSHIP", "TERMINAL_SETTLEMENT",
+                      "PROFILE_QUALIFICATION", "VERSION_PROBE_ADMISSION", "VERSION_PROBE_DEADLINE",
+                      "VERSION_PROBE_CLOCK", "VERSION_PROBE_OWNERSHIP", "VERSION_PROBE_UNAVAILABLE"}
+        categories.update("APP_ERROR_" + str(code) for code in range(1, 9))
+        if (type(value) is not dict
+                or set(value) != {"stream", "observed_bytes", "allowed_bytes", "error_category"}
+                or type(value["stream"]) is not str or value["stream"] not in ("stdout", "stderr")
+                or any(type(value[key]) is not int or not 0 <= value[key] <= 2**64 - 1
+                       for key in ("observed_bytes", "allowed_bytes"))
+                or (value["error_category"] is not None
+                    and (type(value["error_category"]) is not str or value["error_category"] not in categories))):
+            return super().__str__()
+        return ("runtime output limit: stream=" + value["stream"]
+                + " observed_bytes=" + str(value["observed_bytes"])
+                + " allowed_bytes=" + str(value["allowed_bytes"])
+                + " category=" + (value["error_category"] or "UNKNOWN"))
+
+
 class LegacyDirectChildren:
     """Historical direct/group tests only; never the actual capture runner.
 
@@ -537,7 +563,8 @@ class OwnedChildren:
                     slot["stdout"].extend(block[:remaining])
                 if slot[name + "_count"] > (slot["capture_limit"] if name == "stdout" else 0):
                     slot["first_fault"] = slot["first_fault"] or "RUNTIME_OUTPUT_LIMIT"
-                    self._fail(ChildFailure("runtime output limit"), "RUNTIME_OUTPUT_LIMIT")
+                    error = RuntimeOutputLimit()
+                    self._fail(error, "RUNTIME_OUTPUT_LIMIT")
                     if slot.get("output_limit_first") is None:
                         observation = {"stream": name, "observed_bytes": slot[name + "_count"],
                                        "allowed_bytes": slot["capture_limit"] if name == "stdout" else 0,
@@ -548,6 +575,9 @@ class OwnedChildren:
                         if name == "stderr":
                             try: observation["error_category"] = _stderr_category(block)
                             except BaseException: pass
+                            else: error.observation = observation.copy()
+                        else:
+                            error.observation = observation.copy()
         try:
             status = child.poll()
         except OSError as error:
