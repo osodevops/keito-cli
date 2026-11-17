@@ -529,12 +529,28 @@ impl<E: Edge> Core<E> {
         &mut self,
         at: u64,
         capacity: usize,
-        _selected_end: u64,
+        selected_end: u64,
         create: impl FnOnce(SharedOwner, u64) -> io::Result<E>,
     ) -> io::Result<SlotId> {
-        // Baseline route retained for the new clipped-admission regression.
-        let end = self.hard_end;
-        self.admit(at, capacity, |owner| create(owner, end))
+        if self.installer.is_some() || self.slots.len() >= 4
+            || self.slots.iter().any(|slot| slot.accepted_at.is_none())
+        {
+            self.poison("DEV_CLIENT_ADMISSION");
+            return Err(error("DEV_CLIENT_ADMISSION"));
+        }
+        let local = match at.checked_add(1_000_000_000) {
+            Some(end) => end,
+            None => {
+                self.cancel(Some("SCOPE_CLOCK"), 0, 0);
+                return Err(error("SCOPE_CLOCK"));
+            }
+        };
+        self.admit_before(at, capacity, selected_end.min(local), create)
+    }
+    #[cfg(feature = "dev-tools")]
+    fn release_dev_completed(&mut self, _ledgers_complete: bool) -> io::Result<()> {
+        // Baseline: the existing cache still includes completed leaf ends.
+        Ok(())
     }
     fn begin_installer(&mut self, at: u64, expected: usize) -> io::Result<()> {
         if self.installer.is_some()
@@ -1388,6 +1404,16 @@ impl Scope {
         }
         result
     }
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn take_dev_client_result(&mut self, id: &SlotId) -> io::Result<CommandResult> {
+        let result = self.take_result(id)?;
+        let complete = self.ledgers_complete();
+        if self.core.release_dev_completed(complete).is_err() {
+            self.begin_cancel(ProtocolError("DEV_CLIENT_COLLECTION"), self.core.hard_end);
+            return Err(error("DEV_CLIENT_COLLECTION"));
+        }
+        Ok(result)
+    }
     fn start_with_lease(
         &mut self,
         mut command: Command,
@@ -1717,6 +1743,28 @@ impl Drop for Scope {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn offline_client_completed_leaf_cache_releases_only_after_proven_collection() {
+        let mut core = Core::new(std::rc::Rc::default(), 4_000_000_000);
+        let slot = core.admit_dev_client(100, 0, 1_000_000_100, |_, _| Ok(fake("collected", std::rc::Rc::default()))).unwrap();
+        core.request_complete(&slot, 200).unwrap();
+        core.poll(&mut || Ok(201));
+        core.take_result(&slot).unwrap();
+        core.release_dev_completed(true).unwrap();
+        assert_eq!(core.hard_end, 4_000_000_000);
+        assert_eq!(core.slots[0].hard_end, 1_000_000_100);
+        assert_eq!(core.active_end(), 4_000_000_000);
+        assert!(core.admit_dev_client(1_500_000_000, 0, 2_500_000_000, |_, _| Ok(fake("next", std::rc::Rc::default()))).is_ok());
+    }
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn offline_client_incomplete_or_unforwarded_collection_cannot_release_cache() {
+        let mut core = Core::new(std::rc::Rc::default(), 4_000_000_000);
+        core.admit_dev_client(100, 0, 1_000_000_100, |_, _| Ok(fake("unproved", std::rc::Rc::default()))).unwrap();
+        assert!(core.release_dev_completed(false).is_err());
+        assert_eq!(core.active_end(), 1_000_000_100);
+    }
     #[cfg(feature = "dev-tools")]
     #[test]
     fn offline_client_slot_and_keeper_share_the_earlier_leaf_end() {

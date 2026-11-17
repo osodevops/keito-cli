@@ -15,7 +15,6 @@ use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{self, Write},
     os::{
-        fd::AsRawFd,
         unix::{fs::{MetadataExt, OpenOptionsExt}, process::{CommandExt, ExitStatusExt}},
     },
     path::{Path, PathBuf},
@@ -252,7 +251,7 @@ fn exercise(scope: &mut Scope, roots: &Roots, entry: u64, observations: &mut Vec
             if scope.failed() { return Err(Failure::Operation); }
             std::thread::yield_now();
         }
-        let result = scope.take_result(&slot).map_err(|_| Failure::Finality)?;
+        let result = scope.take_dev_client_result(&slot).map_err(|_| Failure::Finality)?;
         native.check()?; roots.check()?;
         let report = scope.report();
         let facts = report.slots.last().ok_or(Failure::Finality)?;
