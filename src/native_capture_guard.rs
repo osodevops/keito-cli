@@ -468,6 +468,9 @@ mod unix {
         let hard_end = leaf_start.ok_or(())?.saturating_add(600_000_000);
         // Parent validation/clock refusal and all executable preparation occur
         // AFTER the durable pending marker. No failed entry loses the boundary.
+        // Declare the permit first: unwinding drops Scope (including fallback
+        // cleanup/terminal publication) before releasing scheduling ownership.
+        let mut core_admission = None;
         let mut scope =
             match crate::process_ownership::scope::Scope::entry_from_environment(600_000_000)
                 .map_err(|_| ())?
@@ -481,6 +484,14 @@ mod unix {
                 }
             };
         let result = (|| {
+            // Queue before image hashing/descriptor preparation and before any
+            // core exists. The separate four-leaf pool remains unchanged, so
+            // cores never wait for leaf permits they themselves hold here.
+            core_admission = Some(
+                scope
+                    .await_hook_core_admission(&state, leaf_end)
+                    .map_err(|_| ())?,
+            );
             // This digest comes from the fixed managed registration, never stdin.
             // Linux executes the descriptor. Darwin checks its managed pathname
             // immediately before exec and carries this verified imageFD for a
@@ -678,6 +689,9 @@ mod unix {
         })();
         let clean = scope.finish().clean && result.is_ok();
         scope.publish_terminal(clean);
+        // Even a failed core keeps its scheduling permit through the final
+        // cleanup attempt. Process exit/unproved cleanup grants no global bound.
+        drop(core_admission);
         result
     }
     #[cfg(test)]

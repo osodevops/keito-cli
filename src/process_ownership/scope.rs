@@ -147,12 +147,21 @@ impl Stage {
 // absolute process bound after owner death or unproved cleanup.
 // Each admission opens an independent description; never duplicate the lock FD.
 const HOOK_SETUP_SLOTS: usize = 4;
+#[derive(Clone, Copy)]
+enum HookCapacityKind {
+    Leaf,
+    Core,
+}
 struct HookSetupAdmission {
     file: File,
     name: &'static [u8],
 }
 impl HookSetupAdmission {
+    #[cfg(test)]
     fn open(directory: &File, slot: usize) -> io::Result<Self> {
+        Self::open_kind(directory, slot, HookCapacityKind::Leaf)
+    }
+    fn open_kind(directory: &File, slot: usize, kind: HookCapacityKind) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let parent = directory
             .metadata()
@@ -163,11 +172,15 @@ impl HookSetupAdmission {
         {
             return Err(error("SCOPE_SETUP_GATE"));
         }
-        let name: &'static [u8] = match slot {
-            0 => b"capture-hook-setup-0.lock\0",
-            1 => b"capture-hook-setup-1.lock\0",
-            2 => b"capture-hook-setup-2.lock\0",
-            3 => b"capture-hook-setup-3.lock\0",
+        let name: &'static [u8] = match (kind, slot) {
+            (HookCapacityKind::Leaf, 0) => b"capture-hook-setup-0.lock\0",
+            (HookCapacityKind::Leaf, 1) => b"capture-hook-setup-1.lock\0",
+            (HookCapacityKind::Leaf, 2) => b"capture-hook-setup-2.lock\0",
+            (HookCapacityKind::Leaf, 3) => b"capture-hook-setup-3.lock\0",
+            (HookCapacityKind::Core, 0) => b"capture-hook-core-0.lock\0",
+            (HookCapacityKind::Core, 1) => b"capture-hook-core-1.lock\0",
+            (HookCapacityKind::Core, 2) => b"capture-hook-core-2.lock\0",
+            (HookCapacityKind::Core, 3) => b"capture-hook-core-3.lock\0",
             _ => return Err(error("SCOPE_SETUP_GATE")),
         };
         let fd = unsafe {
@@ -237,6 +250,15 @@ impl HookSetupAdmission {
             Err(error("SCOPE_SETUP_GATE"))
         }
     }
+}
+
+// Guard-only scheduling ownership. It grants no capture authority. CLOEXEC and
+// the guard's child descriptor inventory keep the lock in the owning guard.
+// A guard retains it through its final Scope::finish and terminal publication;
+// as with leaf permits, this is not an after-crash/unproved-cleanup bound.
+#[allow(dead_code)] // Also compiled into the standalone guard from shared source.
+pub(crate) struct HookCoreAdmission {
+    _permit: HookSetupAdmission,
 }
 
 struct GroupEdge {
@@ -1240,6 +1262,7 @@ fn await_repository_admission<E: Edge>(
 
 // Queue only inside the original containing end. Actual keeper preparation
 // still begins at GroupLease::spawn's unchanged timestamp and setup policy.
+#[cfg(test)]
 fn await_hook_setup_capacity<E: Edge>(
     core: &mut Core<E>,
     progress: &mut impl FnMut(&mut Core<E>),
@@ -1247,11 +1270,23 @@ fn await_hook_setup_capacity<E: Edge>(
     attempt: &mut impl FnMut() -> io::Result<bool>,
     pause: &mut impl FnMut(),
 ) -> io::Result<()> {
+    await_hook_setup_capacity_until(core, progress, clock, attempt, pause, None)
+}
+
+fn await_hook_setup_capacity_until<E: Edge>(
+    core: &mut Core<E>,
+    progress: &mut impl FnMut(&mut Core<E>),
+    clock: &mut impl FnMut() -> io::Result<u64>,
+    attempt: &mut impl FnMut() -> io::Result<bool>,
+    pause: &mut impl FnMut(),
+    admission_ceiling: Option<u64>,
+) -> io::Result<()> {
     loop {
         progress(core);
         let at = core.admission_clock(clock)?;
         let ready = core.repository_admission_ready()?;
-        if at >= core.active_end().saturating_sub(RESERVE_NS) {
+        let admission_end = core.active_end().min(admission_ceiling.unwrap_or(u64::MAX));
+        if at >= admission_end.saturating_sub(RESERVE_NS) {
             core.cancel(Some("SCOPE_SETUP_DEADLINE"), at, core.active_end());
             return Err(error("SCOPE_SETUP_DEADLINE"));
         }
@@ -1266,7 +1301,8 @@ fn await_hook_setup_capacity<E: Edge>(
             progress(core);
             let fresh = core.admission_clock(clock)?;
             let ready = core.repository_admission_ready()?;
-            if !ready || fresh >= core.active_end().saturating_sub(RESERVE_NS) {
+            let admission_end = core.active_end().min(admission_ceiling.unwrap_or(u64::MAX));
+            if !ready || fresh >= admission_end.saturating_sub(RESERVE_NS) {
                 core.cancel(Some("SCOPE_SETUP_DEADLINE"), fresh, core.active_end());
                 return Err(error("SCOPE_SETUP_DEADLINE"));
             }
@@ -1417,13 +1453,38 @@ impl Scope {
         let directory = directory
             .try_clone()
             .map_err(|_| error("SCOPE_SETUP_GATE"))?;
+        self.await_hook_capacity(directory, HookCapacityKind::Leaf, None)
+            .map(Some)
+    }
+    #[allow(dead_code)] // Called by the standalone guard, not ordinary product scopes.
+    pub(crate) fn await_hook_core_admission(
+        &mut self,
+        directory: &File,
+        leaf_end: u64,
+    ) -> io::Result<HookCoreAdmission> {
+        if !self.core.slots.is_empty() || self.core.finished || self.hook_setup_directory.is_some()
+        {
+            return Err(error("SCOPE_SETUP_GATE"));
+        }
+        let directory = directory
+            .try_clone()
+            .map_err(|_| error("SCOPE_SETUP_GATE"))?;
+        self.await_hook_capacity(directory, HookCapacityKind::Core, Some(leaf_end))
+            .map(|permit| HookCoreAdmission { _permit: permit })
+    }
+    fn await_hook_capacity(
+        &mut self,
+        directory: File,
+        kind: HookCapacityKind,
+        admission_ceiling: Option<u64>,
+    ) -> io::Result<HookSetupAdmission> {
         let mut candidates = (0..HOOK_SETUP_SLOTS)
-            .map(|slot| HookSetupAdmission::open(&directory, slot).map(Some))
+            .map(|slot| HookSetupAdmission::open_kind(&directory, slot, kind).map(Some))
             .collect::<io::Result<Vec<_>>>()?;
         let mut selected = None;
         let upstream = &mut self.upstream;
         let ledger = &mut self.ledger;
-        await_hook_setup_capacity(
+        await_hook_setup_capacity_until(
             &mut self.core,
             &mut |core| Self::poll_turn(core, upstream, ledger),
             &mut now,
@@ -1437,8 +1498,9 @@ impl Scope {
                 Ok(false)
             },
             &mut || std::thread::sleep(std::time::Duration::from_millis(1)),
+            admission_ceiling,
         )?;
-        Ok(selected)
+        selected.ok_or_else(|| error("SCOPE_SETUP_GATE"))
     }
     pub(crate) fn first_fault(&self) -> Option<ProtocolError> {
         self.core.owner.borrow().first_fault
@@ -2515,6 +2577,90 @@ mod tests {
         assert!(!still_held.try_lock(&directory).unwrap());
     }
 
+    #[test]
+    fn guard_core_pool_is_four_independent_cloexec_locks_without_consuming_leaf_capacity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = File::open(temp.path()).unwrap();
+        let mut held = Vec::new();
+        for slot in 0..HOOK_SETUP_SLOTS {
+            let mut permit =
+                HookSetupAdmission::open_kind(&directory, slot, HookCapacityKind::Core).unwrap();
+            assert!(permit.try_lock(&directory).unwrap());
+            assert_ne!(
+                unsafe { libc::fcntl(permit.file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let mut leaf = HookSetupAdmission::open(&directory, slot).unwrap();
+            assert_ne!(
+                permit.file.metadata().unwrap().ino(),
+                leaf.file.metadata().unwrap().ino()
+            );
+            assert!(
+                leaf.try_lock(&directory).unwrap(),
+                "core holder consumed a leaf permit"
+            );
+            held.push(permit);
+        }
+        assert!(HookSetupAdmission::open_kind(
+            &directory,
+            HOOK_SETUP_SLOTS,
+            HookCapacityKind::Core
+        )
+        .is_err());
+        for attempt in 0..20 {
+            let mut waiter = HookSetupAdmission::open_kind(
+                &directory,
+                attempt % HOOK_SETUP_SLOTS,
+                HookCapacityKind::Core,
+            )
+            .unwrap();
+            assert!(
+                !waiter.try_lock(&directory).unwrap(),
+                "fifth core admitted into a full pool"
+            );
+        }
+        drop(held.remove(2));
+        let mut next =
+            HookSetupAdmission::open_kind(&directory, 2, HookCapacityKind::Core).unwrap();
+        assert!(next.try_lock(&directory).unwrap());
+        let mut blocked =
+            HookSetupAdmission::open_kind(&directory, 0, HookCapacityKind::Core).unwrap();
+        assert!(!blocked.try_lock(&directory).unwrap());
+    }
+
+    #[test]
+    fn guard_core_capacity_ceiling_preserves_earlier_parent_and_clock_failure() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 100_000_000);
+        assert!(await_hook_setup_capacity_until(
+            &mut core,
+            &mut |_| {},
+            &mut || Ok(50_000_000),
+            &mut || panic!("earlier parent ignored"),
+            &mut || panic!("expired parent wait"),
+            Some(500_000_000)
+        )
+        .is_err());
+        assert_eq!(core.hard_end, 100_000_000);
+        let mut core: Core<Fake> = Core::new(Rc::default(), 600_000_000);
+        assert!(await_hook_setup_capacity_until(
+            &mut core,
+            &mut |_| {},
+            &mut || Err(error("SCOPE_CLOCK")),
+            &mut || panic!("clock failure admitted"),
+            &mut || panic!("failed clock wait"),
+            Some(500_000_000)
+        )
+        .is_err());
+        assert_eq!(
+            core.owner.borrow().first_fault,
+            Some(ProtocolError("SCOPE_CLOCK"))
+        );
+        assert_eq!(core.cancel_end, Some(0));
+        assert!(core.owner.borrow().admission_closed);
+    }
+
     fn completed_hook_facts() -> EdgeFacts {
         EdgeFacts {
             waits_known: true,
@@ -2633,6 +2779,52 @@ mod tests {
         )
         .unwrap_err();
         assert!(core.owner.borrow().first_fault.is_some());
+    }
+
+    #[test]
+    fn guard_core_capacity_refuses_at_the_original_leaf_ceiling_before_lock() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 600_000_000);
+        let attempts = std::cell::Cell::new(0);
+        let result = await_hook_setup_capacity_until(
+            &mut core,
+            &mut |_| {},
+            &mut || Ok(450_000_000),
+            &mut || {
+                attempts.set(attempts.get() + 1);
+                Ok(true)
+            },
+            &mut || panic!("expired core capacity wait"),
+            Some(500_000_000),
+        );
+        assert!(
+            result.is_err(),
+            "guard's longer end admitted an expired leaf"
+        );
+        assert_eq!(attempts.get(), 0);
+        assert_eq!(core.hard_end, 600_000_000);
+    }
+
+    #[test]
+    fn guard_core_capacity_rechecks_leaf_ceiling_after_lock() {
+        let mut core: Core<Fake> = Core::new(Rc::default(), 600_000_000);
+        let reads = std::cell::Cell::new(0);
+        let result = await_hook_setup_capacity_until(
+            &mut core,
+            &mut |_| {},
+            &mut || {
+                reads.set(reads.get() + 1);
+                Ok(if reads.get() == 1 { 1 } else { 450_000_000 })
+            },
+            &mut || Ok(true),
+            &mut || panic!("late acquired core permit"),
+            Some(500_000_000),
+        );
+        assert!(
+            result.is_err(),
+            "lock wait renewed the original leaf ceiling"
+        );
+        assert_eq!(reads.get(), 2);
+        assert_eq!(core.hard_end, 600_000_000);
     }
 
     #[test]
