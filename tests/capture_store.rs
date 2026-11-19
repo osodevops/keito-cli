@@ -57,20 +57,27 @@ fn event(
     event: keito_cli::cli::capture::CaptureEvent,
     s: i64,
 ) {
-    store
-        .event(
-            &repo(),
-            capture::Signal {
-                source: "codex",
-                resumed: false,
-                source_id: session,
-                turn_id: turn,
-                version: "fixture-v1",
-                event,
-                clock: &clock(s),
-            },
-        )
-        .unwrap()
+    let result = store.event(
+        &repo(),
+        capture::Signal {
+            source: "codex",
+            resumed: false,
+            source_id: session,
+            turn_id: turn,
+            version: "fixture-v1",
+            event,
+            clock: &clock(s),
+        },
+    );
+    if let Err(error) = result {
+        #[cfg(feature = "dev-tools")]
+        panic!(
+            "capture fixture event failed: {error:?}; admission={:?}",
+            store.last_admission_timing()
+        );
+        #[cfg(not(feature = "dev-tools"))]
+        panic!("capture fixture event failed: {error:?}");
+    }
 }
 #[cfg(unix)]
 fn body(store: &mut Store, b: &Binding, s: i64) -> (capture::Queued, serde_json::Value) {
@@ -299,6 +306,26 @@ fn next_revision_is_not_claimed_until_previous_acknowledgement() {
 }
 
 #[cfg(unix)]
+fn join_all_before_asserting<T: Send + 'static>(
+    handles: Vec<std::thread::JoinHandle<T>>,
+) -> Vec<std::thread::Result<T>> {
+    handles.into_iter().map(|handle| handle.join()).collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_join_collection_retains_later_outcomes_after_a_failure() {
+    let handles = vec![
+        std::thread::spawn(|| -> u8 { panic!("controlled join failure") }),
+        std::thread::spawn(|| 17_u8),
+    ];
+    let outcomes = join_all_before_asserting(handles);
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes[0].is_err());
+    assert_eq!(outcomes[1].as_ref().unwrap(), &17_u8);
+}
+
+#[cfg(unix)]
 #[test]
 fn sqlite_connections_serialize_duplicate_hooks_into_one_revision() {
     let (dir, mut store, b) = setup();
@@ -313,8 +340,10 @@ fn sqlite_connections_serialize_duplicate_hooks_into_one_revision() {
             })
         })
         .collect();
-    for h in handles {
-        h.join().unwrap();
+    // Retain the TempDir until every original worker has settled, even if
+    // an earlier worker panicked. Keep the original all-success assertion.
+    for outcome in join_all_before_asserting(handles) {
+        outcome.unwrap();
     }
     let s = &store.preview("session").unwrap()[0];
     assert_eq!(s.segments.len(), 1);
