@@ -15,14 +15,29 @@ struct Operation {
     started: Duration,
     last_observed: Duration,
     next_count: i32,
+    hints_allowed: bool,
+    hinted_attempt_pending: bool,
+    unelapsed_backoff: Duration,
 }
 
 impl BusyBudget {
+    #[cfg(test)]
     pub(crate) fn retry(
         &mut self,
         count: i32,
         mut now: impl FnMut() -> Option<Duration>,
         mut sleep: impl FnMut(Duration),
+    ) -> bool {
+        self.retry_hinted(count, &mut now, |delay, _| {
+            sleep(delay);
+            false
+        })
+    }
+    pub(crate) fn retry_hinted(
+        &mut self,
+        count: i32,
+        mut now: impl FnMut() -> Option<Duration>,
+        mut sleep: impl FnMut(Duration, bool) -> bool,
     ) -> bool {
         let Some(delay) = usize::try_from(count)
             .ok()
@@ -42,6 +57,9 @@ impl BusyBudget {
                 started: before,
                 last_observed: before,
                 next_count: 0,
+                hints_allowed: true,
+                hinted_attempt_pending: false,
+                unelapsed_backoff: Duration::ZERO,
             });
         }
         let Some(operation) = &mut self.operation else {
@@ -59,7 +77,20 @@ impl BusyBudget {
             self.operation = None;
             return false;
         };
-        sleep(Duration::from_millis(*delay).min(remaining));
+        // Another callback means the preceding hinted SQL attempt FAILED.
+        // Disable later hints and restore that delay's unelapsed portion so
+        // repeated commit/reacquire races cannot spend all attempts early.
+        if operation.hinted_attempt_pending {
+            operation.hints_allowed = false;
+            operation.hinted_attempt_pending = false;
+        }
+        let restored = std::mem::take(&mut operation.unelapsed_backoff);
+        let requested = Duration::from_millis(*delay)
+            .saturating_add(restored)
+            .min(remaining);
+        // The final timer-only callback cannot manufacture an extra retry.
+        let allow_hint = operation.hints_allowed && (count as usize) + 1 < DELAYS_MS.len();
+        let hinted = sleep(requested, allow_hint);
         let Some(after) = now() else {
             self.operation = None;
             return false;
@@ -71,6 +102,10 @@ impl BusyBudget {
         {
             self.operation = None;
             return false;
+        }
+        if allow_hint && hinted {
+            operation.hinted_attempt_pending = true;
+            operation.unelapsed_backoff = requested.saturating_sub(after - before);
         }
         operation.last_observed = after;
         operation.next_count += 1;
@@ -166,30 +201,33 @@ impl ReleaseNotifier {
         queue.push_back(std::sync::Arc::downgrade(&waiter));
         Some(waiter)
     }
-    pub(crate) fn wait(&self, requested: Duration) {
+    pub(crate) fn wait(&self, requested: Duration) -> bool {
         let Some(until) = std::time::Instant::now().checked_add(requested) else {
             std::thread::sleep(requested);
-            return;
+            return false;
         };
         let fallback =
             || std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
         let Some(waiter) = self.register(until) else {
             fallback();
-            return;
+            return false;
         };
         let Ok(mut state) = waiter.state.try_lock() else {
             fallback();
-            return;
+            return false;
         };
         loop {
-            if *state == WaitState::Selected || *state == WaitState::Retired {
+            if *state == WaitState::Selected {
                 *state = WaitState::Retired;
-                return;
+                return true;
+            }
+            if *state == WaitState::Retired {
+                return false;
             }
             let remaining = until.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 *state = WaitState::Retired;
-                return;
+                return false;
             }
             match waiter.ready.wait_timeout(state, remaining) {
                 Ok((next, _)) => state = next,
@@ -198,7 +236,7 @@ impl ReleaseNotifier {
                     *next = WaitState::Retired;
                     drop(next);
                     fallback();
-                    return;
+                    return false;
                 }
             }
             // Spurious/cross-queue wakes cannot return this callback early:
@@ -276,6 +314,128 @@ mod tests {
         assert!(!tick(&mut policy, 14, &clock));
     }
 
+    #[test]
+    fn failed_release_hint_cannot_compress_all_attempts_before_contention_ends() {
+        let mut policy = BusyBudget::default();
+        let clock = Cell::new(Duration::ZERO);
+        let mut hints = 0;
+        let mut admitted = false;
+        for count in 0..=14 {
+            let retry = policy.retry_hinted(
+                count,
+                || Some(clock.get()),
+                |delay, allowed| {
+                    if allowed {
+                        hints += 1;
+                        clock.set(clock.get() + Duration::from_micros(100));
+                        true
+                    } else {
+                        clock.set(clock.get() + delay);
+                        false
+                    }
+                },
+            );
+            if !retry {
+                break;
+            }
+            // A committing writer immediately reacquires; hinted attempts fail
+            // until contention genuinely ends at400ms. No SQL retry is added.
+            if clock.get() >= Duration::from_millis(400) {
+                admitted = true;
+                break;
+            }
+        }
+        assert!(
+            admitted,
+            "early notices exhausted attempts before the writer released"
+        );
+        assert_eq!(
+            hints, 1,
+            "an unsuccessful hinted attempt must disable later hints"
+        );
+        assert_eq!(clock.get(), Duration::from_millis(428));
+    }
+    #[test]
+    fn restored_hint_backoff_is_capped_by_the_original_elapsed_deadline() {
+        let mut policy = BusyBudget::default();
+        let clock = Cell::new(Duration::ZERO);
+        assert!(policy.retry_hinted(
+            0,
+            || Some(clock.get()),
+            |_, allowed| {
+                assert!(allowed);
+                clock.set(Duration::from_micros(100));
+                true
+            }
+        ));
+        clock.set(Duration::from_micros(499_500));
+        let mut requested = Duration::ZERO;
+        assert!(!policy.retry_hinted(
+            1,
+            || Some(clock.get()),
+            |delay, allowed| {
+                assert!(!allowed);
+                requested = delay;
+                clock.set(clock.get() + delay);
+                false
+            }
+        ));
+        assert_eq!(requested, Duration::from_micros(500));
+        assert_eq!(clock.get(), BUDGET);
+    }
+    #[test]
+    fn a_distinct_count_zero_clears_failed_hint_state_without_carrying_delay() {
+        let mut policy = BusyBudget::default();
+        let clock = Cell::new(Duration::ZERO);
+        assert!(policy.retry_hinted(
+            0,
+            || Some(clock.get()),
+            |_, allowed| {
+                assert!(allowed);
+                clock.set(Duration::from_micros(100));
+                true
+            }
+        ));
+        assert!(policy.retry_hinted(
+            1,
+            || Some(clock.get()),
+            |delay, allowed| {
+                assert!(!allowed);
+                assert_eq!(delay, Duration::from_micros(2900));
+                clock.set(clock.get() + delay);
+                false
+            }
+        ));
+        assert!(policy.retry_hinted(
+            0,
+            || Some(clock.get()),
+            |delay, allowed| {
+                assert!(allowed);
+                assert_eq!(delay, Duration::from_millis(1));
+                clock.set(clock.get() + delay);
+                false
+            }
+        ));
+    }
+    #[test]
+    fn final_callback_remains_timer_only_and_never_resets_the_attempt_ceiling() {
+        let mut policy = BusyBudget::default();
+        let clock = Cell::new(Duration::ZERO);
+        for count in 0..14 {
+            let retry = policy.retry_hinted(
+                count,
+                || Some(clock.get()),
+                |delay, allowed| {
+                    assert_eq!(allowed, count < 13);
+                    clock.set(clock.get() + delay);
+                    false
+                },
+            );
+            assert_eq!(retry, count < 13);
+        }
+        assert_eq!(clock.get(), BUDGET);
+        assert!(!policy.retry_hinted(14, || Some(clock.get()), |_, _| panic!("extra sleep")));
+    }
     #[test]
     fn one_oversleep_stops_without_an_additional_lock_retry() {
         let mut policy = BusyBudget::default();

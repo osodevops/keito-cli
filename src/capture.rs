@@ -1096,12 +1096,15 @@ impl Store {
         let mut admission_budget = crate::capture_busy::BusyBudget::default();
         connection
             .busy_handler(Some(move |count| {
-                admission_budget.retry(
+                admission_budget.retry_hinted(
                     count,
                     || std::time::Instant::now().checked_duration_since(origin),
-                    |delay| match &busy_notification {
-                        Some(notification) => notification.wait(delay),
-                        None => std::thread::sleep(delay),
+                    |delay, hints_allowed| match &busy_notification {
+                        Some(notification) if hints_allowed => notification.wait(delay),
+                        _ => {
+                            std::thread::sleep(delay);
+                            false
+                        }
                     },
                 )
             }))
