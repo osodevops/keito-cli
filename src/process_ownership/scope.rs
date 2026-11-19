@@ -1179,6 +1179,21 @@ impl<E: Edge> Core<E> {
         // Readiness/timeout/HUP/EINTR never advance a protocol state. The next
         // original progress turn parses frames and checks deadlines/signals.
     }
+    fn wait_command_progress(
+        &mut self,
+        clock: &mut impl FnMut() -> io::Result<u64>,
+        poll: &mut impl FnMut(&mut [libc::pollfd], i32) -> io::Result<i32>,
+        pause: &mut impl FnMut(),
+    ) -> io::Result<()> {
+        // The final admitted edge still owns its original short READY/PARK
+        // window. Do not return to a blind timer while its socket can wake us.
+        if self.repository_admission_ready()? {
+            pause();
+            Ok(())
+        } else {
+            self.wait_repository_setup(clock, poll)
+        }
+    }
     // Validate the entire fixed cohort BEFORE consuming any result. An earlier
     // accepted sibling cannot leak output while another is pending or invalid.
     fn take_repository_results(
@@ -1987,7 +2002,7 @@ impl Scope {
                 if let Some(results) = self.core.take_repository_results(&slots)? {
                     return Ok(results);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                self.wait_command_progress()?;
             }
         })();
         if result.is_err() {
@@ -2015,8 +2030,26 @@ impl Scope {
             if self.core.slots[slot.index].accepted_at.is_some() {
                 return self.take_result(&slot);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if let Err(error) = self.wait_command_progress() {
+                self.finish();
+                return Err(error);
+            }
         }
+    }
+    fn wait_command_progress(&mut self) -> io::Result<()> {
+        self.core.wait_command_progress(
+            &mut now,
+            &mut |fds, timeout| {
+                let result =
+                    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+                if result < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(result)
+                }
+            },
+            &mut || std::thread::sleep(std::time::Duration::from_millis(1)),
+        )
     }
     /// A bounded hot-path turn. Full retained reports are explicit snapshots,
     /// never an allocation/whole-registry scan on every command I/O poll.
@@ -3099,6 +3132,143 @@ mod tests {
             core.owner.borrow().first_fault,
             Some(ProtocolError("SCOPE_CLOCK"))
         );
+    }
+    #[test]
+    fn scope_wait_final_pending_setup_uses_readiness_in_the_original_last_fraction() {
+        let mut core = Core::new(Rc::default(), 500_000_000);
+        let id = core
+            .admit(0, 0, |_| Ok(fake("last", Rc::default())))
+            .unwrap();
+        core.slots[id.index].edge.setup_pending = true;
+        core.slots[id.index].edge.setup_wait_source = Some((7, 20_000_000));
+        let mut polls = 0;
+        let mut pauses = 0;
+        core.wait_command_progress(
+            &mut || Ok(19_950_000),
+            &mut |fds, timeout| {
+                polls += 1;
+                assert_eq!(timeout, 0);
+                assert_eq!((fds.len(), fds[0].fd, fds[0].events), (1, 7, libc::POLLIN));
+                fds[0].revents = libc::POLLIN;
+                Ok(1)
+            },
+            &mut || pauses += 1,
+        )
+        .unwrap();
+        assert_eq!((polls, pauses), (1, 0));
+        assert_eq!(core.hard_end, 500_000_000);
+        assert_eq!(
+            core.slots[id.index].edge.setup_wait_source,
+            Some((7, 20_000_000))
+        );
+        assert!(core.slots[id.index].edge.setup_pending);
+        assert!(core.slots[id.index].accepted_at.is_none());
+    }
+    #[test]
+    fn scope_wait_repository_final_sibling_keeps_its_own_pending_socket() {
+        let mut core = Core::new(Rc::default(), 500_000_000);
+        let a = core
+            .admit(0, 0, |_| Ok(fake("running", Rc::default())))
+            .unwrap();
+        let b = core
+            .admit(0, 0, |_| Ok(fake("pending", Rc::default())))
+            .unwrap();
+        core.slots[b.index].edge.setup_pending = true;
+        core.slots[b.index].edge.setup_wait_source = Some((9, 20_000_000));
+        assert!(core.take_repository_results(&[a, b]).unwrap().is_none());
+        let mut polls = 0;
+        let mut pauses = 0;
+        core.wait_command_progress(
+            &mut || Ok(10_000_000),
+            &mut |fds, timeout| {
+                polls += 1;
+                assert_eq!((fds.len(), fds[0].fd, timeout), (1, 9, 1));
+                Ok(0)
+            },
+            &mut || pauses += 1,
+        )
+        .unwrap();
+        assert_eq!((polls, pauses), (1, 0));
+        assert!(core
+            .slots
+            .iter()
+            .all(|slot| slot.accepted_at.is_none() && !slot.output_taken));
+    }
+    #[test]
+    fn scope_wait_running_edges_keep_the_existing_ordinary_pause() {
+        let mut core = Core::new(Rc::default(), 500_000_000);
+        core.admit(0, 0, |_| Ok(fake("running", Rc::default())))
+            .unwrap();
+        let mut polls = 0;
+        let mut pauses = 0;
+        core.wait_command_progress(
+            &mut || Ok(10_000_000),
+            &mut |_, _| {
+                polls += 1;
+                Ok(0)
+            },
+            &mut || pauses += 1,
+        )
+        .unwrap();
+        assert_eq!((polls, pauses), (0, 1));
+        assert_eq!(core.hard_end, 500_000_000);
+    }
+    #[test]
+    fn scope_wait_failed_or_retired_owner_does_not_wait_or_renew() {
+        for state in ["fault", "finished", "cancelled"] {
+            let mut core = Core::new(Rc::default(), 500_000_000);
+            core.admit(0, 0, |_| Ok(fake("pending", Rc::default())))
+                .unwrap();
+            match state {
+                "fault" => core.poison("ORIGINAL_FAULT"),
+                "finished" => core.finished = true,
+                _ => core.cancel_end = Some(100),
+            }
+            let mut polls = 0;
+            let mut pauses = 0;
+            assert!(core
+                .wait_command_progress(
+                    &mut || Ok(10),
+                    &mut |_, _| {
+                        polls += 1;
+                        Ok(0)
+                    },
+                    &mut || pauses += 1
+                )
+                .is_err());
+            assert_eq!((polls, pauses), (0, 0));
+            assert_eq!(core.hard_end, 500_000_000);
+            if state == "fault" {
+                assert_eq!(
+                    core.owner.borrow().first_fault,
+                    Some(ProtocolError("ORIGINAL_FAULT"))
+                );
+            }
+        }
+    }
+    #[test]
+    fn scope_wait_pending_clock_failure_broadcasts_zero_without_a_pause() {
+        let mut core = Core::new(Rc::default(), 500_000_000);
+        let id = core
+            .admit(0, 0, |_| Ok(fake("pending", Rc::default())))
+            .unwrap();
+        core.slots[id.index].edge.setup_pending = true;
+        core.slots[id.index].edge.setup_wait_source = Some((7, 20_000_000));
+        let mut polls = 0;
+        let mut pauses = 0;
+        assert!(core
+            .wait_command_progress(
+                &mut || Err(error("INJECTED_CLOCK")),
+                &mut |_, _| {
+                    polls += 1;
+                    Ok(0)
+                },
+                &mut || pauses += 1
+            )
+            .is_err());
+        assert_eq!((polls, pauses), (0, 0));
+        assert_eq!(core.cancel_end, Some(0));
+        assert_eq!(core.slots[id.index].completion_end, Some(0));
     }
     #[test]
     fn repository_admission_sticky_fault_never_reopens_for_a_ready_sibling() {

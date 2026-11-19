@@ -1632,6 +1632,53 @@ fn keeper_turn<G: GroupOps, S: Read + Write>(
     Ok(Turn::Again)
 }
 
+// Waiting only schedules the next original keeper_turn. It cannot advance
+// protocol/group state, and none of the existing absolute ends is restarted.
+fn wait_keeper_control<G: GroupOps, S: Read + Write>(
+    session: &KeeperSession<G>,
+    channel: &Channel<S>,
+    clock: &mut impl FnMut() -> io::Result<u64>,
+    wait: &mut impl FnMut(i32) -> io::Result<()>,
+) -> io::Result<()> {
+    session.check_authority()?;
+    let at = session.check_time(clock)?;
+    if channel.eof || channel.pending.contains(&b'\n') {
+        return Ok(());
+    }
+    let mut end = session.end;
+    if !session.cleaning {
+        end = end.min(session.lifetime.operation_end);
+    } else if !session.gone && !session.killed {
+        if let Some(term_end) = session.term_end {
+            end = end.min(term_end);
+        }
+    }
+    if at >= end {
+        return Ok(());
+    }
+    // Preserve the old 1ms cap; never round the original remainder up.
+    wait(((end - at) / 1_000_000).min(1) as i32)
+}
+
+// Pure interpretation shared by the real poll adapter and injected tests.
+fn keeper_poll_outcome(
+    count: libc::c_int,
+    revents: libc::c_short,
+    error_kind: Option<io::ErrorKind>,
+) -> io::Result<()> {
+    if count < 0 {
+        return if error_kind == Some(io::ErrorKind::Interrupted) {
+            Ok(())
+        } else {
+            Err(refused("KEEPER_CHANNEL"))
+        };
+    }
+    if revents & libc::POLLNVAL != 0 {
+        return Err(refused("KEEPER_CHANNEL"));
+    }
+    Ok(())
+}
+
 /// Entry point of the dev-only keeper example. No product code calls this.
 pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io::Result<()> {
     let values: Vec<String> = arguments
@@ -1698,7 +1745,19 @@ pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io
     loop {
         match keeper_turn(&mut session, &mut channel, pid, park, sid, &mut clock)? {
             Turn::Finished => return Ok(()),
-            Turn::Again => pause(),
+            Turn::Again => {
+                let fd = channel.stream.as_raw_fd();
+                wait_keeper_control(&session, &channel, &mut clock, &mut |timeout| {
+                    let mut source = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let count = unsafe { libc::poll(&mut source, 1, timeout) };
+                    let error_kind = (count < 0).then(|| io::Error::last_os_error().kind());
+                    keeper_poll_outcome(count, source.revents, error_kind)
+                })?;
+            }
         }
     }
 }
@@ -2612,6 +2671,289 @@ mod tests {
             Ok(())
         }
     }
+    mod keeper_readiness_tests {
+        use super::*;
+        use std::cell::Cell;
+
+        fn short_session() -> KeeperSession<FakeGroup> {
+            KeeperSession::new(
+                FakeGroup::default(),
+                Lifetime::with_policy(0, 70_000_000, CleanupPolicy::HookShort).unwrap(),
+            )
+        }
+
+        #[test]
+        fn keeper_wait_buffered_eighth_read_control_runs_again_without_wait_or_group_work() {
+            let mut session = helper_fixture();
+            let mut channel = scripted_channel(&[]);
+            channel
+                .stream
+                .actions
+                .extend((0..7).map(|_| ReadAction::Interrupted));
+            channel.stream.actions.push_back(ReadAction::Bytes(
+                format!("{}|CLEAN|100\n", "a".repeat(32)).into_bytes(),
+            ));
+            assert_eq!(
+                keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(150)).unwrap(),
+                Turn::Again
+            );
+            assert_eq!(channel.stream.reads, 8);
+            assert!(channel.pending.ends_with(b"\n"));
+            assert!(session.group.events.is_empty());
+            wait_keeper_control(&session, &channel, &mut || Ok(150), &mut |_| {
+                panic!("already-buffered control must not wait")
+            })
+            .unwrap();
+            assert_eq!(
+                keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(150))
+                    .unwrap_err()
+                    .to_string(),
+                "KEEPER_CLEANUP_DEADLINE"
+            );
+            assert_eq!(session.end, 100);
+            assert!(session.group.events.is_empty());
+            assert!(channel.stream.output.is_empty());
+            assert!(!session.gone && !session.released);
+        }
+
+        #[test]
+        fn keeper_wait_partial_control_and_readiness_never_authorize_pending_park() {
+            let mut session = short_session();
+            let mut channel =
+                scripted_channel(format!("{0}|PARK\n{0}|CLEAN|", "a".repeat(32)).as_bytes());
+            assert_eq!(
+                keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(1)).unwrap(),
+                Turn::Again
+            );
+            assert!(session.park_requested && !session.parked);
+            let end = session.end;
+            wait_keeper_control(&session, &channel, &mut || Ok(2), &mut |timeout| {
+                assert_eq!(timeout, 1);
+                keeper_poll_outcome(1, libc::POLLIN, None)
+            })
+            .unwrap();
+            assert_eq!(
+                keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(2)).unwrap(),
+                Turn::Again
+            );
+            assert_eq!(session.end, end);
+            assert!(session.park_requested && !session.parked);
+            assert!(session.group.events.is_empty());
+            assert!(channel.stream.output.is_empty());
+            channel
+                .stream
+                .actions
+                .push_back(ReadAction::Bytes(b"0\n".to_vec()));
+            assert!(keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(3)).is_err());
+            assert_eq!(session.end, 0);
+            assert!(session.group.events.is_empty());
+            assert!(channel.stream.output.is_empty());
+        }
+
+        #[test]
+        fn keeper_wait_final_submillisecond_poll_keeps_a_timely_park_in_the_original_window() {
+            let mut session = short_session();
+            let mut channel = scripted_channel(&[]);
+            let original_end = session.lifetime.operation_end;
+            let clock = Cell::new(original_end - 49_000);
+            wait_keeper_control(
+                &session,
+                &channel,
+                &mut || Ok(clock.get()),
+                &mut |timeout| {
+                    assert_eq!(timeout, 0);
+                    clock.set(original_end - 30_000);
+                    keeper_poll_outcome(1, libc::POLLIN, None)
+                },
+            )
+            .unwrap();
+            assert!(session.group.events.is_empty());
+            channel.stream.actions.push_back(ReadAction::Bytes(
+                format!("{}|PARK\n", "a".repeat(32)).into_bytes(),
+            ));
+            assert_eq!(
+                keeper_turn(
+                    &mut session,
+                    &mut channel,
+                    42,
+                    7,
+                    7,
+                    &mut || Ok(clock.get())
+                )
+                .unwrap(),
+                Turn::Again
+            );
+            assert_eq!(session.group.events, ["park"]);
+            assert_eq!(session.lifetime.operation_end, original_end);
+            assert_eq!(session.end, 70_000_000);
+            assert!(clock.get() < original_end);
+            assert!(!session.cleaning && !session.gone && !session.released);
+        }
+
+        #[test]
+        fn keeper_wait_existing_operation_session_and_term_ends_bound_every_wait() {
+            // (cleaning, gone, killed, session end, TERM end, now, wait timeout)
+            for (cleaning, gone, killed, end, term, at, expected) in [
+                (false, false, false, 70_000_000, None, 10_000_000, Some(1)),
+                (false, false, false, 70_000_000, None, 19_950_000, Some(0)),
+                (false, false, false, 70_000_000, None, 20_000_000, None),
+                (true, false, false, 20_000_000, None, 19_950_000, Some(0)),
+                (
+                    true,
+                    false,
+                    false,
+                    20_000_000,
+                    Some(19_960_000),
+                    19_000_000,
+                    Some(0),
+                ),
+                (
+                    true,
+                    false,
+                    false,
+                    20_000_000,
+                    Some(19_960_000),
+                    19_960_000,
+                    None,
+                ),
+                (true, true, false, 20_000_000, Some(1), 10_000_000, Some(1)),
+                (true, false, true, 20_000_000, Some(1), 10_000_000, Some(1)),
+            ] {
+                let mut session = short_session();
+                session.cleaning = cleaning;
+                session.gone = gone;
+                session.killed = killed;
+                session.end = end;
+                session.term_end = term;
+                let channel = scripted_channel(&[]);
+                let mut observed = None;
+                wait_keeper_control(&session, &channel, &mut || Ok(at), &mut |timeout| {
+                    observed = Some(timeout);
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(observed, expected);
+                assert_eq!(session.end, end);
+                assert_eq!(session.term_end, term);
+                assert_eq!(session.lifetime.operation_end, 20_000_000);
+                assert_eq!(session.lifetime.hard_end, 70_000_000);
+                assert!(session.group.events.is_empty());
+                assert!(!session.released);
+            }
+        }
+
+        #[test]
+        fn keeper_wait_exact_session_end_refuses_without_waiting_or_group_effect() {
+            let mut session = short_session();
+            session.end = 20_000_000;
+            let mut channel = scripted_channel(&[]);
+            assert_eq!(
+                wait_keeper_control(&session, &channel, &mut || Ok(20_000_000), &mut |_| {
+                    panic!("no waiting at the exact end")
+                })
+                .unwrap_err()
+                .to_string(),
+                "KEEPER_CLEANUP_DEADLINE"
+            );
+            assert!(
+                keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(20_000_000)).is_err()
+            );
+            assert!(session.group.events.is_empty());
+            assert!(channel.stream.output.is_empty());
+            assert_eq!(session.end, 20_000_000);
+        }
+
+        #[test]
+        fn keeper_wait_wait_results_only_schedule_original_turns() {
+            for (count, events, kind) in [
+                (0, 0, None),
+                (1, libc::POLLIN, None),
+                (1, libc::POLLHUP, None),
+                (1, libc::POLLERR, None),
+                (-1, 0, Some(io::ErrorKind::Interrupted)),
+            ] {
+                let mut session = short_session();
+                let mut channel = scripted_channel(&[]);
+                wait_keeper_control(&session, &channel, &mut || Ok(1), &mut |_| {
+                    keeper_poll_outcome(count, events, kind)
+                })
+                .unwrap();
+                assert!(session.group.events.is_empty());
+                assert_eq!(session.end, 70_000_000);
+                assert!(!session.parked && !session.cleaning && !session.gone && !session.released);
+                assert_eq!(
+                    keeper_turn(&mut session, &mut channel, 42, 7, 7, &mut || Ok(2)).unwrap(),
+                    Turn::Again
+                );
+                assert!(session.group.events.is_empty());
+                assert!(channel.stream.output.is_empty());
+            }
+        }
+
+        #[test]
+        fn keeper_wait_fatal_wait_clock_and_stopped_authority_cannot_touch_group_or_extend_ends() {
+            for (count, events, kind) in [
+                (-1, 0, Some(io::ErrorKind::Other)),
+                (-1, 0, None),
+                (1, libc::POLLNVAL, None),
+                (0, libc::POLLNVAL, None),
+            ] {
+                let session = short_session();
+                let channel = scripted_channel(&[]);
+                assert_eq!(
+                    wait_keeper_control(&session, &channel, &mut || Ok(1), &mut |_| {
+                        keeper_poll_outcome(count, events, kind)
+                    })
+                    .unwrap_err()
+                    .to_string(),
+                    "KEEPER_CHANNEL"
+                );
+                assert!(session.group.events.is_empty());
+                assert_eq!(session.end, 70_000_000);
+                assert!(!session.gone && !session.released);
+            }
+            let mut session = short_session();
+            let channel = scripted_channel(&[]);
+            assert_eq!(
+                wait_keeper_control(
+                    &session,
+                    &channel,
+                    &mut || Err(refused("GROUP_CLOCK")),
+                    &mut |_| { panic!("unavailable clock must not wait") }
+                )
+                .unwrap_err()
+                .to_string(),
+                "GROUP_CLOCK"
+            );
+            session.stop_authority("KEEPER_CHANNEL", 1);
+            let events = session.group.events.clone();
+            let end = session.end;
+            assert!(wait_keeper_control(
+                &session,
+                &channel,
+                &mut || { panic!("stopped authority must refuse before clock") },
+                &mut |_| panic!("stopped authority must not wait")
+            )
+            .is_err());
+            assert_eq!(session.group.events, events);
+            assert_eq!(session.end, end);
+            assert!(!session.gone && !session.released);
+        }
+
+        #[test]
+        fn keeper_wait_observed_eof_returns_to_original_failure_cleanup_without_wait() {
+            let session = short_session();
+            let mut channel = scripted_channel(&[]);
+            channel.eof = true;
+            wait_keeper_control(&session, &channel, &mut || Ok(1), &mut |_| {
+                panic!("observed EOF must return immediately")
+            })
+            .unwrap();
+            assert!(session.group.events.is_empty());
+            assert!(!session.gone && !session.released);
+        }
+    }
+
     fn r20_budget_yield(interrupted: bool) {
         let mut session = helper_fixture();
         session.control("CLEAN|1000000000", 1).unwrap();
