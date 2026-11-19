@@ -586,83 +586,6 @@ mod qualification {
             ack
         }
     }
-    #[cfg(test)]
-    mod direct_fixture_tests {
-        use super::*;
-        #[test]
-        fn image_never_uses_ack3_or_owner4_and_inventory_precedes_owner_registration() {
-            assert_eq!(
-                direct_close_inventory(5, 9, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
-                vec![4, 6, 7, 8]
-            );
-            assert_eq!(
-                direct_close_inventory(8, 9, &[3, 4, 5, 6, 7, 8, 9]),
-                vec![4, 5, 6, 7]
-            );
-            assert!(std::panic::catch_unwind(|| direct_close_inventory(4, 9, &[])).is_err());
-        }
-        #[test]
-        fn normal_hook_source_keeps_missing_owner_and_image_fd_refusals() {
-            let hook = include_str!("../commands/capture.rs");
-            assert!(hook.contains("command_owner.as_mut().ok_or_else"));
-            assert!(hook.contains("Capture hook requires a verified guarded command owner"));
-            let bootstrap = include_str!("../capture_runtime_pair.rs");
-            assert!(bootstrap.contains("(5..=1024).contains(v)"));
-            let owner = include_str!("../capture_command_owner.rs");
-            assert!(owner.contains("std::env::var(LEAF_END_ENV).map_err"));
-        }
-        fn isolated_case(cohort: &str, name: &str, hash: &str) -> Case {
-            let root = PathBuf::from(cohort).join(name);
-            Case {
-                home: root.join("home"),
-                capture: root.join("home/capture"),
-                core: root.join("artifact/keito"),
-                guard: root.join("artifact/keito-capture-guard"),
-                bin: root.join("bin"),
-                repo: root.join("repo"),
-                core_hash: hash.into(),
-                root,
-            }
-        }
-        #[test]
-        fn direct_ack_reuses_only_guarded_pair_and_preserves_fresh_case_state() {
-            let guarded = isolated_case("/owned/cohort", "first", "same_core");
-            let mut ack = isolated_case("/owned/cohort", "exact-ack", "same_core");
-            let state = (
-                ack.root.clone(),
-                ack.home.clone(),
-                ack.capture.clone(),
-                ack.repo.clone(),
-                ack.bin.clone(),
-            );
-            ack.use_guarded_pair(&guarded);
-            assert_eq!(ack.core, guarded.core);
-            assert_eq!(ack.guard, guarded.guard);
-            assert_eq!((ack.root, ack.home, ack.capture, ack.repo, ack.bin), state);
-        }
-        #[test]
-        fn direct_ack_rejects_pair_from_another_cohort_or_core_identity() {
-            let guarded = isolated_case("/owned/cohort", "first", "same_core");
-            let mut wrong_hash = isolated_case("/owned/cohort", "exact-ack", "different_core");
-            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || wrong_hash.use_guarded_pair(&guarded)
-            ))
-            .is_err());
-            let mut foreign = isolated_case("/foreign/cohort", "exact-ack", "same_core");
-            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || foreign.use_guarded_pair(&guarded)
-            ))
-            .is_err());
-        }
-        #[test]
-        fn leaf_admission_reserve_uses_the_original_absolute_bound() {
-            assert!(direct_admission_fresh(449_999_999, 500_000_000));
-            assert!(!direct_admission_fresh(450_000_000, 500_000_000));
-            assert!(!direct_admission_fresh(500_000_000, 500_000_000));
-            assert!(!direct_admission_fresh(0, 1));
-        }
-    }
-
     pub fn run() {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         assert_eq!(
@@ -818,6 +741,82 @@ mod qualification {
             p95 < 100.0,
             "actual paired artifact p95 exceeds100ms; preserve first failure"
         );
+    }
+    #[cfg(test)]
+    mod direct_fixture_tests {
+        use super::*;
+        #[test]
+        fn image_never_uses_ack3_or_owner4_and_inventory_precedes_owner_registration() {
+            assert_eq!(
+                direct_close_inventory(5, 9, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+                vec![4, 6, 7, 8]
+            );
+            assert_eq!(
+                direct_close_inventory(8, 9, &[3, 4, 5, 6, 7, 8, 9]),
+                vec![4, 5, 6, 7]
+            );
+            assert!(std::panic::catch_unwind(|| direct_close_inventory(4, 9, &[])).is_err());
+        }
+        #[test]
+        fn normal_hook_source_keeps_missing_owner_and_image_fd_refusals() {
+            let hook = include_str!("../commands/capture.rs");
+            assert!(hook.contains("command_owner.as_mut().ok_or_else"));
+            assert!(hook.contains("Capture hook requires a verified guarded command owner"));
+            let bootstrap = include_str!("../capture_runtime_pair.rs");
+            assert!(bootstrap.contains("(5..=1024).contains(v)"));
+            let owner = include_str!("../capture_command_owner.rs");
+            assert!(owner.contains("std::env::var(LEAF_END_ENV).map_err"));
+        }
+        fn isolated_case(cohort: &str, name: &str, hash: &str) -> Case {
+            let root = PathBuf::from(cohort).join(name);
+            Case {
+                home: root.join("home"),
+                capture: root.join("home/capture"),
+                core: root.join("artifact/keito"),
+                guard: root.join("artifact/keito-capture-guard"),
+                bin: root.join("bin"),
+                repo: root.join("repo"),
+                core_hash: hash.into(),
+                root,
+            }
+        }
+        #[test]
+        fn direct_ack_reuses_only_guarded_pair_and_preserves_fresh_case_state() {
+            let guarded = isolated_case("/owned/cohort", "first", "same_core");
+            let mut ack = isolated_case("/owned/cohort", "exact-ack", "same_core");
+            let state = (
+                ack.root.clone(),
+                ack.home.clone(),
+                ack.capture.clone(),
+                ack.repo.clone(),
+                ack.bin.clone(),
+            );
+            ack.use_guarded_pair(&guarded);
+            assert_eq!(ack.core, guarded.core);
+            assert_eq!(ack.guard, guarded.guard);
+            assert_eq!((ack.root, ack.home, ack.capture, ack.repo, ack.bin), state);
+        }
+        #[test]
+        fn direct_ack_rejects_pair_from_another_cohort_or_core_identity() {
+            let guarded = isolated_case("/owned/cohort", "first", "same_core");
+            let mut wrong_hash = isolated_case("/owned/cohort", "exact-ack", "different_core");
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || wrong_hash.use_guarded_pair(&guarded)
+            ))
+            .is_err());
+            let mut foreign = isolated_case("/foreign/cohort", "exact-ack", "same_core");
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || foreign.use_guarded_pair(&guarded)
+            ))
+            .is_err());
+        }
+        #[test]
+        fn leaf_admission_reserve_uses_the_original_absolute_bound() {
+            assert!(direct_admission_fresh(449_999_999, 500_000_000));
+            assert!(!direct_admission_fresh(450_000_000, 500_000_000));
+            assert!(!direct_admission_fresh(500_000_000, 500_000_000));
+            assert!(!direct_admission_fresh(0, 1));
+        }
     }
 }
 fn main() {
