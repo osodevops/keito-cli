@@ -92,6 +92,107 @@ class RuntimeOutputLimit(ChildFailure):
                 + " category=" + (value["error_category"] or "UNKNOWN"))
 
 
+
+# Failure-only closed metadata; no child/path/payload reads or ownership actions.
+_DIAGNOSTIC_FAULTS = frozenset({
+    "PEER_FAILED", "RUNTIME_ENDPOINT", "RUNTIME_DEADLINE", "RUNTIME_OUTPUT_LIMIT",
+    "RUNTIME_INPUT_WRITE", "RUNTIME_INPUT_CLOSE", "RUNTIME_OUTPUT_READ",
+    "RUNTIME_DIRECT_WAIT", "RUNTIME_WAIT_RECEIPT", "RUNTIME_PIPE_FLAGS",
+    "RUNTIME_START_OR_RECEIPT", "RUNTIME_RESULT_RECEIPT", "RUNTIME_COMMAND_FAILED",
+    "RUNTIME_PARENT_OR_SIGNAL", "RUNTIME_SLOT_POLL", "RUNTIME_SLOT_COLLECTION",
+    "RUNTIME_CLEANUP_DEADLINE", "RUNTIME_CANCEL_WRITE", "RUNTIME_CONTROL_CLOSE",
+    "RUNTIME_OPERATION_OR_RECEIPT", "RUNTIME_EXIT_COLLECTION", "RUNTIME_OWNER_EXIT",
+    "RUNTIME_SIGNAL", "OWNER_CLOCK", "EOF_WITHOUT_TERMINAL", "READ_FAILED",
+    "WRITE_FAILED", "TRUNCATED_FRAME", "POST_TERMINAL_DATA", "PEER_IDENTITY",
+})
+_DIAGNOSTIC_MATRIX = frozenset({
+    "positive", "profile-record-changed", "managed-root-recreated",
+    "native-image-changed", "registration-changed", "generation-changed",
+    "generation-receipt-changed", "source-replaced", "source-symlink", "source-fifo",
+    "source-hardlink", "source-directory", "source-wrong-session", "path-missing",
+    "path-null", "path-wrong-namespace", "path-wrong-session", "numeric-revoked",
+    "metadata-paused", "wrong-owned-native-image-bounded-chain",
+})
+_DIAGNOSTIC_PHASES = frozenset({
+    "normal-dispatch", "pre-mutation-prompt", "post-mutation-stop",
+    "wrong-origin-prompt", "terminal-after-wrong-origin",
+})
+
+
+def _closed_diagnostic_value(value, choices):
+    return value if type(value) is str and value in choices else "UNKNOWN"
+
+
+def _closed_diagnostic_fault(value):
+    if value is None:
+        return None
+    return value if type(value) is str and value in _DIAGNOSTIC_FAULTS else "OTHER"
+
+
+def owned_failure_snapshot(manager):
+    """Read only retained Python facts; never poll, wait, drain, clock or repr."""
+    slots = manager.slots
+    slot = slots[-1] if slots else {}
+    endpoint = slot.get("endpoint")
+    child = slot.get("child")
+    status = child.returncode if child is not None else None
+    status = status if type(status) is int and -(2**31) <= status < 2**31 else None
+    def flag(value):
+        return value if type(value) is bool else None
+    def count(value):
+        return value if type(value) is int and 0 <= value <= 2**64 - 1 else None
+    return {
+        "slot_count": min(len(slots), 4096),
+        "direct_handle_retained": child is not None,
+        "direct_wait_known": status is not None,
+        "direct_returncode": status,
+        "accepted": slot.get("accepted") is not None,
+        "collected": flag(slot.get("collected")),
+        "waited_published": flag(slot.get("waited_published")),
+        "stdin_closed": (child.stdin is None) if child is not None else None,
+        "stdout_eof": flag(slot.get("stdout_eof")),
+        "stderr_eof": flag(slot.get("stderr_eof")),
+        "stdout_bytes": count(slot.get("stdout_count")),
+        "stderr_bytes": count(slot.get("stderr_count")),
+        "endpoint_live": flag(getattr(endpoint, "live", None)),
+        "endpoint_terminal": flag(getattr(endpoint, "terminal", None)),
+        "endpoint_eof": flag(getattr(endpoint, "eof", None)),
+        "endpoint_settled": flag(getattr(endpoint, "settled", None)),
+        "slot_fault": _closed_diagnostic_fault(slot.get("first_fault")),
+        "endpoint_fault": _closed_diagnostic_fault(getattr(endpoint, "first_fault", None)),
+        "owner_fault": _closed_diagnostic_fault(manager.owner.first_fault),
+    }
+
+
+def diagnosed_owned_operation(manager, operation, context, emit):
+    """Preserve existing context cleanup and primary exception; emit only after it."""
+    first = None
+    try:
+        with manager:
+            try:
+                return operation(manager)
+            except BaseException:
+                try:
+                    first = owned_failure_snapshot(manager)
+                except BaseException:
+                    pass
+                raise
+    except BaseException:
+        try:
+            record = {
+                "schema": 1, "source_fixture_only": True,
+                "namespace": _closed_diagnostic_value(context.get("namespace"), {"codex", "claude-code"}),
+                "matrix_label": _closed_diagnostic_value(context.get("matrix_label"), _DIAGNOSTIC_MATRIX),
+                "phase": _closed_diagnostic_value(context.get("phase"), _DIAGNOSTIC_PHASES),
+                "event": _closed_diagnostic_value(context.get("event"), {"prompt", "stop"}),
+                "first": first, "after_cleanup": owned_failure_snapshot(manager),
+            }
+            emit(record)
+        except BaseException:
+            pass  # Diagnostics never replace the original exception or retry work.
+        raise
+
+
 class LegacyDirectChildren:
     """Historical direct/group tests only; never the actual capture runner.
 

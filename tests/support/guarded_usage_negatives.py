@@ -75,7 +75,8 @@ def main():
             with SourceOwner() as owner:
                 qa.OWNER = owner
                 case, database, image, session, source, final = setup(namespace, version, filename)
-                qa.dispatch(case, namespace, session, source, "prompt", "turn_synthetic", program_override=image)
+                qa.dispatch(case, namespace, session, source, "prompt", "turn_synthetic", program_override=image,
+                            diagnostic_label=label, diagnostic_phase="pre-mutation-prompt")
                 qa.write_source(source, final)
                 options = {}
                 profile_path = next((case / "home/capture/profiles").glob("*.json"))
@@ -125,7 +126,8 @@ def main():
                 elif label == "metadata-paused":
                     result = qa.cli(case, ["capture", "pause", "--repo", "--json"])
                     assert result.returncode == 0
-                qa.dispatch(case, namespace, session, source, "stop", "turn_synthetic", program_override=image, **options)
+                qa.dispatch(case, namespace, session, source, "stop", "turn_synthetic", program_override=image,
+                            diagnostic_label=label, diagnostic_phase="post-mutation-stop", **options)
                 assert_time_unknown(case, database, namespace, label, expected)
                 database.close()
         # The wrong native-image chain is entirely run-owned. Eight added native
@@ -136,12 +138,16 @@ def main():
             wrong = case / "native-wrong-owned"
             shutil.copyfile(qa.NATIVES / filename, wrong)
             wrong.chmod(0o700)
-            qa.dispatch(case, namespace, session, source, "prompt", "turn_synthetic", program_override=wrong, chain_depth=8)
+            qa.dispatch(case, namespace, session, source, "prompt", "turn_synthetic", program_override=wrong, chain_depth=8,
+                        diagnostic_label="wrong-owned-native-image-bounded-chain",
+                        diagnostic_phase="wrong-origin-prompt")
             status = json.loads(qa.cli(case, ["capture", "usage", "status", "--repo", "--agent", namespace, "--json"]).stdout)
             assert status["reason"] == "HARNESS_ORIGIN_UNAVAILABLE", status
             qa.observe({"namespace": namespace, "case": "wrong-owned-native-image-bounded-chain", "reason": status["reason"], "owned_chain_depth": 8})
             qa.write_source(source, final)
-            qa.dispatch(case, namespace, session, source, "stop", "turn_synthetic", program_override=image)
+            qa.dispatch(case, namespace, session, source, "stop", "turn_synthetic", program_override=image,
+                        diagnostic_label="wrong-owned-native-image-bounded-chain",
+                        diagnostic_phase="terminal-after-wrong-origin")
             assert_time_unknown(case, database, namespace, "terminal-cannot-repair-wrong-origin", "MISSING_QUALIFIED_PROMPT")
             database.close()
     print(json.dumps({"source_fixture_only": True, "normal_guarded_negative_cases": 2 * (len(MATRIX) + 1),

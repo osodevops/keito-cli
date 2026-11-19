@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 import uuid
-from source_qa_children import OwnedChildren
+from source_qa_children import OwnedChildren, diagnosed_owned_operation
 from source_qa_protocol import SourceOwner
 
 ROOT, PAIR, NATIVES, OUTPUT = (Path(value) for value in sys.argv[1:])
@@ -56,12 +56,20 @@ def environment(case):
     return result
 
 
-def owned_runtime(case, arguments, seconds, limit=0):
+def owned_runtime(case, arguments, seconds, limit=0, diagnostic=None):
     label = "runtime-" + uuid.uuid4().hex
-    with OwnedChildren(case, environment(case), case, owner=OWNER) as manager:
-        slot = manager.start(label, arguments, seconds, capture_limit=limit)
-        output = manager.complete(slot)
+    manager = OwnedChildren(case, environment(case), case, owner=OWNER)
+    def operation(active):
+        slot = active.start(label, arguments, seconds, capture_limit=limit)
+        output = active.complete(slot)
         return subprocess.CompletedProcess(arguments, slot["child"].returncode, output or b"", b"")
+    if diagnostic is None:
+        with manager:
+            return operation(manager)
+    return diagnosed_owned_operation(
+        manager, operation, diagnostic,
+        lambda record: print(json.dumps({"guarded_failure_diagnostic": record}, sort_keys=True),
+                             file=sys.stderr, flush=True))
 
 
 def cli(case, arguments):
@@ -114,7 +122,7 @@ def write_source(path, records):
     path.chmod(0o600)
 
 
-def dispatch(case, namespace, session, source, event, turn, *, program_override=None, chain_depth=None, overrides=None, remove_fields=()):
+def dispatch(case, namespace, session, source, event, turn, *, program_override=None, chain_depth=None, overrides=None, remove_fields=(), diagnostic_label="positive", diagnostic_phase="normal-dispatch"):
     config = json.loads((case / ("home/.codex/hooks.json" if namespace == "codex"
                                  else "home/.claude/settings.json")).read_text())
     native_event = "UserPromptSubmit" if event == "prompt" else "Stop"
@@ -137,7 +145,9 @@ def dispatch(case, namespace, session, source, event, turn, *, program_override=
     mode = ["--run"] if chain_depth is None else ["--chain", str(chain_depth)]
     started = time.monotonic()
     result = owned_runtime(case, [str(program), *mode, str(ROOT), str(case), str(CORE),
-                                 str(command_file), str(event_file), str(result_file)], 1)
+                                 str(command_file), str(event_file), str(result_file)], 1,
+                           diagnostic={"namespace": namespace, "matrix_label": diagnostic_label,
+                                       "phase": diagnostic_phase, "event": event})
     outcome = json.loads(result_file.read_text()) if result_file.exists() else {"missing_result": True}
     flags = list((case / "home/capture/capture-invocations").glob("*.pending"))
     flags += list((case / "home/capture/capture-invocations").glob("*.preparing"))
