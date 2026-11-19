@@ -95,7 +95,7 @@ wiremock = "0.6"
 tempfile = "3"
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 strip = true
 lto = true
 codegen-units = 1

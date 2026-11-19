@@ -85,7 +85,7 @@ def main(arguments):
     # DEV/TEST keep their debug assertions and overflow checks explicitly; this
     # remains a source-fixture pair, not the normal release artifact.
     for profile in ("DEV", "TEST"):
-        for key, value in {"OPT_LEVEL": "s", "DEBUG": "0", "STRIP": "symbols",
+        for key, value in {"OPT_LEVEL": "z", "DEBUG": "0", "STRIP": "symbols",
                            "LTO": "true", "CODEGEN_UNITS": "1",
                            "DEBUG_ASSERTIONS": "true", "OVERFLOW_CHECKS": "true"}.items():
             environment["CARGO_PROFILE_" + profile + "_" + key] = value
