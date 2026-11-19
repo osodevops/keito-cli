@@ -125,27 +125,9 @@ impl VerifiedKeeperImage {
     #[allow(dead_code)]
     pub(crate) fn running_guard() -> io::Result<Self> {
         let path = std::env::current_exe()?;
-        let mut file = open_path(&path)?;
-        let mut digest = Sha256::new();
-        let mut part = [0u8; 65536];
-        let mut total = 0u64;
-        loop {
-            let count = file.read(&mut part)?;
-            if count == 0 {
-                break;
-            }
-            total = total
-                .checked_add(count as u64)
-                .filter(|n| *n <= MAX_IMAGE)
-                .ok_or_else(refused)?;
-            digest.update(&part[..count]);
-        }
-        let expected: String = digest
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        Self::open(&path, &expected)
+        // This is resource-only self-image admission, not a compiled-anchor
+        // check. Retain the same opened image through its single hash pass.
+        Self::open_hashed(&path, |file, bytes| file.read(bytes)).map(|(image, _)| image)
     }
     pub(crate) fn open(path: &Path, expected: &str) -> io::Result<Self> {
         if expected.len() != 64
@@ -159,6 +141,17 @@ impl VerifiedKeeperImage {
         {
             return Err(refused());
         }
+        let (image, actual) = Self::open_hashed(path, |file, bytes| file.read(bytes))?;
+        // Anchored admission always compares the supplied compiled digest.
+        if actual != expected {
+            return Err(refused());
+        }
+        Ok(image)
+    }
+    fn open_hashed(
+        path: &Path,
+        mut read: impl FnMut(&mut File, &mut [u8]) -> io::Result<usize>,
+    ) -> io::Result<(Self, String)> {
         let mut file = open_path(path)?;
         let before = file.metadata().map_err(|_| refused())?;
         // Separate product policy; the legacy QA constructor still requires700.
@@ -176,9 +169,14 @@ impl VerifiedKeeperImage {
         let mut bytes = [0u8; 65536];
         let mut length = 0u64;
         loop {
-            let n = file.read(&mut bytes).map_err(|_| refused())?;
+            let n = read(&mut file, &mut bytes).map_err(|_| refused())?;
             if n == 0 {
                 break;
+            }
+            // Real File::read respects the buffer; the explicit check also
+            // keeps injected faults from indexing outside the admitted block.
+            if n > bytes.len() {
+                return Err(refused());
             }
             length = length
                 .checked_add(n as u64)
@@ -191,10 +189,7 @@ impl VerifiedKeeperImage {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        if actual != expected
-            || length != before.len()
-            || Stamp::of(&file.metadata().map_err(|_| refused())?) != stamp
-        {
+        if length != before.len() || Stamp::of(&file.metadata().map_err(|_| refused())?) != stamp {
             return Err(refused());
         }
         let result = Self {
@@ -203,7 +198,7 @@ impl VerifiedKeeperImage {
             stamp,
         };
         result.check_current()?;
-        Ok(result)
+        Ok((result, actual))
     }
     fn check_current(&self) -> io::Result<()> {
         let file = self.file.metadata().map_err(|_| refused())?;
@@ -434,6 +429,218 @@ mod tests {
             }
         }
     }
+    // Inert files only. The injected reads execute the same constructor used
+    // by running_guard; no process, native role or capture authority is run.
+    #[test]
+    fn resource_image_single_hash_retains_the_original_readonly_descriptor() {
+        for mode in [0o700, 0o755] {
+            let fixture = Inert::new(mode);
+            let expected = fs::read(&fixture.path).unwrap();
+            let mut observed_fd = None;
+            let mut bytes_read = 0;
+            let mut eof_reads = 0;
+            let (image, digest) = VerifiedKeeperImage::open_hashed(&fixture.path, |file, bytes| {
+                let fd = file.as_raw_fd();
+                assert!(observed_fd.is_none_or(|original| original == fd));
+                observed_fd = Some(fd);
+                let n = file.read(bytes)?;
+                bytes_read += n;
+                eof_reads += usize::from(n == 0);
+                Ok(n)
+            })
+            .unwrap();
+            assert_eq!(bytes_read, expected.len());
+            assert_eq!(eof_reads, 1);
+            assert_eq!(digest, fixture.hash);
+            assert_eq!(observed_fd, Some(image.file.as_raw_fd()));
+            assert!(image.check_current().is_ok());
+            assert_eq!(
+                unsafe { libc::fcntl(image.file.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                libc::O_RDONLY
+            );
+            assert_eq!(
+                unsafe { libc::fcntl(image.file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC
+            );
+        }
+    }
+
+    #[test]
+    fn resource_image_single_hash_short_reads_keep_the_exact_digest() {
+        let fixture = Inert::new(0o700);
+        let (image, digest) = VerifiedKeeperImage::open_hashed(&fixture.path, |file, bytes| {
+            file.read(&mut bytes[..1])
+        })
+        .unwrap();
+        assert_eq!(digest, fixture.hash);
+        assert!(image.check_current().is_ok());
+        assert!(VerifiedKeeperImage::open(&fixture.path, &fixture.hash).is_ok());
+        assert!(VerifiedKeeperImage::open(&fixture.path, &"0".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn resource_image_single_hash_early_eof_and_read_fault_never_admit() {
+        let fixture = Inert::new(0o700);
+        assert!(VerifiedKeeperImage::open_hashed(&fixture.path, |_, _| Ok(0)).is_err());
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::Other] {
+            assert!(VerifiedKeeperImage::open_hashed(&fixture.path, |_, _| {
+                Err(io::Error::from(kind))
+            })
+            .is_err());
+        }
+        assert!(VerifiedKeeperImage::open_hashed(&fixture.path, |_, bytes| {
+            Ok(bytes.len() + 1)
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn resource_image_single_hash_replacement_at_first_read_or_eof_refuses() {
+        for at_eof in [false, true] {
+            for same_bytes in [false, true] {
+                let fixture = Inert::new(0o700);
+                let original = fs::read(&fixture.path).unwrap();
+                let mut replaced = false;
+                let result = VerifiedKeeperImage::open_hashed(&fixture.path, |file, bytes| {
+                    let n = file.read(bytes)?;
+                    if !replaced && (!at_eof || n == 0) {
+                        replaced = true;
+                        fs::rename(&fixture.path, fixture.path.with_extension("old"))?;
+                        fs::write(
+                            &fixture.path,
+                            if same_bytes {
+                                original.as_slice()
+                            } else {
+                                b"replacement"
+                            },
+                        )?;
+                        fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o700))?;
+                    }
+                    Ok(n)
+                });
+                assert!(replaced);
+                assert!(
+                    result.is_err(),
+                    "replaced named image must not inherit the retained file"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resource_image_single_hash_edit_or_mode_change_during_read_refuses() {
+        for change_mode in [false, true] {
+            let fixture = Inert::new(0o700);
+            let mut changed = false;
+            let result = VerifiedKeeperImage::open_hashed(&fixture.path, |file, bytes| {
+                let n = file.read(&mut bytes[..1])?;
+                if !changed && n != 0 {
+                    changed = true;
+                    if change_mode {
+                        fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o755))?;
+                    } else {
+                        // Same inode; a length change cannot be hidden by a
+                        // digest of an earlier prefix or a later EOF.
+                        let mut output = fs::OpenOptions::new().append(true).open(&fixture.path)?;
+                        std::io::Write::write_all(&mut output, b"changed")?;
+                    }
+                }
+                Ok(n)
+            });
+            assert!(changed);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn resource_image_single_hash_same_size_edit_with_changed_mtime_refuses() {
+        for at_eof in [false, true] {
+            let fixture = Inert::new(0o700);
+            let original = fs::read(&fixture.path).unwrap();
+            let before = fs::metadata(&fixture.path).unwrap();
+            let before_modified = before.modified().unwrap();
+            let changed_modified = before_modified
+                .checked_add(std::time::Duration::from_secs(60))
+                .unwrap();
+            let mut changed = false;
+            let result = VerifiedKeeperImage::open_hashed(&fixture.path, |file, bytes| {
+                let n = file.read(bytes)?;
+                if !changed && (!at_eof || n == 0) {
+                    changed = true;
+                    let mut output = fs::OpenOptions::new().write(true).open(&fixture.path)?;
+                    std::io::Write::write_all(&mut output, &[original[0] ^ 0xff])?;
+                    output.set_times(fs::FileTimes::new().set_modified(changed_modified))?;
+                }
+                Ok(n)
+            });
+            let after = fs::metadata(&fixture.path).unwrap();
+            assert!(changed);
+            assert_eq!(after.len(), before.len());
+            assert_eq!(after.ino(), before.ino());
+            assert_eq!(after.mode(), before.mode());
+            assert_ne!(after.modified().unwrap(), before_modified);
+            assert_eq!(fs::read(&fixture.path).unwrap()[0], original[0] ^ 0xff);
+            assert!(
+                result.is_err(),
+                "same-size mutation must not inherit a prior hash snapshot"
+            );
+        }
+    }
+    #[test]
+    fn resource_image_single_hash_policy_refuses_before_any_payload_read() {
+        for mode in [0o600, 0o777] {
+            let fixture = Inert::new(mode);
+            assert!(VerifiedKeeperImage::open_hashed(&fixture.path, |_, _| {
+                panic!("invalid image mode must refuse before reading")
+            })
+            .is_err());
+        }
+        let fixture = Inert::new(0o700);
+        fs::hard_link(&fixture.path, fixture.path.with_extension("link")).unwrap();
+        assert!(VerifiedKeeperImage::open_hashed(&fixture.path, |_, _| {
+            panic!("multiply-linked image must refuse before reading")
+        })
+        .is_err());
+        let fixture = Inert::new(0o700);
+        let output = fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .unwrap();
+        output.set_len(MAX_IMAGE + 1).unwrap();
+        assert!(VerifiedKeeperImage::open_hashed(&fixture.path, |_, _| {
+            panic!("oversized image must refuse before reading")
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn resource_image_single_hash_later_replacement_edit_and_link_still_refuse() {
+        for change in ["replace", "edit", "link", "symlink"] {
+            let fixture = Inert::new(0o700);
+            let (image, _) =
+                VerifiedKeeperImage::open_hashed(&fixture.path, |file, bytes| file.read(bytes))
+                    .unwrap();
+            match change {
+                "replace" => {
+                    let original = fs::read(&fixture.path).unwrap();
+                    fs::rename(&fixture.path, fixture.path.with_extension("old")).unwrap();
+                    fs::write(&fixture.path, original).unwrap();
+                    fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                "edit" => fs::write(&fixture.path, b"changed bytes").unwrap(),
+                "link" => {
+                    fs::hard_link(&fixture.path, fixture.path.with_extension("link")).unwrap()
+                }
+                _ => {
+                    let old = fixture.path.with_extension("old");
+                    fs::rename(&fixture.path, &old).unwrap();
+                    symlink(old, &fixture.path).unwrap();
+                }
+            }
+            assert!(image.check_current().is_err());
+        }
+    }
+
     #[test]
     fn r40_official_755_guard_has_distinct_verified_image_admission() {
         let f = Inert::new(0o755);

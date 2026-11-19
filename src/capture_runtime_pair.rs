@@ -20,8 +20,10 @@ pub struct CaptureRuntimeIdentity {
     pub guard_contract: u32,
 }
 
-use crate::{capture, error::AppError};
+use crate::error::AppError;
 use serde::Deserialize;
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
 #[cfg(unix)]
 use std::{fs, io::Read, path::Component};
@@ -39,7 +41,12 @@ fn refused() -> AppError {
     AppError::Config("Capture requires an intact official keito / keito-capture-guard release pair; manual CLI commands remain available".into())
 }
 #[cfg(unix)]
-fn read_file(path: &Path, max: u64, executable: bool) -> Result<Vec<u8>, AppError> {
+fn read_file_with<T>(
+    path: &Path,
+    max: u64,
+    executable: bool,
+    consume: impl FnOnce(&fs::File, u64) -> Result<(T, u64), AppError>,
+) -> Result<T, AppError> {
     use std::{
         ffi::CString,
         os::{
@@ -110,9 +117,7 @@ fn read_file(path: &Path, max: u64, executable: bool) -> Result<Vec<u8>, AppErro
     {
         return Err(refused());
     }
-    let mut bytes = Vec::new();
-    let mut bounded = (&file).take(max + 1);
-    bounded.read_to_end(&mut bytes).map_err(|_| refused())?;
+    let (output, bytes_read) = consume(&file, max)?;
     let after = file.metadata().map_err(|_| refused())?;
     let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe {
@@ -127,7 +132,7 @@ fn read_file(path: &Path, max: u64, executable: bool) -> Result<Vec<u8>, AppErro
         return Err(refused());
     }
     let current = unsafe { current.assume_init() };
-    if bytes.len() as u64 > max
+    if bytes_read > max
         || before.dev() != after.dev()
         || before.ino() != after.ino()
         || before.len() != after.len()
@@ -140,14 +145,65 @@ fn read_file(path: &Path, max: u64, executable: bool) -> Result<Vec<u8>, AppErro
     {
         return Err(refused());
     }
-    Ok(bytes)
+    Ok(output)
+}
+#[cfg(unix)]
+fn read_file(path: &Path, max: u64, executable: bool) -> Result<Vec<u8>, AppError> {
+    read_file_with(path, max, executable, |file, max| {
+        let mut bytes = Vec::new();
+        let mut bounded = file.take(max + 1);
+        bounded.read_to_end(&mut bytes).map_err(|_| refused())?;
+        let length = bytes.len() as u64;
+        Ok((bytes, length))
+    })
 }
 #[cfg(not(unix))]
 fn read_file(_: &Path, _: u64, _: bool) -> Result<Vec<u8>, AppError> {
     Err(refused())
 }
+#[cfg(unix)]
+fn hash_reader(reader: &mut impl Read, max: u64) -> Result<(String, u64), AppError> {
+    let mut hash = Sha256::new();
+    let mut bytes_read = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bounded = reader.take(max + 1);
+    loop {
+        let count = match bounded.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(refused()),
+        };
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read.checked_add(count as u64).ok_or_else(refused)?;
+        if bytes_read > max {
+            return Err(refused());
+        }
+        hash.update(&buffer[..count]);
+    }
+    let digest = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((digest, bytes_read))
+}
+#[cfg(unix)]
 fn hash_file(path: &Path) -> Result<String, AppError> {
-    Ok(capture::hash(read_file(path, 128 * 1024 * 1024, true)?))
+    read_file_with(path, 128 * 1024 * 1024, true, |file, max| {
+        // The SAME retained descriptor and pre/post path+inode gates still
+        // verify every image byte. Only the whole-image Vec is removed.
+        hash_reader(&mut &*file, max)
+    })
+}
+#[cfg(not(unix))]
+fn hash_file(path: &Path) -> Result<String, AppError> {
+    Ok(crate::capture::hash(read_file(
+        path,
+        128 * 1024 * 1024,
+        true,
+    )?))
 }
 /// Pure filesystem qualification against a caller-supplied compiled identity.
 /// The release command uses only its embedded anchor, never manifest trust.
@@ -311,5 +367,68 @@ impl HookRuntime {
     }
     pub(crate) fn keeper(&self) -> &crate::process_ownership::image::VerifiedKeeperImage {
         &self.keeper
+    }
+}
+
+#[cfg(all(test, unix))]
+mod streaming_hash_tests {
+    use super::*;
+    use std::io::{self, Cursor};
+    #[test]
+    fn stream_digest_matches_exact_whole_buffer_sha256_at_chunk_boundaries() {
+        for length in [0, 1, 65535, 65536, 65537, 131073] {
+            let bytes: Vec<u8> = (0..length).map(|n| (n % 251) as u8).collect();
+            let (digest, count) = hash_reader(&mut Cursor::new(&bytes), length as u64).unwrap();
+            assert_eq!(digest, crate::capture::hash(&bytes));
+            assert_eq!(count, length as u64);
+        }
+    }
+    #[test]
+    fn excess_byte_is_refused_instead_of_accepting_a_hashed_prefix() {
+        assert!(hash_reader(&mut Cursor::new(b"a"), 0).is_err());
+        assert!(hash_reader(&mut Cursor::new(b"abc"), 2).is_err());
+        let (digest, count) = hash_reader(&mut Cursor::new(b"ab"), 2).unwrap();
+        assert_eq!(digest, crate::capture::hash(b"ab"));
+        assert_eq!(count, 2);
+    }
+    struct InterruptedThenChunks {
+        bytes: Cursor<Vec<u8>>,
+        interrupted: bool,
+    }
+    impl Read for InterruptedThenChunks {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let end = output.len().min(3);
+            self.bytes.read(&mut output[..end])
+        }
+    }
+    #[test]
+    fn interrupted_and_partial_reads_preserve_exact_digest_and_count() {
+        let bytes = b"complete image bytes after interruption".to_vec();
+        let mut reader = InterruptedThenChunks {
+            bytes: Cursor::new(bytes.clone()),
+            interrupted: false,
+        };
+        let (digest, count) = hash_reader(&mut reader, bytes.len() as u64).unwrap();
+        assert_eq!(digest, crate::capture::hash(&bytes));
+        assert_eq!(count, bytes.len() as u64);
+    }
+    struct FailsAfterPrefix(bool);
+    impl Read for FailsAfterPrefix {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.0 {
+                return Err(io::Error::from(io::ErrorKind::Other));
+            }
+            self.0 = true;
+            output[0] = b'x';
+            Ok(1)
+        }
+    }
+    #[test]
+    fn a_read_fault_never_returns_a_partial_digest() {
+        assert!(hash_reader(&mut FailsAfterPrefix(false), 10).is_err());
     }
 }
