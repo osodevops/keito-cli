@@ -331,19 +331,60 @@ fn sqlite_connections_serialize_duplicate_hooks_into_one_revision() {
     let (dir, mut store, b) = setup();
     event(&mut store, "session", Some("turn"), Prompt, 0);
     let dir = dir.path().join("capture");
+    let origin = std::time::Instant::now();
     let handles: Vec<_> = (0..20)
         .map(|_| {
             let path = dir.clone();
             std::thread::spawn(move || {
-                let mut store = Store::open(&path).unwrap();
-                event(&mut store, "session", Some("turn"), Stop, 90);
+                let open_started = std::time::Instant::now();
+                let open_at = open_started.duration_since(origin);
+                let opened = Store::open(&path);
+                let open_elapsed = open_started.elapsed();
+                let mut store = match opened {
+                    Ok(store) => store,
+                    Err(error) => {
+                        return Err(format!("open_at={open_at:?}; open={open_elapsed:?}; open_error={error:?}"));
+                    }
+                };
+                let event_started = std::time::Instant::now();
+                let event_at = event_started.duration_since(origin);
+                let result = store.event(
+                    &repo(),
+                    capture::Signal {
+                        source: "codex",
+                        resumed: false,
+                        source_id: "session",
+                        turn_id: Some("turn"),
+                        version: "fixture-v1",
+                        event: Stop,
+                        clock: &clock(90),
+                    },
+                );
+                let event_elapsed = event_started.elapsed();
+                #[cfg(feature = "dev-tools")]
+                let receipt = format!(
+                    "open_at={open_at:?}; open={open_elapsed:?}; event_at={event_at:?}; event={event_elapsed:?}; admission={:?}",
+                    store.last_admission_timing()
+                );
+                #[cfg(not(feature = "dev-tools"))]
+                let receipt = format!("open_at={open_at:?}; open={open_elapsed:?}; event_at={event_at:?}; event={event_elapsed:?}");
+                match result {
+                    Ok(()) => Ok(receipt),
+                    Err(error) => Err(format!("{receipt}; event_error={error:?}")),
+                }
             })
         })
         .collect();
     // Retain the TempDir until every original worker has settled, even if
     // an earlier worker panicked. Keep the original all-success assertion.
-    for outcome in join_all_before_asserting(handles) {
-        outcome.unwrap();
+    let outcomes = join_all_before_asserting(handles);
+    // Emit every successful and failed holder receipt before any assertion.
+    // No worker failure can hide later outcomes or drop the original TempDir.
+    for (worker, outcome) in outcomes.iter().enumerate() {
+        println!("sqlite_duplicate_worker={worker}; outcome={outcome:?}");
+    }
+    for outcome in outcomes {
+        outcome.unwrap().unwrap();
     }
     let s = &store.preview("session").unwrap()[0];
     assert_eq!(s.segments.len(), 1);

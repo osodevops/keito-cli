@@ -247,6 +247,41 @@ impl PipeIo {
             }
         }
     }
+    // Scheduling hints from the SAME retained, independently configured pipes.
+    // Only their original read/write operations can change closure/EOF facts.
+    pub(super) fn progress_wait_sources(&self, descriptors: &mut Vec<libc::pollfd>) {
+        if self.stdin_ready && !self.input.closed && self.input.offset < self.input.bytes.len() {
+            if let Some(pipe) = &self.stdin_pipe {
+                descriptors.push(libc::pollfd {
+                    fd: pipe.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                });
+            }
+        }
+        for (pipe, ready, eof) in [
+            (
+                self.stdout_pipe.as_ref().map(AsRawFd::as_raw_fd),
+                self.stdout_ready,
+                self.stdout.eof,
+            ),
+            (
+                self.stderr_pipe.as_ref().map(AsRawFd::as_raw_fd),
+                self.stderr_ready,
+                self.stderr.eof,
+            ),
+        ] {
+            if ready && !eof {
+                if let Some(fd) = pipe {
+                    descriptors.push(libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    });
+                }
+            }
+        }
+    }
     pub(super) fn facts(&self) -> IoFacts {
         IoFacts {
             stdin_closed: self.input.closed,
@@ -435,5 +470,116 @@ mod tests {
         let pipes = plan.prepare().unwrap();
         assert_eq!(pipes.input.bytes, b"x");
         assert_eq!(pipes.input.bytes.capacity(), capacity);
+    }
+    // Inert retained descriptors only: these tests create no process.
+    fn socket_pipe_io(
+        input: Vec<u8>,
+    ) -> (
+        PipeIo,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+        [i32; 3],
+    ) {
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+        let (stdin, input_peer) = UnixStream::pair().unwrap();
+        let (stdout, output_peer) = UnixStream::pair().unwrap();
+        let (stderr, error_peer) = UnixStream::pair().unwrap();
+        for peer in [&input_peer, &output_peer, &error_peer] {
+            peer.set_nonblocking(true).unwrap();
+        }
+        let fds = [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()];
+        let mut pipes = IoPlan::new(input, 32, 32).unwrap().prepare().unwrap();
+        let stdin: OwnedFd = stdin.into();
+        let stdout: OwnedFd = stdout.into();
+        let stderr: OwnedFd = stderr.into();
+        pipes
+            .attach(
+                Some(ChildStdin::from(stdin)),
+                Some(ChildStdout::from(stdout)),
+                Some(ChildStderr::from(stderr)),
+            )
+            .unwrap();
+        (pipes, input_peer, output_peer, error_peer, fds)
+    }
+    #[test]
+    fn retained_pipe_readiness_matches_pending_fd_directions_without_advancing_io() {
+        let (mut pipes, mut input_peer, mut output_peer, mut error_peer, fds) =
+            socket_pipe_io(b"in".to_vec());
+        let mut descriptors = Vec::new();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|fd| (fd.fd, fd.events))
+                .collect::<Vec<_>>(),
+            [
+                (fds[0], libc::POLLOUT),
+                (fds[1], libc::POLLIN),
+                (fds[2], libc::POLLIN)
+            ]
+        );
+        let mut bytes = [0u8; 8];
+        assert_eq!(
+            input_peer.read(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        output_peer.write_all(b"out").unwrap();
+        error_peer.write_all(b"err").unwrap();
+        descriptors.clear();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert_eq!(pipes.facts().stdout_bytes, 0);
+        assert_eq!(pipes.facts().stderr_bytes, 0);
+        assert!(!pipes.facts().stdout_eof && !pipes.facts().stderr_eof);
+        assert!(!pipes.facts().stdin_closed);
+        pipes.poll();
+        assert_eq!(input_peer.read(&mut bytes).unwrap(), 2);
+        assert_eq!(&bytes[..2], b"in");
+        assert_eq!(pipes.facts().stdout_bytes, 3);
+        assert_eq!(pipes.facts().stderr_bytes, 3);
+        assert!(pipes.facts().stdin_closed);
+        descriptors.clear();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert!(descriptors.iter().all(|fd| fd.fd != fds[0]));
+        assert_eq!(descriptors.len(), 2);
+        output_peer.shutdown(std::net::Shutdown::Write).unwrap();
+        error_peer.shutdown(std::net::Shutdown::Write).unwrap();
+        descriptors.clear();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert_eq!(
+            descriptors.len(),
+            2,
+            "HUP was mistaken for physical read(0)"
+        );
+        assert!(!pipes.facts().stdout_eof && !pipes.facts().stderr_eof);
+        pipes.poll();
+        assert!(pipes.facts().stdout_eof && pipes.facts().stderr_eof);
+        descriptors.clear();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert!(
+            descriptors.is_empty(),
+            "known EOF would cause repeated HUP wakeups"
+        );
+        assert!(pipes.facts().complete());
+    }
+    #[test]
+    fn retained_pipe_readiness_omits_empty_input_before_original_close_then_keeps_it_closed() {
+        let (mut pipes, mut input_peer, _output_peer, _error_peer, fds) =
+            socket_pipe_io(Vec::new());
+        let mut descriptors = Vec::new();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert!(
+            !pipes.facts().stdin_closed,
+            "hint performed original stdin close"
+        );
+        assert!(descriptors.iter().all(|fd| fd.fd != fds[0]));
+        assert_eq!(descriptors.len(), 2);
+        pipes.poll();
+        assert!(pipes.facts().stdin_closed);
+        assert_eq!(input_peer.read(&mut [0u8; 1]).unwrap(), 0);
+        descriptors.clear();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert!(descriptors.iter().all(|fd| fd.fd != fds[0]));
+        assert_eq!(descriptors.len(), 2);
     }
 }

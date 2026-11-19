@@ -290,6 +290,9 @@ struct Channel<S = UnixStream> {
     eof: bool,
 }
 impl Channel {
+    fn cleanup_wait_source(&self) -> Option<i32> {
+        (!self.eof).then(|| self.stream.as_raw_fd())
+    }
     fn new(stream: UnixStream, nonce: String) -> io::Result<Self> {
         if !nonce_valid(&nonce) {
             return Err(refused("GROUP_NONCE"));
@@ -308,6 +311,9 @@ impl Channel {
     }
 }
 impl<S: Read + Write> Channel<S> {
+    fn cleanup_buffered_event(&self) -> bool {
+        self.pending.contains(&b'\n') || (self.eof && !self.pending.is_empty())
+    }
     fn buffered_event(&self) -> bool {
         self.eof || self.pending.contains(&b'\n')
     }
@@ -484,6 +490,9 @@ struct Settlement {
     policy: CleanupPolicy,
 }
 impl Settlement {
+    fn progress_wait_end(&self) -> u64 {
+        self.progress.deadline_ns
+    }
     fn new(hard_end: u64) -> Self {
         Self::with_policy(hard_end, CleanupPolicy::Legacy)
     }
@@ -745,6 +754,18 @@ enum KeeperProgram<'a> {
     Verified(&'a super::image::VerifiedKeeperImage),
 }
 impl GroupLease {
+    // Cleanup consumes this channel on its ORIGINAL next settlement turn.
+    // Known physical EOF is omitted: a remaining Child::try_wait has no FD.
+    pub(super) fn cleanup_wait_source(&self) -> Option<i32> {
+        self.channel.cleanup_wait_source()
+    }
+    pub(super) fn cleanup_buffered_event(&self) -> bool {
+        self.channel.cleanup_buffered_event()
+    }
+    pub(super) fn progress_wait_end(&self) -> u64 {
+        // Lifetime/actual shortened cleanup end, NEVER ready_end/park_end.
+        self.settlement.progress_wait_end()
+    }
     pub(super) fn setup_buffered_event(&self) -> bool {
         self.channel.buffered_event()
     }
@@ -4285,5 +4306,103 @@ mod dev_client_keeper_policy_tests {
         );
         assert_eq!(CleanupPolicy::HookShort.reserve_ns(), 50_000_000);
         assert_eq!(CleanupPolicy::HookShort.term_ns(), 15_000_000);
+    }
+}
+
+#[cfg(test)]
+mod progress_readiness_getter_tests {
+    use super::*;
+    #[test]
+    fn cleanup_readiness_getters_preserve_partial_and_complete_buffered_frames() {
+        let (left, mut right) = UnixStream::pair().unwrap();
+        right.set_nonblocking(true).unwrap();
+        let mut channel = Channel::new(left, "a".repeat(32)).unwrap();
+        let fd = channel.stream.as_raw_fd();
+        right.write_all("a".repeat(32).as_bytes()).unwrap();
+        assert!(channel.receive().unwrap().is_none());
+        assert!(!channel.cleanup_buffered_event());
+        assert_eq!(channel.cleanup_wait_source(), Some(fd));
+        let partial = channel.pending.clone();
+        assert_eq!(channel.cleanup_wait_source(), Some(fd));
+        assert_eq!(
+            channel.pending, partial,
+            "hint consumed partial protocol bytes"
+        );
+        right
+            .write_all(format!("|PARK|7\n{}|GONE|7\n", "a".repeat(32)).as_bytes())
+            .unwrap();
+        assert_eq!(channel.receive().unwrap().as_deref(), Some("PARK|7"));
+        assert!(channel.cleanup_buffered_event());
+        let complete = channel.pending.clone();
+        assert_eq!(channel.cleanup_wait_source(), Some(fd));
+        assert!(channel.cleanup_buffered_event());
+        assert_eq!(channel.pending, complete, "hint consumed a complete GONE");
+        assert!(!channel.eof);
+        assert_eq!(channel.receive().unwrap().as_deref(), Some("GONE|7"));
+        assert!(!channel.cleanup_buffered_event());
+        assert_eq!(channel.cleanup_wait_source(), Some(fd));
+    }
+    #[test]
+    fn cleanup_readiness_omits_only_physically_observed_eof_not_peer_shutdown_hint() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut channel = Channel::new(left, "a".repeat(32)).unwrap();
+        let fd = channel.stream.as_raw_fd();
+        right.shutdown(std::net::Shutdown::Write).unwrap();
+        // A physical hangup can wake the next read, but is not yet read(0).
+        assert_eq!(channel.cleanup_wait_source(), Some(fd));
+        assert!(!channel.eof);
+        assert!(channel.receive().unwrap().is_none());
+        assert!(channel.eof);
+        assert_eq!(channel.cleanup_wait_source(), None);
+        assert!(!channel.cleanup_buffered_event());
+        // All wait-only turns now use the original no-usefulFD cadence.
+        assert_eq!(channel.cleanup_wait_source(), None);
+        assert!(channel.pending.is_empty());
+    }
+    #[test]
+    fn cleanup_readiness_end_is_actual_shortened_settlement_end_not_setup_window() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        let mut channel = Channel::new(left, "a".repeat(32)).unwrap();
+        let mut settlement = Settlement::with_policy(500_000_000, CleanupPolicy::HookShort);
+        assert_eq!(settlement.progress_wait_end(), 500_000_000);
+        assert_eq!(
+            CleanupPolicy::HookShort.setup_end(0, 500_000_000),
+            20_000_000
+        );
+        settlement.progress.phase = Phase::Parked;
+        settlement
+            .begin(300_000_000, 100_000_000, &mut channel)
+            .unwrap();
+        assert_eq!(settlement.progress_wait_end(), 150_000_000);
+        settlement
+            .begin(120_000_000, 110_000_000, &mut channel)
+            .unwrap();
+        assert_eq!(settlement.progress_wait_end(), 120_000_000);
+        settlement
+            .begin(300_000_000, 115_000_000, &mut channel)
+            .unwrap();
+        assert_eq!(settlement.progress_wait_end(), 120_000_000);
+        assert!(settlement.workload_status.is_none() && settlement.keeper_status.is_none());
+        assert!(!settlement.group_absent && !settlement.release_sent);
+        assert_eq!(settlement.progress.phase, Phase::Cleaning);
+    }
+
+    #[test]
+    fn cleanup_readiness_partial_at_physical_eof_remains_original_truncation_fault() {
+        let (left, mut right) = UnixStream::pair().unwrap();
+        right.set_nonblocking(true).unwrap();
+        let mut channel = Channel::new(left, "a".repeat(32)).unwrap();
+        right.write_all("a".repeat(32).as_bytes()).unwrap();
+        right.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(
+            channel.receive().unwrap_err().to_string(),
+            "GROUP_TRUNCATED"
+        );
+        assert!(channel.eof && !channel.pending.is_empty());
+        assert_eq!(channel.cleanup_wait_source(), None);
+        assert!(channel.cleanup_buffered_event());
+        let pending = channel.pending.clone();
+        assert!(channel.cleanup_buffered_event());
+        assert_eq!(channel.pending, pending);
     }
 }

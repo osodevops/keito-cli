@@ -124,6 +124,12 @@ trait Edge {
     fn setup_wait_source(&self) -> Option<(i32, u64)> {
         None
     }
+    fn progress_wait_sources(&self, _descriptors: &mut Vec<libc::pollfd>) -> Option<u64> {
+        None
+    }
+    fn progress_buffered_event(&self) -> bool {
+        false
+    }
     fn setup_buffered_event(&self) -> bool {
         false
     }
@@ -383,6 +389,25 @@ impl GroupEdge {
     }
 }
 impl Edge for GroupEdge {
+    fn progress_wait_sources(&self, descriptors: &mut Vec<libc::pollfd>) -> Option<u64> {
+        if self.stage.setup_pending() {
+            return None;
+        }
+        self.pipes.progress_wait_sources(descriptors);
+        if matches!(self.stage, Stage::Cleaning) {
+            if let Some(fd) = self.lease.cleanup_wait_source() {
+                descriptors.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+        }
+        Some(self.lease.progress_wait_end())
+    }
+    fn progress_buffered_event(&self) -> bool {
+        matches!(self.stage, Stage::Cleaning) && self.lease.cleanup_buffered_event()
+    }
     #[cfg(feature = "capture-profile")]
     fn repository_profile_stage(&self) -> Option<crate::capture_profile::Phase> {
         Some(self.stage.repository_profile_stage())
@@ -587,6 +612,18 @@ enum ProductEdge {
     Cooperative(CooperativeEdge),
 }
 impl Edge for ProductEdge {
+    fn progress_wait_sources(&self, descriptors: &mut Vec<libc::pollfd>) -> Option<u64> {
+        match self {
+            Self::Group(edge) => edge.progress_wait_sources(descriptors),
+            Self::Cooperative(edge) => edge.progress_wait_sources(descriptors),
+        }
+    }
+    fn progress_buffered_event(&self) -> bool {
+        match self {
+            Self::Group(edge) => edge.progress_buffered_event(),
+            Self::Cooperative(edge) => edge.progress_buffered_event(),
+        }
+    }
     #[cfg(feature = "capture-profile")]
     fn repository_profile_stage(&self) -> Option<crate::capture_profile::Phase> {
         match self {
@@ -1348,6 +1385,102 @@ impl<E: Edge> Core<E> {
             _ => Phase::RepoMixedWait,
         }
     }
+    fn progress_wait_clock(
+        &mut self,
+        clock: &mut impl FnMut() -> io::Result<u64>,
+        end: u64,
+    ) -> io::Result<u64> {
+        let at = self.admission_clock(clock)?;
+        if super::signals::pending() {
+            self.cancel(Some("SCOPE_INTERRUPTED"), at, self.hard_end);
+            return Err(error("SCOPE_INTERRUPTED"));
+        }
+        self.repository_admission_ready()?;
+        if at >= self.active_end().saturating_sub(RESERVE_NS) {
+            self.cancel(Some("SCOPE_OPERATION_DEADLINE"), at, self.active_end());
+            return Err(error("SCOPE_OPERATION_DEADLINE"));
+        }
+        if at >= end {
+            // The local end caps waiting only. Preserve every sibling
+            // cleanup allowance in the original scope cancellation envelope.
+            self.cancel(Some("SCOPE_PROOF_DEADLINE"), at, self.hard_end);
+            return Err(error("SCOPE_PROOF_DEADLINE"));
+        }
+        Ok(at)
+    }
+    fn wait_running_progress(
+        &mut self,
+        clock: &mut impl FnMut() -> io::Result<u64>,
+        poll: &mut impl FnMut(&mut [libc::pollfd], i32) -> io::Result<i32>,
+        pause: &mut impl FnMut(),
+    ) -> io::Result<()> {
+        let mut end = self.active_end().saturating_sub(RESERVE_NS);
+        let mut descriptors = Vec::new();
+        if descriptors
+            .try_reserve(self.slots.len().min(MAX_REGISTRATIONS) * 4)
+            .is_err()
+        {
+            self.poison("SCOPE_LIMIT");
+            return Err(error("SCOPE_LIMIT"));
+        }
+        let mut buffered = false;
+        for slot in self.slots.iter().filter(|slot| slot.accepted_at.is_none()) {
+            end = end
+                .min(slot.hard_end)
+                .min(slot.completion_end.unwrap_or(u64::MAX));
+            if let Some(edge_end) = slot.edge.progress_wait_sources(&mut descriptors) {
+                end = end.min(edge_end);
+            }
+            buffered |= slot.edge.progress_buffered_event();
+        }
+        if descriptors.iter().any(|fd| fd.fd < 0) {
+            self.poison("SCOPE_POLL");
+            return Err(error("SCOPE_POLL"));
+        }
+        let at = self.progress_wait_clock(clock, end)?;
+        if buffered {
+            return Ok(());
+        }
+        // Same original1ms maximum and original earliest absolute bound. The
+        // final fraction remains nonblocking; never round it up or reset it.
+        let timeout = ((end - at) / 1_000_000).min(1) as i32;
+        #[cfg(feature = "capture-profile")]
+        let phase = self.repository_wait_phase();
+        if descriptors.is_empty() {
+            // EOF/HUP already consumed: sockets cannot wake a Child::try_wait.
+            // Retain the old short polling cadence rather than spin on HUP.
+            if timeout == 0 {
+                return Ok(());
+            }
+            #[cfg(feature = "capture-profile")]
+            let _span = crate::capture_profile::Span::wait(phase, 1_000_000);
+            pause();
+        } else {
+            #[cfg(feature = "capture-profile")]
+            let outcome = {
+                let _span = crate::capture_profile::Span::wait(phase, timeout as u64 * 1_000_000);
+                poll(&mut descriptors, timeout)
+            };
+            #[cfg(not(feature = "capture-profile"))]
+            let outcome = poll(&mut descriptors, timeout);
+            match outcome {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Ok(count)
+                    if count >= 0
+                        && descriptors
+                            .iter()
+                            .all(|fd| fd.revents & libc::POLLNVAL == 0) => {}
+                _ => {
+                    self.poison("SCOPE_POLL");
+                    return Err(error("SCOPE_POLL"));
+                }
+            }
+        }
+        self.progress_wait_clock(clock, end)?;
+        // Readiness/timeout/HUP/EINTR only schedule the original next fair
+        // turn (including upstream CANCEL pumping); NONE is resource proof.
+        Ok(())
+    }
     fn wait_command_progress(
         &mut self,
         clock: &mut impl FnMut() -> io::Result<u64>,
@@ -1357,15 +1490,7 @@ impl<E: Edge> Core<E> {
         // The final admitted edge still owns its original short READY/PARK
         // window. Do not return to a blind timer while its socket can wake us.
         if self.repository_admission_ready()? {
-            #[cfg(feature = "capture-profile")]
-            {
-                let _span =
-                    crate::capture_profile::Span::wait(self.repository_wait_phase(), 1_000_000);
-                pause();
-            }
-            #[cfg(not(feature = "capture-profile"))]
-            pause();
-            Ok(())
+            self.wait_running_progress(clock, poll, pause)
         } else {
             self.wait_repository_setup(clock, poll)
         }
@@ -1441,6 +1566,16 @@ fn upstream_park_probe_allowed(work: Option<&super::protocol::PollWork>) -> bool
     work.is_none_or(|work| {
         work.reads < super::protocol::MAX_READS && work.parsed < super::protocol::MAX_PARSE
     })
+}
+
+fn wait_with_upstream_budget(
+    work: Option<&super::protocol::PollWork>,
+    wait: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if !upstream_park_probe_allowed(work) {
+        return Ok(());
+    }
+    wait()
 }
 
 fn poll_joined_after_drain<E: Edge>(
@@ -2233,19 +2368,24 @@ impl Scope {
         }
     }
     fn wait_command_progress(&mut self) -> io::Result<()> {
-        self.core.wait_command_progress(
-            &mut now,
-            &mut |fds, timeout| {
-                let result =
-                    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
-                if result < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(result)
-                }
-            },
-            &mut || std::thread::sleep(std::time::Duration::from_millis(1)),
-        )
+        // Exhausted upstream read/parse budgets require the next ORIGINAL
+        // pump/turn before any additional wait, with no cursor reset.
+        let work = self.upstream.as_ref().map(|endpoint| &endpoint.last_poll);
+        wait_with_upstream_budget(work, || {
+            self.core.wait_command_progress(
+                &mut now,
+                &mut |fds, timeout| {
+                    let result =
+                        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+                    if result < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(result)
+                    }
+                },
+                &mut || std::thread::sleep(std::time::Duration::from_millis(1)),
+            )
+        })
     }
     /// A bounded hot-path turn. Full retained reports are explicit snapshots,
     /// never an allocation/whole-registry scan on every command I/O poll.
@@ -2609,6 +2749,9 @@ mod tests {
         assert_eq!(core.slots[2].accepted_at, Some(1));
     }
     struct Fake {
+        progress_sources: Vec<(i32, i16)>,
+        progress_end: Option<u64>,
+        progress_buffered: bool,
         #[cfg(feature = "capture-profile")]
         repository_stage: Option<crate::capture_profile::Phase>,
         events: Rc<RefCell<Vec<String>>>,
@@ -2626,6 +2769,21 @@ mod tests {
         setup_trace: Option<super::super::group::SetupTrace>,
     }
     impl Edge for Fake {
+        fn progress_wait_sources(&self, descriptors: &mut Vec<libc::pollfd>) -> Option<u64> {
+            descriptors.extend(
+                self.progress_sources
+                    .iter()
+                    .map(|(fd, events)| libc::pollfd {
+                        fd: *fd,
+                        events: *events,
+                        revents: 0,
+                    }),
+            );
+            self.progress_end
+        }
+        fn progress_buffered_event(&self) -> bool {
+            self.progress_buffered
+        }
         #[cfg(feature = "capture-profile")]
         fn repository_profile_stage(&self) -> Option<crate::capture_profile::Phase> {
             self.repository_stage
@@ -2692,6 +2850,9 @@ mod tests {
     }
     fn fake(name: &'static str, events: Rc<RefCell<Vec<String>>>) -> Fake {
         Fake {
+            progress_sources: Vec::new(),
+            progress_end: None,
+            progress_buffered: false,
             #[cfg(feature = "capture-profile")]
             repository_stage: None,
             name,
@@ -4511,5 +4672,369 @@ mod tests {
             assert_eq!(core.hard_end, 500_000_000);
             assert!(core.cancel_end.is_none());
         }
+    }
+    fn running_wait_core(events: Rc<RefCell<Vec<String>>>) -> (Core<Fake>, SlotId) {
+        let mut core = Core::new(Rc::default(), 500_000_000);
+        let id = core.admit(1, 0, |_| Ok(fake("waiting", events))).unwrap();
+        core.slots[id.index].edge.progress_sources = vec![(7, libc::POLLIN)];
+        core.slots[id.index].edge.progress_end = Some(400_000_000);
+        (core, id)
+    }
+    #[test]
+    fn running_wait_retained_socket_readiness_schedules_original_turn_before_blind_pause() {
+        use std::cell::Cell;
+        // Old blind branch advances1ms, missing the original200us boundary.
+        let at = Cell::new(100_000_000u64);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let (mut core, id) = running_wait_core(events.clone());
+        let pauses = Cell::new(0);
+        core.wait_command_progress(
+            &mut || Ok(at.get()),
+            &mut |fds, timeout| {
+                assert_eq!(timeout, 1);
+                assert_eq!(fds[0].fd, 7);
+                at.set(100_100_000);
+                fds[0].revents = libc::POLLIN | libc::POLLHUP;
+                Ok(1)
+            },
+            &mut || {
+                pauses.set(pauses.get() + 1);
+                at.set(at.get() + 1_000_000);
+            },
+        )
+        .unwrap();
+        assert_eq!(pauses.get(), 0);
+        assert!(
+            at.get() < 100_200_000,
+            "blind pause postponed original GONE/EOF parser turn"
+        );
+        assert!(events.borrow().is_empty());
+        core.poll(&mut || Ok(at.get()));
+        assert_eq!(events.borrow().as_slice(), ["poll:waiting"]);
+        assert!(core.slots[id.index].accepted_at.is_none());
+        assert!(!core.slots[id.index].output_taken);
+        assert!(!core.slots[id.index].edge.facts().resources_complete());
+    }
+    #[test]
+    fn running_wait_caps_to_earliest_original_end_and_floors_final_fraction() {
+        for (slot_end, completion_end, edge_end, at, expected) in [
+            (500_000_000, None, 400_000_000, 100_000_000, 1),
+            (100_900_000, None, 400_000_000, 100_000_000, 0),
+            (500_000_000, Some(100_700_000), 400_000_000, 100_000_000, 0),
+            (500_000_000, None, 100_999_999, 100_000_000, 0),
+            (500_000_000, None, 500_000_000, 449_500_000, 0),
+        ] {
+            let (mut core, id) = running_wait_core(Rc::default());
+            core.slots[id.index].hard_end = slot_end;
+            core.slots[id.index].completion_end = completion_end;
+            core.slots[id.index].edge.progress_end = Some(edge_end);
+            let mut polls = 0;
+            core.wait_command_progress(
+                &mut || Ok(at),
+                &mut |_, timeout| {
+                    polls += 1;
+                    assert_eq!(timeout, expected);
+                    Ok(0)
+                },
+                &mut || panic!("useful retainedFD became blind pause"),
+            )
+            .unwrap();
+            assert_eq!(polls, 1);
+            assert_eq!(core.slots[id.index].hard_end, slot_end);
+            assert_eq!(core.slots[id.index].completion_end, completion_end);
+            assert!(core.slots[id.index].accepted_at.is_none());
+        }
+    }
+    #[test]
+    fn running_wait_buffered_frame_schedules_parser_but_partial_without_fd_keeps_pause() {
+        for (buffered, expected_pauses) in [(true, 0), (false, 1)] {
+            let (mut core, id) = running_wait_core(Rc::default());
+            // No usefulFD after actual EOF, or partial bytes without anFD.
+            core.slots[id.index].edge.progress_sources.clear();
+            core.slots[id.index].edge.progress_buffered = buffered;
+            let mut pauses = 0;
+            core.wait_command_progress(
+                &mut || Ok(100_000_000),
+                &mut |_, _| panic!("no useful source was polled"),
+                &mut || pauses += 1,
+            )
+            .unwrap();
+            assert_eq!(pauses, expected_pauses);
+            assert!(core.slots[id.index].accepted_at.is_none());
+            assert!(!core.slots[id.index].edge.facts().waits_known);
+        }
+    }
+    #[test]
+    fn running_wait_no_fd_final_fraction_does_not_sleep_past_earliest_end() {
+        let (mut core, id) = running_wait_core(Rc::default());
+        core.slots[id.index].edge.progress_sources.clear();
+        core.slots[id.index].completion_end = Some(100_999_999);
+        core.wait_command_progress(
+            &mut || Ok(100_000_000),
+            &mut |_, _| panic!("absentFD poll"),
+            &mut || panic!("final fraction rounded up"),
+        )
+        .unwrap();
+        assert!(core.slots[id.index].accepted_at.is_none());
+    }
+    #[test]
+    fn running_wait_invalid_fd_clock_and_expiry_refuse_before_poll() {
+        for kind in ["invalid", "clock", "completion", "operation"] {
+            let (mut core, id) = running_wait_core(Rc::default());
+            if kind == "invalid" {
+                core.slots[id.index].edge.progress_sources[0].0 = -1;
+            }
+            if kind == "completion" {
+                core.slots[id.index].completion_end = Some(100_000_000);
+            }
+            let mut polls = 0;
+            let mut pauses = 0;
+            let result = core.wait_command_progress(
+                &mut || {
+                    if kind == "clock" {
+                        Err(error("INJECTED_CLOCK"))
+                    } else if kind == "operation" {
+                        Ok(450_000_000)
+                    } else {
+                        Ok(100_000_000)
+                    }
+                },
+                &mut |_, _| {
+                    polls += 1;
+                    Ok(0)
+                },
+                &mut || pauses += 1,
+            );
+            assert!(result.is_err());
+            assert_eq!((polls, pauses), (0, 0));
+            assert!(core.owner.borrow().first_fault.is_some());
+            assert!(core.slots[id.index].accepted_at.is_none());
+            assert!(!core.slots[id.index].output_taken);
+            if kind == "clock" {
+                assert_eq!(core.cancel_end, Some(0));
+                assert_eq!(core.slots[id.index].completion_end, Some(0));
+            }
+        }
+    }
+    #[test]
+    fn running_wait_eintr_hup_timeout_are_not_proof_and_poll_faults_stick() {
+        for kind in ["eintr", "hup", "timeout", "nval", "negative", "error"] {
+            let (mut core, id) = running_wait_core(Rc::default());
+            let result = core.wait_command_progress(
+                &mut || Ok(100_000_000),
+                &mut |fds, _| match kind {
+                    "eintr" => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                    "hup" => {
+                        fds[0].revents = libc::POLLHUP;
+                        Ok(1)
+                    }
+                    "nval" => {
+                        fds[0].revents = libc::POLLNVAL;
+                        Ok(1)
+                    }
+                    "negative" => Ok(-1),
+                    "error" => Err(io::Error::from(io::ErrorKind::Other)),
+                    _ => Ok(0),
+                },
+                &mut || panic!("unexpected blind pause"),
+            );
+            assert_eq!(
+                result.is_err(),
+                matches!(kind, "nval" | "negative" | "error")
+            );
+            assert!(core.slots[id.index].accepted_at.is_none());
+            assert!(!core.slots[id.index].edge.facts().waits_known);
+            assert!(!core.slots[id.index].edge.facts().terminal_eof);
+            assert!(!core.slots[id.index].output_taken);
+        }
+    }
+    #[test]
+    fn running_wait_rechecks_original_end_and_owner_after_wakeup() {
+        use std::cell::Cell;
+        for fault in [false, true] {
+            let (mut core, id) = running_wait_core(Rc::default());
+            core.slots[id.index].completion_end = Some(100_500_000);
+            let owner = core.owner.clone();
+            let at = Cell::new(100_000_000);
+            let result = core.wait_command_progress(
+                &mut || Ok(at.get()),
+                &mut |_, _| {
+                    if fault {
+                        owner.borrow_mut().poison(ProtocolError("ORIGINAL_FAULT"));
+                    } else {
+                        at.set(100_500_000);
+                    }
+                    Ok(1)
+                },
+                &mut || panic!("unexpected blind pause"),
+            );
+            assert!(result.is_err());
+            assert!(core.slots[id.index].accepted_at.is_none());
+            assert!(!core.slots[id.index].output_taken);
+            if fault {
+                assert_eq!(
+                    core.owner.borrow().first_fault,
+                    Some(ProtocolError("ORIGINAL_FAULT"))
+                );
+            } else {
+                assert_eq!(core.cancel_end, Some(150_500_000));
+                assert_eq!(core.slots[id.index].completion_end, Some(100_500_000));
+            }
+        }
+    }
+    #[test]
+    fn running_wait_local_expiry_preserves_sibling_cleanup_envelope() {
+        use std::cell::Cell;
+        for expired_before_wait in [true, false] {
+            let (mut core, expired) = running_wait_core(Rc::default());
+            let sibling = core
+                .admit(2, 0, |_| Ok(fake("sibling", Rc::default())))
+                .unwrap();
+            core.request_complete(&expired, 100_000_000).unwrap();
+            core.slots[expired.index].edge.progress_end = Some(150_000_000);
+            let at = Cell::new(if expired_before_wait {
+                150_000_000
+            } else {
+                149_000_000
+            });
+            let mut polls = 0;
+            let result = core.wait_command_progress(
+                &mut || Ok(at.get()),
+                &mut |_, _| {
+                    polls += 1;
+                    at.set(150_000_000);
+                    Ok(0)
+                },
+                &mut || panic!("retained source became blind pause"),
+            );
+            assert!(result.is_err());
+            assert_eq!(polls, usize::from(!expired_before_wait));
+            assert_eq!(core.cancel_end, Some(200_000_000));
+            assert_eq!(core.slots[expired.index].completion_end, Some(150_000_000));
+            assert_eq!(core.slots[sibling.index].completion_end, Some(200_000_000));
+            assert_eq!(
+                core.slots[expired.index].edge.begin_ends,
+                [150_000_000, 150_000_000]
+            );
+            assert_eq!(core.slots[sibling.index].edge.begin_ends, [200_000_000]);
+            assert!(core
+                .slots
+                .iter()
+                .all(|slot| slot.accepted_at.is_none() && !slot.output_taken));
+        }
+    }
+    #[test]
+    fn running_wait_does_not_reset_cursor_or_release_a_partial_repository_cohort() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut core = Core::new(Rc::default(), 500_000_000);
+        let mut ids = Vec::new();
+        for _ in 0..9 {
+            ids.push(
+                core.admit(1, 0, |_| Ok(fake("slot", events.clone())))
+                    .unwrap(),
+            );
+        }
+        core.cursor = 8;
+        core.slots[8].edge.progress_sources = vec![(7, libc::POLLIN)];
+        core.wait_command_progress(&mut || Ok(100_000_000), &mut |_, _| Ok(1), &mut || {
+            panic!("blind pause")
+        })
+        .unwrap();
+        assert_eq!(core.cursor, 8);
+        assert!(events.borrow().is_empty());
+        core.poll(&mut || Ok(100_000_000));
+        assert_eq!(events.borrow().len(), SLOTS_PER_TURN);
+        assert_eq!(core.cursor, 7);
+        assert!(core
+            .take_repository_results(&[ids[0].clone(), ids[8].clone()])
+            .unwrap()
+            .is_none());
+        assert!(core
+            .slots
+            .iter()
+            .all(|slot| slot.accepted_at.is_none() && !slot.output_taken));
+    }
+    #[test]
+    fn running_wait_upstream_budget_defers_wait_for_original_cancel_pump() {
+        use super::super::protocol::{PollWork, MAX_PARSE, MAX_READS};
+        for (reads, parsed, expected) in [
+            (MAX_READS, 0, 0),
+            (0, MAX_PARSE, 0),
+            (MAX_READS - 1, MAX_PARSE - 1, 1),
+        ] {
+            let work = PollWork { reads, parsed };
+            let mut waits = 0;
+            wait_with_upstream_budget(Some(&work), || {
+                waits += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(waits, expected);
+        }
+        let mut waits = 0;
+        wait_with_upstream_budget(None, || {
+            waits += 1;
+            Err(error("ORIGINAL_WAIT"))
+        })
+        .unwrap_err();
+        assert_eq!(waits, 1);
+    }
+
+    #[test]
+    fn running_wait_ready_sibling_does_not_release_previously_accepted_cohort_output() {
+        let (mut core, pending) = running_wait_core(Rc::default());
+        let accepted = core
+            .admit(2, 0, |_| Ok(fake("accepted", Rc::default())))
+            .unwrap();
+        core.slots[accepted.index].accepted_at = Some(3);
+        core.slots[accepted.index].edge.facts = EdgeFacts {
+            status: Some(ExitStatus::from_raw(0)),
+            waits_known: true,
+            group_absent: true,
+            terminal_eof: true,
+            resource_proof: true,
+            ..Default::default()
+        };
+        core.wait_command_progress(
+            &mut || Ok(100_000_000),
+            &mut |fds, _| {
+                fds[0].revents = libc::POLLIN;
+                Ok(1)
+            },
+            &mut || panic!("blind pause"),
+        )
+        .unwrap();
+        assert!(core
+            .take_repository_results(&[accepted.clone(), pending.clone()])
+            .unwrap()
+            .is_none());
+        assert_eq!(core.slots[accepted.index].accepted_at, Some(3));
+        assert!(!core.slots[accepted.index].output_taken);
+        assert!(core.slots[pending.index].accepted_at.is_none());
+        assert!(!core.slots[pending.index].output_taken);
+    }
+    #[test]
+    fn running_wait_clock_failure_after_wakeup_broadcasts_zero_without_proof() {
+        use std::cell::Cell;
+        let (mut core, id) = running_wait_core(Rc::default());
+        let reads = Cell::new(0);
+        assert!(core
+            .wait_command_progress(
+                &mut || {
+                    reads.set(reads.get() + 1);
+                    if reads.get() == 1 {
+                        Ok(100_000_000)
+                    } else {
+                        Err(error("INJECTED_CLOCK"))
+                    }
+                },
+                &mut |_, _| Ok(1),
+                &mut || panic!("blind pause")
+            )
+            .is_err());
+        assert_eq!(core.cancel_end, Some(0));
+        assert_eq!(core.slots[id.index].completion_end, Some(0));
+        assert!(core.slots[id.index].accepted_at.is_none());
+        assert!(!core.slots[id.index].output_taken);
     }
 }

@@ -40,6 +40,20 @@ pub struct Marker {
     #[cfg(unix)]
     preparing: bool,
 }
+#[cfg(feature = "dev-tools")]
+impl Marker {
+    /// State already validated by the existing strict snapshot; no new probe.
+    pub(crate) fn preparing_state(&self) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            Some(self.preparing)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+}
 /// Capture state follows effective-user passwd HOME, never a hook's HOME/CWD.
 pub fn directory() -> Result<PathBuf, AppError> {
     if let Some(path) = std::env::var_os("KEITO_CAPTURE_HOME") {

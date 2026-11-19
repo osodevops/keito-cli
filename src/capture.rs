@@ -815,6 +815,10 @@ struct CaptureTransaction<'a> {
     _authority: AuthorityGuard,
     directory: PathBuf,
     invocation: Option<Permit>,
+    #[cfg(feature = "dev-tools")]
+    admitted_at: std::time::Instant,
+    #[cfg(feature = "dev-tools")]
+    timing: &'a AdmissionTiming,
 }
 impl<'a> std::ops::Deref for CaptureTransaction<'a> {
     type Target = Transaction<'a>;
@@ -843,11 +847,27 @@ impl CaptureTransaction<'_> {
             _authority,
             directory,
             invocation,
+            #[cfg(feature = "dev-tools")]
+            admitted_at,
+            #[cfg(feature = "dev-tools")]
+            timing,
         } = self;
         if let Some(invocation) = invocation {
             crate::capture_profile_measure!(PermitValidation, invocation.validate(&directory))?;
         }
-        crate::capture_profile_measure!(Commit, inner.commit()).map_err(storage_error)?;
+        #[cfg(feature = "dev-tools")]
+        let commit_started = {
+            // Includes authority acquisition and every fresh check before commit.
+            // This receipt describes only transactions reaching commit admission.
+            timing
+                .transaction_before_commit
+                .set(Some(admitted_at.elapsed()));
+            std::time::Instant::now()
+        };
+        let committed = crate::capture_profile_measure!(Commit, inner.commit());
+        #[cfg(feature = "dev-tools")]
+        timing.commit.set(Some(commit_started.elapsed()));
+        committed.map_err(storage_error)?;
         drop(_authority);
         Ok(())
     }
@@ -860,6 +880,11 @@ pub struct AdmissionTiming {
     pub sqlite_begin: Option<Duration>,
     pub sqlite_error: Option<rusqlite::ErrorCode>,
     pub authority: Option<Duration>,
+    /// After successful BEGIN through final permit validation, before COMMIT.
+    /// None means no commit-admission receipt, not a zero-duration transaction.
+    pub transaction_before_commit: std::cell::Cell<Option<Duration>>,
+    /// The original COMMIT call, including its failure/rollback path if any.
+    pub commit: std::cell::Cell<Option<Duration>>,
 }
 
 pub struct Store {
@@ -1147,6 +1172,8 @@ impl Store {
         }
         let inner = admission.map_err(storage_error)?;
         #[cfg(feature = "dev-tools")]
+        let admitted_at = std::time::Instant::now();
+        #[cfg(feature = "dev-tools")]
         let authority_started = std::time::Instant::now();
         let authority = crate::capture_profile_measure!(
             AuthorityAcquire,
@@ -1166,6 +1193,10 @@ impl Store {
             _authority: authority,
             directory,
             invocation,
+            #[cfg(feature = "dev-tools")]
+            admitted_at,
+            #[cfg(feature = "dev-tools")]
+            timing: self.last_admission_timing.as_ref().unwrap(),
         };
         let markers = capture_invocations::snapshot(&tx.directory)?;
         for marker in markers.iter().filter(|m| !m.live) {
@@ -2691,6 +2722,20 @@ impl Store {
                         })
                         .then_some(true)
                 });
+                // State belongs to this same non-atomic snapshot, not a cause.
+                let dead_state_match = |preparing| {
+                    invocations.as_ref().and_then(|snapshot| {
+                        snapshot
+                            .iter()
+                            .any(|marker| {
+                                !marker.live
+                                    && marker.preparing_state() == Some(preparing)
+                                    && hash(format!("INVOCATION\0{}", marker.nonce))
+                                        == failure.boundary_id
+                            })
+                            .then_some(true)
+                    })
+                };
                 serde_json::json!({
                     "selection_index": index,
                     "selected_for_status": index == 0,
@@ -2698,6 +2743,8 @@ impl Store {
                     "filename_boundary_match": filename_boundary_match,
                     "invocation_nonce_match": invocation_nonce_match,
                     "dead_invocation_boundary_match": dead_invocation_boundary_match,
+                    "dead_preparing_invocation_boundary_match": dead_state_match(true),
+                    "dead_pending_invocation_boundary_match": dead_state_match(false),
                 })
             })
             .collect();
@@ -2758,10 +2805,7 @@ impl Store {
         // Hold authority through commit and exact snapshot removal. New fallback
         // publications have unique names and therefore cannot be removed here.
         let CaptureTransaction {
-            inner,
-            _authority,
-            directory: _,
-            invocation: _,
+            inner, _authority, ..
         } = tx;
         inner.commit().map_err(storage_error)?;
         capture_invocations::remove_dead(&directory, &invocations)?;
@@ -3393,7 +3437,9 @@ mod failure_summary_tests {
             .prefix("PRIVATE_SUMMARY_PATH_")
             .tempdir()
             .unwrap();
-        let store = Store::open(directory.path()).unwrap();
+        // macOS temporary paths can traverse /var -> /private/var.
+        // Supply the real path to the production no-symlink admission checks.
+        let store = Store::open(&directory.path().canonicalize().unwrap()).unwrap();
         (directory, store)
     }
     fn probe() -> HookFailureProbe {
@@ -3454,6 +3500,15 @@ mod failure_summary_tests {
         let bytes = serde_json::to_vec(&summary).unwrap();
         assert!(bytes.len() <= 16 * 1024);
         assert!(!String::from_utf8(bytes).unwrap().contains("PRIVATE"));
+        for record in summary["records"].as_array().unwrap() {
+            for key in [
+                "dead_preparing_invocation_boundary_match",
+                "dead_pending_invocation_boundary_match",
+            ] {
+                assert!(record.as_object().unwrap().contains_key(key));
+                assert!(record[key].is_null() || record[key] == true);
+            }
+        }
         summary
     }
 
@@ -3511,6 +3566,14 @@ mod failure_summary_tests {
         assert_eq!(records[1]["dead_invocation_boundary_match"], true);
         assert_eq!(records[1]["filename_boundary_match"], false);
         assert_eq!(records[2]["dead_invocation_boundary_match"], true);
+        assert_eq!(records[1]["dead_preparing_invocation_boundary_match"], true);
+        assert!(records[1]["dead_pending_invocation_boundary_match"].is_null());
+        assert_eq!(records[2]["dead_pending_invocation_boundary_match"], true);
+        assert!(records[2]["dead_preparing_invocation_boundary_match"].is_null());
+        for index in [0, 3, 4] {
+            assert!(records[index]["dead_preparing_invocation_boundary_match"].is_null());
+            assert!(records[index]["dead_pending_invocation_boundary_match"].is_null());
+        }
         assert_eq!(records[3]["failure"]["probe"]["phase"], "permit");
         assert!(records[3]["dead_invocation_boundary_match"].is_null());
         assert_eq!(records[4]["invocation_nonce_match"], true);
@@ -3562,6 +3625,8 @@ mod failure_summary_tests {
         assert_eq!(value["invocation_snapshot"], "unknown");
         assert!(value["records"][0]["invocation_nonce_match"].is_null());
         assert!(value["records"][0]["dead_invocation_boundary_match"].is_null());
+        assert!(value["records"][0]["dead_preparing_invocation_boundary_match"].is_null());
+        assert!(value["records"][0]["dead_pending_invocation_boundary_match"].is_null());
     }
 
     #[test]
@@ -3576,10 +3641,13 @@ mod failure_summary_tests {
             false,
             b"KEITO_CAPTURE_PENDING_V1\n",
         );
+        let before = summary(&store);
+        assert_eq!(before["records"][0]["dead_invocation_boundary_match"], true);
         assert_eq!(
-            summary(&store)["records"][0]["dead_invocation_boundary_match"],
+            before["records"][0]["dead_pending_invocation_boundary_match"],
             true
         );
+        assert!(before["records"][0]["dead_preparing_invocation_boundary_match"].is_null());
         fs::remove_file(path).unwrap();
         let value = summary(&store);
         assert_eq!(value["invocation_snapshot"], "observed");
@@ -3589,6 +3657,8 @@ mod failure_summary_tests {
             "marker_status_and_invocation_reads_are_not_atomic"
         );
         assert!(value["records"][0]["dead_invocation_boundary_match"].is_null());
+        assert!(value["records"][0]["dead_preparing_invocation_boundary_match"].is_null());
+        assert!(value["records"][0]["dead_pending_invocation_boundary_match"].is_null());
     }
 
     #[test]
