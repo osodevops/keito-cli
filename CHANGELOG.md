@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.2.0] - 2026-11-08
+## [0.2.0-rc.1] - 2026-11-19
+
+Opt-in prerelease candidate; stable update channels remain unchanged. Supported client/platform combinations and live capture require the corresponding final-artifact qualification and release notes.
 
 ### Added
 

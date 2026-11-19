@@ -336,7 +336,15 @@ mod unix {
         }
         Ok(count)
     }
-    fn publish_capacity_refusal(state: &File, nonce: &str) -> Result<(), ()> {
+    enum PrelaunchRefusal {
+        Capacity,
+        Boundary,
+    }
+    fn publish_prelaunch_refusal(
+        state: &File,
+        nonce: &str,
+        reason: PrelaunchRefusal,
+    ) -> Result<(), ()> {
         // Existing refusal saturation already forces a paused core. Never
         // evict another unresolved boundary to make room for this one.
         if count_entries(state, Some(b"capture-refusal-"))? >= 1024 {
@@ -350,7 +358,13 @@ mod unix {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
         )?;
         let now = unsafe { libc::time(std::ptr::null_mut()) };
-        let bytes=format!("{{\"reason\":\"QUEUE_LIMIT_REACHED\",\"boundary_id\":\"{nonce}\",\"observed_at\":{now}}}");
+        let reason = match reason {
+            PrelaunchRefusal::Capacity => "QUEUE_LIMIT_REACHED",
+            PrelaunchRefusal::Boundary => "BOUNDARY_REFUSED",
+        };
+        let bytes = format!(
+            "{{\"reason\":\"{reason}\",\"boundary_id\":\"{nonce}\",\"observed_at\":{now}}}"
+        );
         file.write_all(bytes.as_bytes()).map_err(|_| ())?;
         sync(&file)?;
         if unsafe {
@@ -365,6 +379,38 @@ mod unix {
             return Err(());
         }
         sync(state)
+    }
+    fn prepare_marker_with(
+        state: &File,
+        publication: &File,
+        nonce: &str,
+        serialize: bool,
+        create: impl FnOnce() -> Result<File, ()>,
+    ) -> Result<Option<File>, ()> {
+        // Darwin's O_EXLOCK makes create+ownership atomic. Linux has no such
+        // open flag: serialize ONLY visible creation and the original flock
+        // against the existing scanner's publication barrier. Never hold this
+        // barrier across marker writes/fsync or expensive core preparation.
+        if serialize && !lock(publication) {
+            // A bounded admission failure is still a lost boundary. Preserve
+            // immutable evidence without requiring the contended lock.
+            publish_prelaunch_refusal(state, nonce, PrelaunchRefusal::Boundary)?;
+            return Ok(None);
+        }
+        let result = create().and_then(|marker| if lock(&marker) { Ok(marker) } else { Err(()) });
+        if serialize {
+            unlock(publication);
+        }
+        if !serialize {
+            return result.map(Some); // Retain the original atomic Darwin path.
+        }
+        match result {
+            Ok(marker) => Ok(Some(marker)),
+            Err(()) => {
+                publish_prelaunch_refusal(state, nonce, PrelaunchRefusal::Boundary)?;
+                Ok(None)
+            }
+        }
     }
     pub fn run(args: &[std::ffi::OsString]) -> Result<(), ()> {
         // This entry owns no Child before publication. Signals only latch,
@@ -424,7 +470,7 @@ mod unix {
         }
         let nonce: String = random.iter().map(|b| format!("{b:02x}")).collect();
         if count_entries(&flags, None).map_err(|_| ())? >= 1024 {
-            publish_capacity_refusal(&state, &nonce)?;
+            publish_prelaunch_refusal(&state, &nonce, PrelaunchRefusal::Capacity)?;
             return Ok(());
         }
         let preparing = format!("{nonce}.preparing");
@@ -433,10 +479,16 @@ mod unix {
         // Darwin can atomically create and lock the visible preparation.
         #[cfg(target_os = "macos")]
         let marker_flags = marker_flags | libc::O_EXLOCK;
-        let mut marker = open(&flags, &preparing, marker_flags)?;
-        if !lock(&marker) {
-            return Err(());
-        }
+        let Some(mut marker) = prepare_marker_with(
+            &state,
+            &publication,
+            &nonce,
+            cfg!(not(target_os = "macos")),
+            || open(&flags, &preparing, marker_flags),
+        )?
+        else {
+            return Ok(());
+        };
         marker.write_all(PENDING).map_err(|_| ())?;
         sync(&marker)?;
         sync(&flags)?;
@@ -706,6 +758,75 @@ mod unix {
                 .mode(0o600)
                 .open(path)
                 .unwrap()
+        }
+        #[test]
+        fn preparing_visibility_is_serialized_until_original_marker_is_locked() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = File::open(temp.path()).unwrap();
+            let publication_path = temp.path().join("publication.lock");
+            let publication = owned_file(&publication_path);
+            let nonce = "b".repeat(64);
+            let marker_path = temp.path().join("marker.preparing");
+            let marker = prepare_marker_with(&state, &publication, &nonce, true, || {
+                let file = owned_file(&marker_path);
+                let observer = File::open(&publication_path).unwrap();
+                assert_ne!(
+                    unsafe { libc::flock(observer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0,
+                    "an observer must not classify the visible but not-yet-locked preparation as dead"
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                Ok(file)
+            })
+            .unwrap()
+            .unwrap();
+            let observer = File::open(&publication_path).unwrap();
+            assert_eq!(
+                unsafe { libc::flock(observer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0,
+                "publication must be released before writes/fsync or core preparation"
+            );
+            let probe = File::open(&marker_path).unwrap();
+            assert_ne!(
+                unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+                0
+            );
+            drop(marker);
+            assert_eq!(
+                unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+                0,
+                "an abandoned original marker remains dead, never ignored"
+            );
+        }
+        #[test]
+        fn preparing_publication_contention_preserves_lock_independent_failure_evidence() {
+            let temp = tempfile::tempdir().unwrap();
+            let state = File::open(temp.path()).unwrap();
+            let path = temp.path().join("publication.lock");
+            let held = owned_file(&path);
+            assert!(lock(&held));
+            let publication = File::open(&path).unwrap();
+            let nonce = "c".repeat(64);
+            let mut created = false;
+            let marker = prepare_marker_with(&state, &publication, &nonce, true, || {
+                created = true;
+                Err(())
+            })
+            .unwrap();
+            assert!(marker.is_none());
+            assert!(
+                !created,
+                "publication refusal must precede a visible unlocked preparation"
+            );
+            let evidence: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(temp.path().join(format!("capture-refusal-{nonce}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(evidence["reason"], "BOUNDARY_REFUSED");
+            assert_eq!(evidence["boundary_id"], nonce);
         }
         #[test]
         fn rename_flush_releases_publication_but_retains_guardian_marker_lock() {

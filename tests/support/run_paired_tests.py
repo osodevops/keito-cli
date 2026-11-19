@@ -80,12 +80,14 @@ def main(arguments):
     git_directory = str(Path(git).resolve(strict=True).parent)
     environment["KEITO_TEST_PROCESS_PATH"] = os.pathsep.join([git_directory, "/usr/bin", "/bin"])
     environment["PATH"] = environment["KEITO_TEST_PROCESS_PATH"] + os.pathsep + environment["PATH"]
-    # The production deadlines include hashing the complete executable. Debug
-    # symbols and unoptimized SHA would test a different workload. Match the
-    # existing owned source-fixture QA's opt2 profile, without relaxing a bound.
+    # Exercise the production optimization/LTO/codegen footprint without changing
+    # fixture checked semantics, dev-tools negative seams, or any runtime bound.
+    # DEV/TEST keep their debug assertions and overflow checks explicitly; this
+    # remains a source-fixture pair, not the normal release artifact.
     for profile in ("DEV", "TEST"):
-        for key, value in {"OPT_LEVEL": "2", "DEBUG": "0", "STRIP": "symbols",
-                           "LTO": "false", "CODEGEN_UNITS": "8"}.items():
+        for key, value in {"OPT_LEVEL": "3", "DEBUG": "0", "STRIP": "symbols",
+                           "LTO": "true", "CODEGEN_UNITS": "1",
+                           "DEBUG_ASSERTIONS": "true", "OVERFLOW_CHECKS": "true"}.items():
             environment["CARGO_PROFILE_" + profile + "_" + key] = value
     environment.setdefault("RUST_TEST_THREADS", "1")
     target = next(line.split(": ", 1)[1] for line in subprocess.check_output(

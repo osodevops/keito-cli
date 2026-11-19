@@ -882,6 +882,82 @@ fn removed_harness_and_reapproval_cannot_count_the_unapproved_interval() {
 }
 #[cfg(unix)]
 #[test]
+fn abandoned_preparation_refusal_holds_completed_stop_and_survives_marker_removal() {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    let (dir, mut store, binding) = setup();
+    event(
+        &mut store,
+        "completed-before-preparation",
+        Some("turn"),
+        Prompt,
+        0,
+    );
+    event(
+        &mut store,
+        "completed-before-preparation",
+        Some("turn"),
+        Stop,
+        30,
+    );
+    let (frozen, _) = body(&mut store, &binding, 31);
+    let root = dir.path().join("capture");
+    let flags = root.join("capture-invocations");
+    std::fs::create_dir_all(&flags).unwrap();
+    std::fs::set_permissions(&flags, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let nonce = capture::hash("visible-abandoned-preparation");
+    let path = flags.join(format!("{nonce}.preparing"));
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    // No live owner: this must be a genuine immutable refusal even though an
+    // identical Stop has already committed COMPLETE evidence.
+    store.maintain(clock(32).wall).unwrap();
+    let failure = store.status().unwrap().capture_failure.unwrap();
+    assert_eq!(failure.reason, "BOUNDARY_REFUSED");
+    assert_eq!(
+        failure.boundary_id,
+        capture::hash(format!("INVOCATION\0{nonce}"))
+    );
+    // A later lock or disappearance cannot rehabilitate a classified refusal.
+    assert_eq!(
+        unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    use std::io::Write;
+    marker.write_all(b"KEITO_CAPTURE_PENDING_V1\n").unwrap();
+    marker.sync_all().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    drop(marker);
+    let status = store.status().unwrap();
+    assert_eq!(status.pending_invocations, 0);
+    assert!(status.storage_paused);
+    assert_eq!(status.held, 1);
+    let session = store
+        .preview("completed-before-preparation")
+        .unwrap()
+        .remove(0);
+    assert_eq!(session.revision, 1);
+    assert_eq!(session.segments.len(), 1);
+    assert_eq!(session.segments[0].completeness, "COMPLETE");
+    assert!(session.needs_attention);
+    let db = rusqlite::Connection::open(root.join("capture.sqlite3")).unwrap();
+    let retained: String = db
+        .query_row("SELECT body FROM outbox WHERE id=?1", [frozen.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(retained, frozen.body);
+    assert!(store.claim(&binding, clock(34).wall).unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn refused_stop_cannot_be_replaced_by_the_time_of_a_later_duplicate_stop() {
     let (dir, mut store, _) = setup();
     event(&mut store, "refused-stop", Some("turn"), Prompt, 0);

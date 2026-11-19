@@ -33,6 +33,14 @@ class PairFixtures(unittest.TestCase):
                 # phase, never the rustup shim found through PATH.
                 for call in launch.call_args_list:
                     self.assertEqual(call.kwargs["env"].get("RUSTC"), "fixture-rustc")
+                    self.assertIn("--all-features", call.args[0])
+                    for profile in ("DEV", "TEST"):
+                        for key, value in {"OPT_LEVEL": "3", "DEBUG": "0",
+                                           "STRIP": "symbols", "LTO": "true",
+                                           "CODEGEN_UNITS": "1", "DEBUG_ASSERTIONS": "true",
+                                           "OVERFLOW_CHECKS": "true"}.items():
+                            self.assertEqual(call.kwargs["env"].get(
+                                "CARGO_PROFILE_" + profile + "_" + key), value)
 
     def test_each_running_image_has_its_own_binding_and_tampering_breaks_it(self):
         with tempfile.TemporaryDirectory() as directory:
