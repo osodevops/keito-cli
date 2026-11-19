@@ -2625,6 +2625,101 @@ impl Store {
             .filter_map(|(_, failure)| failure.probe)
             .collect())
     }
+    /// Failure-only source-fixture summary, never a normal capture hot path.
+    /// Selection order is the status reader's order, not causal chronology.
+    /// Missing associations remain unknown even after a successful snapshot.
+    /// selected_for_status describes this marker snapshot; reads are not atomic.
+    #[cfg(feature = "dev-tools")]
+    pub fn developer_failure_summary(&self) -> Result<serde_json::Value, AppError> {
+        const SAMPLE_LIMIT: usize = 8;
+        const BYTE_LIMIT: usize = 16 * 1024;
+        let markers = read_failure_markers(&self.directory)?;
+        let invocations = capture_invocations::snapshot(&self.directory).ok();
+        let total = markers.len();
+        let probed = markers.iter().filter(|(_, f)| f.probe.is_some()).count();
+        // Keep the selected marker and at least one of each observed probe kind.
+        let mut selected = Vec::new();
+        if total > 0 {
+            selected.push(0);
+        }
+        for has_probe in [false, true] {
+            if let Some(index) = markers
+                .iter()
+                .position(|(_, f)| f.probe.is_some() == has_probe)
+            {
+                if !selected.contains(&index) {
+                    selected.push(index);
+                }
+            }
+        }
+        for index in 0..total {
+            if selected.len() == SAMPLE_LIMIT {
+                break;
+            }
+            if !selected.contains(&index) {
+                selected.push(index);
+            }
+        }
+        selected.sort_unstable();
+        let records: Vec<_> = selected
+            .into_iter()
+            .map(|index| {
+                let (path, failure) = &markers[index];
+                let filename_boundary_match = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("capture-refusal-"))
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .filter(|suffix| {
+                        suffix.len() == 64 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                    .map(|suffix| suffix == failure.boundary_id);
+                // Positive relations only: a missing/raced snapshot is not absence.
+                let invocation_nonce_match = invocations.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .iter()
+                        .any(|marker| marker.nonce == failure.boundary_id)
+                        .then_some(true)
+                });
+                let dead_invocation_boundary_match = invocations.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .iter()
+                        .any(|marker| {
+                            !marker.live
+                                && hash(format!("INVOCATION\0{}", marker.nonce))
+                                    == failure.boundary_id
+                        })
+                        .then_some(true)
+                });
+                serde_json::json!({
+                    "selection_index": index,
+                    "selected_for_status": index == 0,
+                    "failure": failure,
+                    "filename_boundary_match": filename_boundary_match,
+                    "invocation_nonce_match": invocation_nonce_match,
+                    "dead_invocation_boundary_match": dead_invocation_boundary_match,
+                })
+            })
+            .collect();
+        let summary = serde_json::json!({
+            "selection_order": "observed_at_seconds_then_filename_not_causal",
+            "association_missing": "UNKNOWN",
+            "snapshot_relation": "marker_status_and_invocation_reads_are_not_atomic",
+            "invocation_snapshot": if invocations.is_some() { "observed" } else { "unknown" },
+            "total_records": total,
+            "probed_records": probed,
+            "unprobed_records": total - probed,
+            "sample_limit": SAMPLE_LIMIT,
+            "sampled_records": records.len(),
+            "omitted_records": total - records.len(),
+            "byte_limit": BYTE_LIMIT,
+            "records": records,
+        });
+        if serde_json::to_vec(&summary).map_err(storage_error)?.len() > BYTE_LIMIT {
+            return Err(storage_error("failure summary limit"));
+        }
+        Ok(summary)
+    }
     pub fn recover(&mut self, clock: &Clock) -> Result<(), AppError> {
         let tx = self.transaction()?;
         let invocations = capture_invocations::snapshot(&tx.directory)?;
@@ -3284,6 +3379,330 @@ mod failure_probe_tests {
         let mut marker = legacy();
         marker["probe"] = serde_json::json!({ "phase": "repository" });
         assert!(serde_json::from_value::<CaptureFailure>(marker).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "dev-tools", unix))]
+mod failure_summary_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::{symlink, DirBuilderExt, OpenOptionsExt};
+
+    fn fixture() -> (tempfile::TempDir, Store) {
+        let directory = tempfile::Builder::new()
+            .prefix("PRIVATE_SUMMARY_PATH_")
+            .tempdir()
+            .unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        (directory, store)
+    }
+    fn probe() -> HookFailureProbe {
+        HookFailureProbe {
+            phase: HookFailurePhase::Permit,
+            owner_fault: None,
+            setup: None,
+        }
+    }
+    fn private_write(path: &Path, bytes: impl AsRef<[u8]>) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes.as_ref()).unwrap();
+    }
+    fn marker(
+        directory: &Path,
+        suffix: &str,
+        boundary: &str,
+        at: i64,
+        probe: Option<HookFailureProbe>,
+    ) -> Vec<u8> {
+        let failure = CaptureFailure {
+            reason: "BOUNDARY_REFUSED".into(),
+            boundary_id: boundary.into(),
+            observed_at: at,
+            probe,
+        };
+        let bytes = serde_json::to_vec(&failure).unwrap();
+        assert!(bytes.len() <= 1024);
+        private_write(
+            &directory.join(format!("capture-refusal-{suffix}.json")),
+            &bytes,
+        );
+        bytes
+    }
+    fn invocation(directory: &Path, nonce: &str, preparing: bool, bytes: &[u8]) -> PathBuf {
+        let root = directory.join("capture-invocations");
+        if !root.exists() {
+            fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        }
+        let publication = directory.join("capture-invocations-publication.lock");
+        if !publication.exists() {
+            private_write(&publication, []);
+        }
+        let path = root.join(format!(
+            "{nonce}.{}",
+            if preparing { "preparing" } else { "pending" }
+        ));
+        private_write(&path, bytes);
+        path
+    }
+    fn summary(store: &Store) -> serde_json::Value {
+        let summary = store.developer_failure_summary().unwrap();
+        let bytes = serde_json::to_vec(&summary).unwrap();
+        assert!(bytes.len() <= 16 * 1024);
+        assert!(!String::from_utf8(bytes).unwrap().contains("PRIVATE"));
+        summary
+    }
+
+    #[test]
+    fn direct_dead_preparing_dead_pending_and_core_records_keep_their_associations() {
+        let (directory, store) = fixture();
+        let preparing = "b".repeat(64);
+        let pending = "c".repeat(64);
+        invocation(
+            directory.path(),
+            &preparing,
+            true,
+            b"KEITO_CAPTURE_PENDING_V1\n",
+        );
+        invocation(
+            directory.path(),
+            &pending,
+            false,
+            b"KEITO_CAPTURE_PENDING_V1\n",
+        );
+        let direct = "d".repeat(64);
+        let first = marker(directory.path(), &direct, &direct, 1, None);
+        marker(
+            directory.path(),
+            &"e".repeat(64),
+            &hash(format!("INVOCATION\0{preparing}")),
+            2,
+            None,
+        );
+        marker(
+            directory.path(),
+            &"f".repeat(64),
+            &hash(format!("INVOCATION\0{pending}")),
+            3,
+            None,
+        );
+        marker(
+            directory.path(),
+            &"a".repeat(64),
+            &hash("synthetic core boundary"),
+            4,
+            Some(probe()),
+        );
+        marker(directory.path(), &preparing, &preparing, 5, None);
+        let value = summary(&store);
+        assert_eq!(value["total_records"], 5);
+        assert_eq!(value["unprobed_records"], 4);
+        assert_eq!(value["probed_records"], 1);
+        assert_eq!(value["invocation_snapshot"], "observed");
+        let records = value["records"].as_array().unwrap();
+        assert_eq!(records[0]["selected_for_status"], true);
+        assert_eq!(records[0]["failure"]["boundary_id"], direct);
+        assert_eq!(records[0]["filename_boundary_match"], true);
+        assert!(records[0]["invocation_nonce_match"].is_null());
+        assert_eq!(records[1]["dead_invocation_boundary_match"], true);
+        assert_eq!(records[1]["filename_boundary_match"], false);
+        assert_eq!(records[2]["dead_invocation_boundary_match"], true);
+        assert_eq!(records[3]["failure"]["probe"]["phase"], "permit");
+        assert!(records[3]["dead_invocation_boundary_match"].is_null());
+        assert_eq!(records[4]["invocation_nonce_match"], true);
+        assert_eq!(
+            fs::read(
+                directory
+                    .path()
+                    .join(format!("capture-refusal-{direct}.json"))
+            )
+            .unwrap(),
+            first
+        );
+        assert_eq!(store.failure().unwrap().unwrap().boundary_id, direct);
+    }
+
+    #[test]
+    fn same_second_selection_is_lexical_not_write_order_or_causality() {
+        let (directory, store) = fixture();
+        let later_name = "f".repeat(64);
+        let selected_name = "a".repeat(64);
+        marker(
+            directory.path(),
+            &later_name,
+            &later_name,
+            10,
+            Some(probe()),
+        );
+        marker(directory.path(), &selected_name, &selected_name, 10, None);
+        let value = summary(&store);
+        assert_eq!(
+            value["selection_order"],
+            "observed_at_seconds_then_filename_not_causal"
+        );
+        assert_eq!(value["records"][0]["failure"]["boundary_id"], selected_name);
+        assert_eq!(value["records"][0]["selection_index"], 0);
+        assert_eq!(value["records"][1]["selected_for_status"], false);
+        assert_eq!(store.failure().unwrap().unwrap().boundary_id, selected_name);
+    }
+
+    #[test]
+    fn invalid_invocation_snapshot_keeps_records_but_associations_unknown() {
+        let (directory, store) = fixture();
+        let nonce = "b".repeat(64);
+        let boundary = hash(format!("INVOCATION\0{nonce}"));
+        marker(directory.path(), &"a".repeat(64), &boundary, 1, None);
+        invocation(directory.path(), &nonce, false, b"PRIVATE_INVALID_MARKER");
+        let value = summary(&store);
+        assert_eq!(value["total_records"], 1);
+        assert_eq!(value["invocation_snapshot"], "unknown");
+        assert!(value["records"][0]["invocation_nonce_match"].is_null());
+        assert!(value["records"][0]["dead_invocation_boundary_match"].is_null());
+    }
+
+    #[test]
+    fn lost_invocation_association_remains_unknown_after_a_valid_empty_snapshot() {
+        let (directory, store) = fixture();
+        let nonce = "b".repeat(64);
+        let boundary = hash(format!("INVOCATION\0{nonce}"));
+        marker(directory.path(), &"a".repeat(64), &boundary, 1, None);
+        let path = invocation(
+            directory.path(),
+            &nonce,
+            false,
+            b"KEITO_CAPTURE_PENDING_V1\n",
+        );
+        assert_eq!(
+            summary(&store)["records"][0]["dead_invocation_boundary_match"],
+            true
+        );
+        fs::remove_file(path).unwrap();
+        let value = summary(&store);
+        assert_eq!(value["invocation_snapshot"], "observed");
+        assert_eq!(value["association_missing"], "UNKNOWN");
+        assert_eq!(
+            value["snapshot_relation"],
+            "marker_status_and_invocation_reads_are_not_atomic"
+        );
+        assert!(value["records"][0]["dead_invocation_boundary_match"].is_null());
+    }
+
+    #[test]
+    fn malformed_symlink_and_oversized_failure_inputs_are_unavailable() {
+        for kind in 0..3 {
+            let (directory, store) = fixture();
+            let path = directory
+                .path()
+                .join(format!("capture-refusal-{}.json", "a".repeat(64)));
+            match kind {
+                0 => private_write(&path, b"PRIVATE_MALFORMED_CANARY"),
+                1 => {
+                    let target = directory.path().join("PRIVATE_TARGET");
+                    private_write(&target, b"PRIVATE_SYMLINK_CANARY");
+                    symlink(target, &path).unwrap();
+                }
+                _ => private_write(&path, vec![b'x'; 1025]),
+            }
+            assert!(store.developer_failure_summary().is_err());
+        }
+    }
+
+    #[test]
+    fn reader_cap_and_sample_cap_preserve_selected_and_unprobed_counts() {
+        let (directory, store) = fixture();
+        for index in 0..1024 {
+            let suffix = format!("{index:064x}");
+            marker(
+                directory.path(),
+                &suffix,
+                &suffix,
+                index,
+                if index == 0 { Some(probe()) } else { None },
+            );
+        }
+        let value = summary(&store);
+        assert_eq!(value["total_records"], 1024);
+        assert_eq!(value["sampled_records"], 8);
+        assert_eq!(value["omitted_records"], 1016);
+        assert_eq!(value["unprobed_records"], 1023);
+        assert_eq!(value["probed_records"], 1);
+        assert_eq!(value["records"][0]["selected_for_status"], true);
+        marker(
+            directory.path(),
+            &format!("{:064x}", 1024),
+            &"a".repeat(64),
+            1024,
+            None,
+        );
+        assert!(store.developer_failure_summary().is_err());
+    }
+
+    #[test]
+    fn bounded_sample_keeps_a_later_probe_without_losing_the_selected_marker() {
+        let (directory, store) = fixture();
+        let full = HookFailureProbe {
+            phase: HookFailurePhase::Event,
+            owner_fault: Some(HookOwnerFault::GroupDeadline),
+            setup: Some(HookSetupProbe {
+                fault_state: Some(HookGroupState::AwaitReady),
+                ready_window_ns: Some(u64::MAX),
+                pre_spawn_offset_ns: Some(u64::MAX),
+                spawn_return_offset_ns: Some(u64::MAX),
+                first_ready_poll_offset_ns: Some(u64::MAX),
+                deadline_offset_ns: Some(u64::MAX),
+                ready_frame_observed: true,
+                ready_eof_observed: true,
+                deadline_edge: Some(HookReadyEdge::ParkAfterReceive),
+                park_end_offset_ns: Some(u64::MAX),
+                workload_spawn_return_offset_ns: Some(u64::MAX),
+                first_park_poll_offset_ns: Some(u64::MAX),
+                park_frame_observed: Some(true),
+            }),
+        };
+        for index in 0..12 {
+            let suffix = format!("{index:064x}");
+            marker(
+                directory.path(),
+                &suffix,
+                &suffix,
+                index,
+                if index == 11 { Some(full) } else { None },
+            );
+        }
+        let value = summary(&store);
+        assert_eq!(value["total_records"], 12);
+        assert_eq!(value["sampled_records"], 8);
+        assert_eq!(value["omitted_records"], 4);
+        assert_eq!(value["records"][0]["selected_for_status"], true);
+        assert!(value["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["selection_index"] == 11));
+    }
+
+    #[test]
+    fn legacy_filename_has_no_invented_filename_relation_and_empty_summary_is_bounded() {
+        let (directory, store) = fixture();
+        let empty = summary(&store);
+        assert_eq!(empty["total_records"], 0);
+        assert_eq!(empty["sampled_records"], 0);
+        assert_eq!(empty["records"].as_array().unwrap().len(), 0);
+        let bytes = serde_json::to_vec(&CaptureFailure {
+            reason: "STORAGE_UNAVAILABLE".into(),
+            boundary_id: "a".repeat(64),
+            observed_at: 1,
+            probe: None,
+        })
+        .unwrap();
+        private_write(&directory.path().join("capture-failure.json"), bytes);
+        let value = summary(&store);
+        assert!(value["records"][0]["filename_boundary_match"].is_null());
+        assert!(value["records"][0]["invocation_nonce_match"].is_null());
     }
 }
 
