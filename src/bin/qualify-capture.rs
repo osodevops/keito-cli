@@ -5,16 +5,19 @@
 mod isolation;
 #[cfg(unix)]
 mod qualification {
-    use keito_cli::capture::{self, Binding, Store};
+    use keito_cli::{
+        capture::{self, Binding, Store},
+        process_ownership::{io::IoPlan, scope::Scope},
+    };
     use serde_json::{json, Value};
     use std::{
         fs,
         io::{Read, Write},
         os::{
-            fd::{AsRawFd, FromRawFd},
+            fd::{AsRawFd, FromRawFd, OwnedFd},
             unix::{
                 fs::{MetadataExt, PermissionsExt},
-                process::CommandExt,
+                process::{CommandExt, ExitStatusExt},
             },
         },
         path::{Path, PathBuf},
@@ -31,6 +34,79 @@ mod qualification {
         stderr_bytes: usize,
         spawn_error: Option<i32>,
         flags: usize,
+    }
+    const ACK: &[u8] = b"KEITO_CAPTURE_DURABLE_V1\n";
+    const STDERR_LIMIT: usize = 64 * 1024;
+    fn direct_clock() -> std::io::Result<u64> {
+        let mut clock = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, clock.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let clock = unsafe { clock.assume_init() };
+        u64::try_from(clock.tv_sec)
+            .ok()
+            .and_then(|s| s.checked_mul(1_000_000_000))
+            .and_then(|s| s.checked_add(clock.tv_nsec as u64))
+            .ok_or_else(|| std::io::Error::other("qualifier clock overflow"))
+    }
+    fn direct_admission_fresh(at: u64, leaf_end: u64) -> bool {
+        // The public cooperative API has the parent ceiling; preserve the
+        // guard's earlier leaf admission reserve at both caller and exec edge.
+        at < leaf_end.saturating_sub(50_000_000)
+    }
+    fn direct_close_inventory(image_fd: i32, inventory_fd: i32, fds: &[i32]) -> Vec<i32> {
+        assert!((5..=1024).contains(&image_fd));
+        fds.iter()
+            .copied()
+            .filter(|fd| *fd >= 4 && *fd != inventory_fd && *fd != image_fd)
+            .collect()
+    }
+    fn direct_pipe() -> (fs::File, OwnedFd) {
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let reader = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        (reader, writer)
+    }
+    fn direct_read(
+        reader: &mut fs::File,
+        bytes: &mut Vec<u8>,
+        eof: &mut bool,
+        limit: usize,
+    ) -> std::io::Result<()> {
+        if *eof {
+            return Ok(());
+        }
+        // One bounded read per owner-pump turn. One extra byte detects excess.
+        let mut part = [0u8; 256];
+        let remaining = (limit + 1).saturating_sub(bytes.len()).min(part.len());
+        if remaining == 0 {
+            return Err(std::io::Error::other("qualifier output limit"));
+        }
+        match reader.read(&mut part[..remaining]) {
+            Ok(0) => *eof = true,
+            Ok(n) => bytes.extend_from_slice(&part[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(e),
+        }
+        if bytes.len() > limit {
+            return Err(std::io::Error::other("qualifier output limit"));
+        }
+        Ok(())
     }
     struct Case {
         root: PathBuf,
@@ -296,6 +372,9 @@ mod qualification {
             nonce: &str,
             replace_after_image_open: bool,
         ) -> Vec<u8> {
+            let origin = direct_clock().unwrap();
+            let leaf_end = origin.checked_add(500_000_000).unwrap();
+            let parent_end = origin.checked_add(600_000_000).unwrap();
             let flags = self.capture.join("capture-invocations");
             fs::create_dir_all(&flags).unwrap();
             fs::set_permissions(&flags, fs::Permissions::from_mode(0o700)).unwrap();
@@ -314,21 +393,29 @@ mod qualification {
                 unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                 0
             );
-            let image = fs::File::open(&self.core).unwrap();
-            let image_fd = image.as_raw_fd();
+            let original_image = fs::File::open(&self.core).unwrap();
+            // Owner attachment is fixed at4. Bootstrap requires image5..1024.
+            let image_fd =
+                unsafe { libc::fcntl(original_image.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+            assert!((5..=1024).contains(&image_fd));
+            let image = unsafe { fs::File::from_raw_fd(image_fd) };
+            drop(original_image);
             if replace_after_image_open {
                 let replacement = self.root.join("replacement-core");
                 fs::copy(&self.core, &replacement).unwrap();
                 fs::rename(replacement, &self.core).unwrap();
             }
-            let mut pipe = [0; 2];
-            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-            let writer = pipe[1];
-            let reader = pipe[0];
+            let (mut reader, writer) = direct_pipe();
+            // Scope's fault path intentionally withholds take_result output.
+            // Retain stderr independently for the existing privacy assertion;
+            // stdin/stdout and the internal stderr pipe remain Scope-owned.
+            let (mut error_reader, error_writer) = direct_pipe();
+            let write_fd = writer.as_raw_fd();
+            let error_fd = error_writer.as_raw_fd();
             let inventory = unsafe { libc::opendir(c"/dev/fd".as_ptr()) };
             assert!(!inventory.is_null());
             let own_inventory = unsafe { libc::dirfd(inventory) };
-            let mut inherited = Vec::new();
+            let mut descriptors = Vec::new();
             loop {
                 let entry = unsafe { libc::readdir(inventory) };
                 if entry.is_null() {
@@ -336,11 +423,10 @@ mod qualification {
                 }
                 let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
                 if let Some(fd) = name.to_str().ok().and_then(|v| v.parse::<i32>().ok()) {
-                    if fd >= 4 && fd != own_inventory && fd != image_fd {
-                        inherited.push(fd);
-                    }
+                    descriptors.push(fd);
                 }
             }
+            let inherited = direct_close_inventory(image_fd, own_inventory, &descriptors);
             unsafe {
                 libc::closedir(inventory);
             }
@@ -348,6 +434,7 @@ mod qualification {
             cmd.env("KEITO_CAPTURE_INVOCATION_NONCE", nonce)
                 .env("KEITO_CAPTURE_ACK_FD", "3")
                 .env("KEITO_CAPTURE_IMAGE_FD", image_fd.to_string())
+                .env("KEITO_CAPTURE_LEAF_END_NS", leaf_end.to_string())
                 .args([
                     "capture",
                     "hook",
@@ -357,16 +444,16 @@ mod qualification {
                     "prompt",
                     "--harness-version",
                     "0.167.0",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                ]);
             unsafe {
                 cmd.pre_exec(move || {
-                    if libc::setsid() < 0 {
-                        return Err(std::io::Error::last_os_error());
+                    if !direct_admission_fresh(direct_clock()?, leaf_end) {
+                        return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
                     }
-                    if libc::dup2(writer, 3) < 0 {
+                    if libc::setsid() < 0
+                        || libc::dup2(write_fd, 3) < 0
+                        || libc::dup2(error_fd, 2) < 0
+                    {
                         return Err(std::io::Error::last_os_error());
                     }
                     if libc::fcntl(3, libc::F_SETFD, 0) < 0
@@ -377,29 +464,136 @@ mod qualification {
                     for fd in &inherited {
                         libc::close(*fd);
                     }
+                    // Scope appends its owner4 callback AFTER this callback.
+                    // Its freshly allocated attachment descriptors were not in
+                    // our earlier inventory; no private owner tuple is forged.
                     Ok(())
                 });
             }
-            let mut child = cmd.spawn().unwrap();
-            unsafe {
-                libc::close(writer);
-            }
-            let _ = child.stdin.take().unwrap().write_all(input);
-            let output = child.wait_with_output().unwrap();
-            assert!(
-                !String::from_utf8_lossy(&output.stderr).contains("PRIVATE_QUALIFICATION_CANARY")
-            );
-            let mut ack = Vec::new();
-            unsafe { fs::File::from_raw_fd(reader) }
-                .read_to_end(&mut ack)
+            let mut scope = Scope::local_entry(parent_end).unwrap();
+            assert!(direct_admission_fresh(direct_clock().unwrap(), leaf_end));
+            let child = scope
+                .start_cooperative_with_io(cmd, IoPlan::new(input.to_vec(), 4096, 4096).unwrap())
                 .unwrap();
-            if !ack.is_empty() {
-                assert!(output.status.success());
+            drop(writer);
+            drop(error_writer);
+            let mut ack = Vec::with_capacity(ACK.len() + 1);
+            let mut stderr = Vec::new();
+            let (mut eof, mut error_eof) = (false, false);
+            let mut read_fault = false;
+            let mut observed_before_parent = false;
+            loop {
+                scope.poll();
+                read_fault |= direct_read(&mut reader, &mut ack, &mut eof, ACK.len()).is_err();
+                read_fault |=
+                    direct_read(&mut error_reader, &mut stderr, &mut error_eof, STDERR_LIMIT)
+                        .is_err();
+                let report = scope.report();
+                let slot = report.slots.first().unwrap();
+                // Negative bootstrap/FAILED peers need not provide a clean
+                // terminal. Independently retain original wait and pipe facts.
+                let fresh = direct_clock().unwrap();
+                if slot.waits_known
+                    && slot.io.complete()
+                    && eof
+                    && error_eof
+                    && (scope.slot_complete(&child) || scope.failed())
+                    && fresh < parent_end
+                {
+                    observed_before_parent = true;
+                    break;
+                }
+                if fresh >= parent_end {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
             }
+            let output = if scope.slot_complete(&child) {
+                Some(scope.take_result(&child).unwrap())
+            } else {
+                None
+            };
+            let report = scope.finish();
+            let slot = report.slots.first().unwrap();
+            fs::write(
+                self.root.join("direct-ack-probe.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "ack_bytes":ack.len(), "ack_eof":eof, "stderr_eof":error_eof,
+                    "observed_before_parent":observed_before_parent,
+                    "stderr_bytes":stderr.len(), "read_fault":read_fault,
+                    "waits_known":slot.waits_known, "exit_code":slot.status.and_then(|s|s.code()),
+                    "signal":slot.status.and_then(|s|s.signal()), "terminal_eof":slot.terminal_eof,
+                    "stdin_closed":slot.io.stdin_closed, "stdout_eof":slot.io.stdout_eof,
+                    "scope_stderr_eof":slot.io.stderr_eof, "io_fault":slot.io.first_fault,
+                    "slot_fault":slot.first_fault, "scope_fault":report.first_fault.map(|e|e.0),
+                    "whole_clean":report.clean, "all_resources":report.all_resources,
+                    "leaf_end_ns":leaf_end, "parent_end_ns":parent_end,
+                    "finality_limit":"negative refusal proves only independently observed facts; no clean-terminal or descendant proof is synthesized"
+                })).unwrap(),
+            ).unwrap();
+            assert!(
+                !read_fault && eof && error_eof && observed_before_parent,
+                "direct ACK/stderr stream not boundedly settled"
+            );
+            assert!(
+                slot.waits_known && slot.status.is_some() && slot.io.complete(),
+                "original child wait/stdio finality unknown"
+            );
+            assert!(!String::from_utf8_lossy(&stderr).contains("PRIVATE_QUALIFICATION_CANARY"));
+            if !ack.is_empty() {
+                assert!(
+                    slot.io.first_fault.is_none(),
+                    "ACK with direct core stdio fault"
+                );
+                assert!(
+                    report.clean && slot.terminal_eof,
+                    "ACK without cooperative settlement"
+                );
+                let output = output
+                    .as_ref()
+                    .expect("ACK without retained command result");
+                assert!(output.status.success());
+                assert!(output.output.stdout.is_empty() && output.output.stderr.is_empty());
+            }
+            drop(image);
             drop(marker);
             ack
         }
     }
+    #[cfg(test)]
+    mod direct_fixture_tests {
+        use super::*;
+        #[test]
+        fn image_never_uses_ack3_or_owner4_and_inventory_precedes_owner_registration() {
+            assert_eq!(
+                direct_close_inventory(5, 9, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+                vec![4, 6, 7, 8]
+            );
+            assert_eq!(
+                direct_close_inventory(8, 9, &[3, 4, 5, 6, 7, 8, 9]),
+                vec![4, 5, 6, 7]
+            );
+            assert!(std::panic::catch_unwind(|| direct_close_inventory(4, 9, &[])).is_err());
+        }
+        #[test]
+        fn normal_hook_source_keeps_missing_owner_and_image_fd_refusals() {
+            let hook = include_str!("../commands/capture.rs");
+            assert!(hook.contains("command_owner.as_mut().ok_or_else"));
+            assert!(hook.contains("Capture hook requires a verified guarded command owner"));
+            let bootstrap = include_str!("../capture_runtime_pair.rs");
+            assert!(bootstrap.contains("(5..=1024).contains(v)"));
+            let owner = include_str!("../capture_command_owner.rs");
+            assert!(owner.contains("std::env::var(LEAF_END_ENV).map_err"));
+        }
+        #[test]
+        fn leaf_admission_reserve_uses_the_original_absolute_bound() {
+            assert!(direct_admission_fresh(449_999_999, 500_000_000));
+            assert!(!direct_admission_fresh(450_000_000, 500_000_000));
+            assert!(!direct_admission_fresh(500_000_000, 500_000_000));
+            assert!(!direct_admission_fresh(0, 1));
+        }
+    }
+
     pub fn run() {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         assert_eq!(
