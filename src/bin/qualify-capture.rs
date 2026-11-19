@@ -49,6 +49,22 @@ mod qualification {
             .and_then(|s| s.checked_add(clock.tv_nsec as u64))
             .ok_or_else(|| std::io::Error::other("qualifier clock overflow"))
     }
+    fn direct_sync_marker(marker: &fs::File) -> std::io::Result<()> {
+        // Match native_capture_guard::sync: POSIX fsync, not Apple's
+        // F_FULLFSYNC used by Rust File::sync_all. Never refresh leaf/parent ends.
+        let started = Instant::now();
+        loop {
+            if unsafe { libc::fsync(marker.as_raw_fd()) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted
+                || started.elapsed() >= Duration::from_millis(25)
+            {
+                return Err(error);
+            }
+        }
+    }
     fn direct_admission_fresh(at: u64, leaf_end: u64) -> bool {
         // The public cooperative API has the parent ceiling; preserve the
         // guard's earlier leaf admission reserve at both caller and exec edge.
@@ -246,6 +262,16 @@ mod qualification {
                 .unwrap();
             result
         }
+        fn use_guarded_pair(&mut self, guarded: &Self) {
+            // The unchanged first probe already exercised this exact image pair
+            // through the cold guard entry. Direct-ACK is a protocol fixture,
+            // not a second cold keeper-start test on a never-dispatched guard.
+            // Keep this case's fresh HOME/capture/repository and pending marker.
+            assert_eq!(self.root.parent(), guarded.root.parent());
+            assert_eq!(self.core_hash, guarded.core_hash);
+            self.core = guarded.core.clone();
+            self.guard = guarded.guard.clone();
+        }
         fn command(&self, program: &Path) -> Command {
             let checked = super::isolation::checked(
                 self.root.parent().unwrap(),
@@ -388,7 +414,7 @@ mod qualification {
                 .set_permissions(fs::Permissions::from_mode(0o600))
                 .unwrap();
             marker.write_all(PENDING).unwrap();
-            marker.sync_all().unwrap();
+            direct_sync_marker(&marker).unwrap();
             assert_eq!(
                 unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                 0
@@ -585,6 +611,49 @@ mod qualification {
             let owner = include_str!("../capture_command_owner.rs");
             assert!(owner.contains("std::env::var(LEAF_END_ENV).map_err"));
         }
+        fn isolated_case(cohort: &str, name: &str, hash: &str) -> Case {
+            let root = PathBuf::from(cohort).join(name);
+            Case {
+                home: root.join("home"),
+                capture: root.join("home/capture"),
+                core: root.join("artifact/keito"),
+                guard: root.join("artifact/keito-capture-guard"),
+                bin: root.join("bin"),
+                repo: root.join("repo"),
+                core_hash: hash.into(),
+                root,
+            }
+        }
+        #[test]
+        fn direct_ack_reuses_only_guarded_pair_and_preserves_fresh_case_state() {
+            let guarded = isolated_case("/owned/cohort", "first", "same_core");
+            let mut ack = isolated_case("/owned/cohort", "exact-ack", "same_core");
+            let state = (
+                ack.root.clone(),
+                ack.home.clone(),
+                ack.capture.clone(),
+                ack.repo.clone(),
+                ack.bin.clone(),
+            );
+            ack.use_guarded_pair(&guarded);
+            assert_eq!(ack.core, guarded.core);
+            assert_eq!(ack.guard, guarded.guard);
+            assert_eq!((ack.root, ack.home, ack.capture, ack.repo, ack.bin), state);
+        }
+        #[test]
+        fn direct_ack_rejects_pair_from_another_cohort_or_core_identity() {
+            let guarded = isolated_case("/owned/cohort", "first", "same_core");
+            let mut wrong_hash = isolated_case("/owned/cohort", "exact-ack", "different_core");
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || wrong_hash.use_guarded_pair(&guarded)
+            ))
+            .is_err());
+            let mut foreign = isolated_case("/foreign/cohort", "exact-ack", "same_core");
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || foreign.use_guarded_pair(&guarded)
+            ))
+            .is_err());
+        }
         #[test]
         fn leaf_admission_reserve_uses_the_original_absolute_bound() {
             assert!(direct_admission_fresh(449_999_999, 500_000_000));
@@ -648,7 +717,8 @@ mod qualification {
         positive.assert_private_state();
         positive.guard("stop", &positive.input("cold"));
         assert_eq!(positive.flags(), 0);
-        let ack = Case::new(&source, &run, "exact-ack");
+        let mut ack = Case::new(&source, &run, "exact-ack");
+        ack.use_guarded_pair(&positive);
         assert_eq!(
             ack.direct_ack(&ack.input("ack"), &capture::hash("qualified_ack")),
             b"KEITO_CAPTURE_DURABLE_V1\n"
