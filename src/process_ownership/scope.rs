@@ -114,6 +114,10 @@ trait Edge {
     fn begin(&mut self, end: u64) -> io::Result<()>;
     fn poll(&mut self) -> io::Result<()>;
     fn facts(&self) -> EdgeFacts;
+    #[cfg(feature = "capture-profile")]
+    fn repository_profile_stage(&self) -> Option<crate::capture_profile::Phase> {
+        None
+    }
     fn setup_pending(&self) -> bool {
         false
     }
@@ -143,6 +147,17 @@ enum Stage {
     Done,
 }
 impl Stage {
+    #[cfg(feature = "capture-profile")]
+    fn repository_profile_stage(&self) -> crate::capture_profile::Phase {
+        use crate::capture_profile::Phase;
+        match self {
+            Self::Ready => Phase::RepoReadyPoll,
+            Self::Park => Phase::RepoParkPoll,
+            Self::Running => Phase::RepoRunningPoll,
+            Self::Cleaning => Phase::RepoCleaningPoll,
+            Self::Done => Phase::RepoDonePoll,
+        }
+    }
     fn setup_pending(&self) -> bool {
         matches!(self, Self::Ready | Self::Park)
     }
@@ -368,6 +383,10 @@ impl GroupEdge {
     }
 }
 impl Edge for GroupEdge {
+    #[cfg(feature = "capture-profile")]
+    fn repository_profile_stage(&self) -> Option<crate::capture_profile::Phase> {
+        Some(self.stage.repository_profile_stage())
+    }
     #[cfg(feature = "dev-tools")]
     fn setup_trace(&self) -> Option<super::group::SetupTrace> {
         Some(self.lease.setup_trace())
@@ -397,6 +416,12 @@ impl Edge for GroupEdge {
         self.lease.begin_local_cleanup(end)
     }
     fn poll(&mut self) -> io::Result<()> {
+        #[cfg(feature = "capture-profile")]
+        let result = {
+            let _span = crate::capture_profile::Span::start(self.stage.repository_profile_stage());
+            self.progress()
+        };
+        #[cfg(not(feature = "capture-profile"))]
         let result = self.progress();
         if result.is_err() {
             self.first_fault.get_or_insert(
@@ -562,6 +587,13 @@ enum ProductEdge {
     Cooperative(CooperativeEdge),
 }
 impl Edge for ProductEdge {
+    #[cfg(feature = "capture-profile")]
+    fn repository_profile_stage(&self) -> Option<crate::capture_profile::Phase> {
+        match self {
+            Self::Group(edge) => edge.repository_profile_stage(),
+            Self::Cooperative(edge) => edge.repository_profile_stage(),
+        }
+    }
     fn setup_buffered_event(&self) -> bool {
         match self {
             Self::Group(edge) => edge.setup_buffered_event(),
@@ -1193,6 +1225,15 @@ impl<E: Edge> Core<E> {
             if self.finish_at(at) {
                 break;
             }
+            #[cfg(feature = "capture-profile")]
+            {
+                let _span = crate::capture_profile::Span::wait(
+                    crate::capture_profile::Phase::RepoFinishWait,
+                    1_000_000,
+                );
+                pause();
+            }
+            #[cfg(not(feature = "capture-profile"))]
             pause();
         }
         self.finished = true;
@@ -1258,7 +1299,17 @@ impl<E: Edge> Core<E> {
         // protocol traffic wakes immediately; the original last submillisecond
         // remains nonblocking, and no absolute end is reset or extended.
         let timeout = ((end - at) / 1_000_000).min(1) as i32;
-        match poll(&mut descriptors, timeout) {
+        #[cfg(feature = "capture-profile")]
+        let outcome = {
+            let _span = crate::capture_profile::Span::wait(
+                crate::capture_profile::Phase::RepoSetupWait,
+                timeout as u64 * 1_000_000,
+            );
+            poll(&mut descriptors, timeout)
+        };
+        #[cfg(not(feature = "capture-profile"))]
+        let outcome = poll(&mut descriptors, timeout);
+        match outcome {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
             Ok(count)
                 if count >= 0
@@ -1276,6 +1327,27 @@ impl<E: Edge> Core<E> {
         // Readiness/timeout/HUP/EINTR never advance a protocol state. The next
         // original progress turn parses frames and checks deadlines/signals.
     }
+    #[cfg(feature = "capture-profile")]
+    fn repository_wait_phase(&self) -> crate::capture_profile::Phase {
+        use crate::capture_profile::Phase;
+        let mut mask = 0u8;
+        for slot in self.slots.iter().filter(|slot| slot.accepted_at.is_none()) {
+            mask |= match slot.edge.repository_profile_stage() {
+                Some(Phase::RepoRunningPoll) => 1,
+                // Done can retain physical pipe EOF collection. Keep it in the
+                // cleanup wait category; its poll time has a distinct counter.
+                Some(Phase::RepoCleaningPoll | Phase::RepoDonePoll) => 2,
+                Some(Phase::RepoReadyPoll | Phase::RepoParkPoll) => 4,
+                _ => 8,
+            };
+        }
+        match mask {
+            1 => Phase::RepoRunningWait,
+            2 => Phase::RepoCleaningWait,
+            0 | 8 => Phase::RepoUnknownWait,
+            _ => Phase::RepoMixedWait,
+        }
+    }
     fn wait_command_progress(
         &mut self,
         clock: &mut impl FnMut() -> io::Result<u64>,
@@ -1285,6 +1357,13 @@ impl<E: Edge> Core<E> {
         // The final admitted edge still owns its original short READY/PARK
         // window. Do not return to a blind timer while its socket can wake us.
         if self.repository_admission_ready()? {
+            #[cfg(feature = "capture-profile")]
+            {
+                let _span =
+                    crate::capture_profile::Span::wait(self.repository_wait_phase(), 1_000_000);
+                pause();
+            }
+            #[cfg(not(feature = "capture-profile"))]
             pause();
             Ok(())
         } else {
@@ -2530,6 +2609,8 @@ mod tests {
         assert_eq!(core.slots[2].accepted_at, Some(1));
     }
     struct Fake {
+        #[cfg(feature = "capture-profile")]
+        repository_stage: Option<crate::capture_profile::Phase>,
         events: Rc<RefCell<Vec<String>>>,
         name: &'static str,
         facts: EdgeFacts,
@@ -2545,6 +2626,10 @@ mod tests {
         setup_trace: Option<super::super::group::SetupTrace>,
     }
     impl Edge for Fake {
+        #[cfg(feature = "capture-profile")]
+        fn repository_profile_stage(&self) -> Option<crate::capture_profile::Phase> {
+            self.repository_stage
+        }
         #[cfg(feature = "dev-tools")]
         fn setup_trace(&self) -> Option<super::super::group::SetupTrace> {
             self.setup_trace
@@ -2607,6 +2692,8 @@ mod tests {
     }
     fn fake(name: &'static str, events: Rc<RefCell<Vec<String>>>) -> Fake {
         Fake {
+            #[cfg(feature = "capture-profile")]
+            repository_stage: None,
             name,
             events,
             facts: EdgeFacts::default(),
@@ -4328,5 +4415,101 @@ mod tests {
             command.get_args().collect::<Vec<_>>(),
             [std::ffi::OsStr::new("--version")]
         );
+    }
+    #[test]
+    #[cfg(feature = "capture-profile")]
+    fn repository_wait_profile_classifies_retained_stages_without_progress_or_proof() {
+        use crate::capture_profile::Phase;
+        for (first, second, expected) in [
+            (
+                Some(Phase::RepoRunningPoll),
+                Some(Phase::RepoRunningPoll),
+                Phase::RepoRunningWait,
+            ),
+            (
+                Some(Phase::RepoCleaningPoll),
+                Some(Phase::RepoDonePoll),
+                Phase::RepoCleaningWait,
+            ),
+            (
+                Some(Phase::RepoRunningPoll),
+                Some(Phase::RepoCleaningPoll),
+                Phase::RepoMixedWait,
+            ),
+            (
+                Some(Phase::RepoParkPoll),
+                Some(Phase::RepoRunningPoll),
+                Phase::RepoMixedWait,
+            ),
+            (None, None, Phase::RepoUnknownWait),
+            (None, Some(Phase::RepoRunningPoll), Phase::RepoMixedWait),
+        ] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let mut core = Core::new(Rc::default(), 500_000_000);
+            let a = core.admit(1, 0, |_| Ok(fake("a", events.clone()))).unwrap();
+            let b = core.admit(2, 0, |_| Ok(fake("b", events.clone()))).unwrap();
+            core.slots[a.index].edge.repository_stage = first;
+            core.slots[b.index].edge.repository_stage = second;
+            let cursor = core.cursor;
+            assert_eq!(core.repository_wait_phase() as usize, expected as usize);
+            assert_eq!(core.cursor, cursor);
+            assert_eq!(core.hard_end, 500_000_000);
+            assert!(core.cancel_end.is_none());
+            assert!(events.borrow().is_empty());
+            assert!(core.slots.iter().all(|slot| slot.accepted_at.is_none()
+                && !slot.output_taken
+                && !slot.edge.facts().resources_complete()));
+        }
+    }
+    #[test]
+    #[cfg(feature = "capture-profile")]
+    fn repository_wait_profile_ignores_accepted_slots_without_consuming_them() {
+        use crate::capture_profile::Phase;
+        let mut core = Core::new(Rc::default(), 500_000_000);
+        assert_eq!(
+            core.repository_wait_phase() as usize,
+            Phase::RepoUnknownWait as usize
+        );
+        let a = core.admit(1, 0, |_| Ok(fake("a", Rc::default()))).unwrap();
+        let b = core.admit(2, 0, |_| Ok(fake("b", Rc::default()))).unwrap();
+        core.slots[a.index].edge.repository_stage = Some(Phase::RepoRunningPoll);
+        core.slots[a.index].accepted_at = Some(3);
+        core.slots[b.index].edge.repository_stage = Some(Phase::RepoDonePoll);
+        assert_eq!(
+            core.repository_wait_phase() as usize,
+            Phase::RepoCleaningWait as usize
+        );
+        assert_eq!(core.slots[a.index].accepted_at, Some(3));
+        assert!(!core.slots[a.index].output_taken);
+        assert!(core.slots[b.index].accepted_at.is_none());
+    }
+    #[test]
+    #[cfg(feature = "capture-profile")]
+    fn repository_wait_profile_keeps_one_original_pause_and_withholds_unproved_output() {
+        use crate::capture_profile::Phase;
+        for stage in [
+            Phase::RepoRunningPoll,
+            Phase::RepoCleaningPoll,
+            Phase::RepoDonePoll,
+        ] {
+            let mut core = Core::new(Rc::default(), 500_000_000);
+            let slot = core
+                .admit(1, 0, |_| Ok(fake("retained", Rc::default())))
+                .unwrap();
+            core.slots[slot.index].edge.repository_stage = Some(stage);
+            let mut pauses = 0;
+            core.wait_command_progress(
+                &mut || Ok(10_000_000),
+                &mut |_, _| panic!("original sleep path became fd poll"),
+                &mut || pauses += 1,
+            )
+            .unwrap();
+            assert_eq!(pauses, 1);
+            assert!(core.slots[slot.index].accepted_at.is_none());
+            assert!(!core.slots[slot.index].output_taken);
+            assert!(!core.slots[slot.index].edge.facts().resources_complete());
+            assert_eq!(core.hard_end, 500_000_000);
+            assert!(core.cancel_end.is_none());
+        }
     }
 }

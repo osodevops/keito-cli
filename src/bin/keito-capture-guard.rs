@@ -1,5 +1,11 @@
 #[path = "../native_capture_guard.rs"]
 mod native_capture_guard;
+// Shared Scope's diagnostic calls use this binary's independent numeric TLS.
+// Guard roles never begin a handler record, so these calls collect nothing.
+#[cfg(all(unix, feature = "capture-profile"))]
+#[path = "../capture_profile.rs"]
+#[allow(dead_code)]
+mod capture_profile;
 #[cfg(unix)]
 #[path = "../process_ownership/mod.rs"]
 #[allow(dead_code)] // Core-only APIs share this source; the guard links only its roles.

@@ -845,7 +845,7 @@ impl CaptureTransaction<'_> {
             invocation,
         } = self;
         if let Some(invocation) = invocation {
-            invocation.validate(&directory)?;
+            crate::capture_profile_measure!(PermitValidation, invocation.validate(&directory))?;
         }
         crate::capture_profile_measure!(Commit, inner.commit()).map_err(storage_error)?;
         drop(_authority);
@@ -1118,7 +1118,7 @@ impl Store {
         let directory = self.directory.clone();
         let invocation = if event { self.invocation.clone() } else { None };
         if let Some(permit) = &invocation {
-            permit.validate(&directory)?;
+            crate::capture_profile_measure!(PermitValidation, permit.validate(&directory))?;
         }
         #[cfg(feature = "dev-tools")]
         let sqlite_started = {
@@ -1128,9 +1128,14 @@ impl Store {
                 .permit_validation = Some(permit_started.elapsed());
             std::time::Instant::now()
         };
+        #[cfg(all(unix, feature = "capture-profile"))]
+        let profile_sqlite_begin =
+            crate::capture_profile::Span::start(crate::capture_profile::Phase::SqliteBegin);
         let admission = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate);
+        #[cfg(all(unix, feature = "capture-profile"))]
+        drop(profile_sqlite_begin);
         #[cfg(feature = "dev-tools")]
         {
             let timing = self.last_admission_timing.as_mut().unwrap();
@@ -1143,7 +1148,10 @@ impl Store {
         let inner = admission.map_err(storage_error)?;
         #[cfg(feature = "dev-tools")]
         let authority_started = std::time::Instant::now();
-        let authority = AuthorityGuard::acquire(&directory, true);
+        let authority = crate::capture_profile_measure!(
+            AuthorityAcquire,
+            AuthorityGuard::acquire(&directory, true)
+        );
         #[cfg(feature = "dev-tools")]
         {
             self.last_admission_timing.as_mut().unwrap().authority =
@@ -1151,7 +1159,7 @@ impl Store {
         }
         let authority = authority?;
         if let Some(permit) = &invocation {
-            permit.validate(&directory)?;
+            crate::capture_profile_measure!(PermitValidation, permit.validate(&directory))?;
         }
         let tx = CaptureTransaction {
             inner,
@@ -2902,54 +2910,57 @@ fn validate_frozen(
 /// Bounded metadata-only refusal state. Unique immutable filenames prevent a
 /// recovering process from deleting a concurrently published refusal.
 fn read_failure_markers(directory: &Path) -> Result<Vec<(PathBuf, CaptureFailure)>, AppError> {
-    let mut markers = Vec::new();
-    for entry in fs::read_dir(directory).map_err(storage_error)? {
-        let entry = entry.map_err(storage_error)?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name != "capture-failure.json"
-            && !(name.starts_with("capture-refusal-") && name.ends_with(".json"))
-        {
-            continue;
+    crate::capture_profile_measure!(RefusalReads, {
+        let mut markers = Vec::new();
+        for entry in fs::read_dir(directory).map_err(storage_error)? {
+            let entry = entry.map_err(storage_error)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name != "capture-failure.json"
+                && !(name.starts_with("capture-refusal-") && name.ends_with(".json"))
+            {
+                continue;
+            }
+            if markers.len() >= 1024 {
+                return Err(storage_error("refusal marker limit"));
+            }
+            let path = entry.path();
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+            }
+            let file = options.open(&path).map_err(storage_error)?;
+            let metadata = file.metadata().map_err(storage_error)?;
+            if !metadata.is_file() || metadata.len() > 1024 {
+                return Err(storage_error("invalid refusal marker"));
+            }
+            let mut bytes = Vec::new();
+            file.take(1025)
+                .read_to_end(&mut bytes)
+                .map_err(storage_error)?;
+            if bytes.len() > 1024 {
+                return Err(storage_error("invalid refusal marker"));
+            }
+            let value: CaptureFailure = serde_json::from_slice(&bytes).map_err(storage_error)?;
+            if !matches!(
+                value.reason.as_str(),
+                "STORAGE_UNAVAILABLE" | "QUEUE_LIMIT_REACHED" | "BOUNDARY_REFUSED"
+            ) || value.boundary_id.len() != 64
+                || !value.boundary_id.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(storage_error("invalid refusal marker"));
+            }
+            markers.push((path, value));
         }
-        if markers.len() >= 1024 {
-            return Err(storage_error("refusal marker limit"));
-        }
-        let path = entry.path();
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-        }
-        let file = options.open(&path).map_err(storage_error)?;
-        let metadata = file.metadata().map_err(storage_error)?;
-        if !metadata.is_file() || metadata.len() > 1024 {
-            return Err(storage_error("invalid refusal marker"));
-        }
-        let mut bytes = Vec::new();
-        file.take(1025)
-            .read_to_end(&mut bytes)
-            .map_err(storage_error)?;
-        if bytes.len() > 1024 {
-            return Err(storage_error("invalid refusal marker"));
-        }
-        let value: CaptureFailure = serde_json::from_slice(&bytes).map_err(storage_error)?;
-        if !matches!(
-            value.reason.as_str(),
-            "STORAGE_UNAVAILABLE" | "QUEUE_LIMIT_REACHED" | "BOUNDARY_REFUSED"
-        ) || value.boundary_id.len() != 64
-            || !value.boundary_id.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err(storage_error("invalid refusal marker"));
-        }
-        markers.push((path, value));
-    }
-    markers.sort_by(|(ap, a), (bp, b)| a.observed_at.cmp(&b.observed_at).then_with(|| ap.cmp(bp)));
-    Ok(markers)
+        markers
+            .sort_by(|(ap, a), (bp, b)| a.observed_at.cmp(&b.observed_at).then_with(|| ap.cmp(bp)));
+        Ok(markers)
+    })
 }
 
 // Emergency markers use the reviewed POSIX fsync contract, not Apple's
