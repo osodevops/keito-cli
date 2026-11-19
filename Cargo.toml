@@ -50,6 +50,8 @@ required-features = ["dev-tools"]
 
 [features]
 dev-tools = []
+# Diagnostic-only; never publish a capture-profile artifact.
+capture-profile = []
 
 [[example]]
 name = "source-qa-keeper"

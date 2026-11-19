@@ -112,6 +112,11 @@ fn main() {
     } else {
         result
     };
+    #[cfg(all(unix, feature = "capture-profile"))]
+    keito_cli::capture_profile::finish(
+        result.is_ok() && parser_exit.unwrap_or(0) == 0,
+        entry_scope.as_ref().map(|scope| scope.hard_end()),
+    );
     if let Some(code) = parser_exit {
         std::process::exit(code);
     }

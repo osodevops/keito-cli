@@ -291,6 +291,14 @@ async fn run_inner(
             event,
             harness_version,
         } => {
+            #[cfg(all(unix, feature = "capture-profile"))]
+            crate::capture_profile::begin(match event {
+                crate::cli::capture::CaptureEvent::Prompt => 1,
+                crate::cli::capture::CaptureEvent::Stop => 2,
+                crate::cli::capture::CaptureEvent::SessionStart => 3,
+                crate::cli::capture::CaptureEvent::Interrupt => 4,
+                crate::cli::capture::CaptureEvent::SessionEnd => 5,
+            });
             // A malformed/unknown hook must never block coding or echo raw input.
             let mut boundary_id = None;
             let invocation_nonce = std::env::var("KEITO_CAPTURE_INVOCATION_NONCE").ok();
@@ -298,8 +306,11 @@ async fn run_inner(
             let hook_runtime = invocation_nonce
                 .as_ref()
                 .map(|_| {
-                    crate::capture_runtime_pair::HookRuntime::current(
-                        &std::env::var("KEITO_CAPTURE_CORE_SHA256").unwrap_or_default(),
+                    crate::capture_profile_measure!(
+                        Pair,
+                        crate::capture_runtime_pair::HookRuntime::current(
+                            &std::env::var("KEITO_CAPTURE_CORE_SHA256").unwrap_or_default(),
+                        )
                     )
                 })
                 .transpose()?;
@@ -377,14 +388,18 @@ async fn run_inner(
                     failure_phase = capture::HookFailurePhase::Repository;
                 }
                 #[cfg(unix)]
-                let repo = Repository::resolve_with(Path::new(cwd), owner)?;
+                let repo = crate::capture_profile_measure!(
+                    Repository,
+                    Repository::resolve_with(Path::new(cwd), owner)
+                )?;
                 #[cfg(not(unix))]
                 let repo = Repository::resolve(Path::new(cwd))?;
                 #[cfg(feature = "dev-tools")]
                 {
                     failure_phase = capture::HookFailurePhase::Store;
                 }
-                let mut store = Store::open(&directory()?)?;
+                let mut store =
+                    crate::capture_profile_measure!(StoreOpen, Store::open(&directory()?))?;
                 #[cfg(feature = "dev-tools")]
                 {
                     failure_phase = capture::HookFailurePhase::Permit;
@@ -397,7 +412,7 @@ async fn run_inner(
                     failure_phase = capture::HookFailurePhase::Clock;
                 }
                 #[cfg(unix)]
-                let clock = Clock::now_with(owner)?;
+                let clock = crate::capture_profile_measure!(Clock, Clock::now_with(owner))?;
                 #[cfg(not(unix))]
                 let clock = Clock::now()?;
                 let signal = capture::Signal {
@@ -415,20 +430,25 @@ async fn run_inner(
                     failure_phase = capture::HookFailurePhase::Event;
                 }
                 #[cfg(unix)]
-                store.event_hook(
-                    &repo,
-                    signal,
-                    value
-                        .get("transcript_path")
-                        .and_then(Value::as_str)
-                        .map(Path::new),
-                    hook_runtime.as_ref(),
+                crate::capture_profile_measure!(
+                    EventTransaction,
+                    store.event_hook(
+                        &repo,
+                        signal,
+                        value
+                            .get("transcript_path")
+                            .and_then(Value::as_str)
+                            .map(Path::new),
+                        hook_runtime.as_ref(),
+                    )
                 )?;
                 #[cfg(not(unix))]
                 store.event(&repo, signal)?;
                 accepted_store = Some(store);
                 Ok(())
             })();
+            #[cfg(all(unix, feature = "capture-profile"))]
+            let profile_event_accepted = result.is_ok();
             let mut ack_store = None;
             if let Err(error) = result {
                 let reason = match error {
@@ -482,14 +502,23 @@ async fn run_inner(
             // Preserve the original business/durability predicate above, but
             // never acknowledge it until the actual command owner has finished.
             #[cfg(unix)]
-            let resources_clean = command_owner
-                .as_mut()
-                .is_some_and(|owner| owner.finish_clean());
+            let resources_clean = crate::capture_profile_measure!(
+                OwnerFinish,
+                command_owner
+                    .as_mut()
+                    .is_some_and(|owner| owner.finish_clean())
+            );
             #[cfg(not(unix))]
             let resources_clean = false;
             if resources_clean {
                 if let (Some(store), Some(fd)) = (ack_store, ack_fd) {
-                    if store.acknowledge_hook(fd).is_err() {
+                    if crate::capture_profile_measure!(
+                        Ack,
+                        store.acknowledge_hook(fd),
+                        profile_event_accepted
+                    )
+                    .is_err()
+                    {
                         #[cfg(unix)]
                         if let Some(owner) = command_owner.as_mut() {
                             owner.fail_ack();

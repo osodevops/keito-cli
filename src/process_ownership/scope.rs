@@ -120,6 +120,12 @@ trait Edge {
     fn setup_wait_source(&self) -> Option<(i32, u64)> {
         None
     }
+    fn setup_buffered_event(&self) -> bool {
+        false
+    }
+    fn post_join_pending(&self) -> bool {
+        false
+    }
     #[cfg(feature = "dev-tools")]
     fn setup_trace(&self) -> Option<super::group::SetupTrace> {
         None
@@ -270,6 +276,7 @@ struct GroupEdge {
     first_fault: Option<&'static str>,
     published: [bool; 4],
     setup_admission: Option<HookSetupAdmission>,
+    post_join_pending: bool,
 }
 fn release_hook_admission(
     stage: &Stage,
@@ -284,6 +291,23 @@ fn release_hook_admission(
         admission.take();
     }
 }
+// Attach all retained handles before propagating even a post-spawn error.
+// Success schedules ONE later PARK observation after the upstream drain.
+fn retain_group_start(
+    stage: &mut Stage,
+    pending: &mut bool,
+    started: io::Result<()>,
+    attach: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let attached = attach();
+    *stage = Stage::Park;
+    *pending = false;
+    started?;
+    attached?;
+    *pending = true;
+    Ok(())
+}
+
 impl GroupEdge {
     fn progress(&mut self) -> io::Result<()> {
         // Outputs progress even while PARK is pending. Each pipe has a fixed
@@ -302,21 +326,25 @@ impl GroupEdge {
                     let started = self.lease.start_pending(command);
                     // Even an error AFTER spawn must transfer every available
                     // pipe to this retained slot before returning the fault.
-                    let attached = if self.lease.report().workload_spawned {
-                        self.pipes.attach(
-                            self.lease.stdin(),
-                            self.lease.stdout(),
-                            self.lease.stderr(),
-                        )
-                    } else {
-                        Ok(())
-                    };
-                    self.stage = Stage::Park;
-                    started?;
-                    attached?;
+                    let workload_spawned = self.lease.report().workload_spawned;
+                    let lease = &mut self.lease;
+                    let pipes = &mut self.pipes;
+                    retain_group_start(
+                        &mut self.stage,
+                        &mut self.post_join_pending,
+                        started,
+                        || {
+                            if workload_spawned {
+                                pipes.attach(lease.stdin(), lease.stdout(), lease.stderr())
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )?;
                 }
             }
             Stage::Park => {
+                self.post_join_pending = false;
                 if self.lease.poll_parked()? {
                     self.stage = Stage::Running;
                 }
@@ -347,6 +375,12 @@ impl Edge for GroupEdge {
     fn setup_pending(&self) -> bool {
         self.stage.setup_pending()
     }
+    fn setup_buffered_event(&self) -> bool {
+        self.stage.setup_pending() && self.lease.setup_buffered_event()
+    }
+    fn post_join_pending(&self) -> bool {
+        self.post_join_pending && matches!(self.stage, Stage::Park)
+    }
     fn setup_wait_source(&self) -> Option<(i32, u64)> {
         self.stage
             .setup_pending()
@@ -359,6 +393,7 @@ impl Edge for GroupEdge {
             return Ok(());
         }
         self.stage = Stage::Cleaning;
+        self.post_join_pending = false;
         self.lease.begin_local_cleanup(end)
     }
     fn poll(&mut self) -> io::Result<()> {
@@ -527,6 +562,18 @@ enum ProductEdge {
     Cooperative(CooperativeEdge),
 }
 impl Edge for ProductEdge {
+    fn setup_buffered_event(&self) -> bool {
+        match self {
+            Self::Group(edge) => edge.setup_buffered_event(),
+            Self::Cooperative(edge) => edge.setup_buffered_event(),
+        }
+    }
+    fn post_join_pending(&self) -> bool {
+        match self {
+            Self::Group(edge) => edge.post_join_pending(),
+            Self::Cooperative(edge) => edge.post_join_pending(),
+        }
+    }
     fn setup_wait_source(&self) -> Option<(i32, u64)> {
         match self {
             Self::Group(edge) => edge.setup_wait_source(),
@@ -1002,52 +1049,94 @@ impl<E: Edge> Core<E> {
         for _ in 0..len.min(SLOTS_PER_TURN) {
             let index = self.cursor % len;
             self.cursor = (index + 1) % len;
-            if self.slots[index].accepted_at.is_some() {
-                continue;
+            self.poll_slot(index, clock);
+        }
+    }
+    fn poll_slot(&mut self, index: usize, clock: &mut impl FnMut() -> io::Result<u64>) {
+        if self.slots[index].accepted_at.is_some() {
+            return;
+        }
+        if self.slots[index].edge.poll().is_err() {
+            self.poison(
+                self.slots[index]
+                    .edge
+                    .facts()
+                    .first_fault
+                    .unwrap_or("SCOPE_POLL"),
+            );
+            match clock() {
+                Ok(at) => self.cancel(None, at, self.hard_end),
+                Err(_) => self.cancel(Some("SCOPE_CLOCK"), 0, 0),
             }
-            if self.slots[index].edge.poll().is_err() {
-                self.poison(
-                    self.slots[index]
-                        .edge
-                        .facts()
-                        .first_fault
-                        .unwrap_or("SCOPE_POLL"),
-                );
-                match clock() {
-                    Ok(at) => self.cancel(None, at, self.hard_end),
-                    Err(_) => self.cancel(Some("SCOPE_CLOCK"), 0, 0),
-                }
-            }
-            let facts = self.slots[index].edge.facts();
-            if facts.status.is_some() && self.slots[index].completion_end.is_none() {
-                match clock() {
-                    Err(_) => self.cancel(Some("SCOPE_CLOCK"), 0, 0),
-                    Ok(at) => {
-                        let id = SlotId {
-                            index,
-                            scope: self.identity.clone(),
-                        };
-                        if self.request_complete(&id, at).is_err() {
-                            self.cancel(None, at, self.hard_end);
-                        }
-                    }
-                }
-            }
-            if facts.resources_complete() {
-                let end = self.slots[index]
-                    .completion_end
-                    .unwrap_or(0)
-                    .min(self.slots[index].hard_end)
-                    .min(self.hard_end);
-                match clock() {
-                    Ok(at) if at < end => self.slots[index].accepted_at = Some(at),
-                    _ => {
-                        self.poison("SCOPE_PROOF_DEADLINE");
-                        self.cancel(None, 0, 0);
+        }
+        let facts = self.slots[index].edge.facts();
+        if facts.status.is_some() && self.slots[index].completion_end.is_none() {
+            match clock() {
+                Err(_) => self.cancel(Some("SCOPE_CLOCK"), 0, 0),
+                Ok(at) => {
+                    let id = SlotId {
+                        index,
+                        scope: self.identity.clone(),
+                    };
+                    if self.request_complete(&id, at).is_err() {
+                        self.cancel(None, at, self.hard_end);
                     }
                 }
             }
         }
+        if facts.resources_complete() {
+            let end = self.slots[index]
+                .completion_end
+                .unwrap_or(0)
+                .min(self.slots[index].hard_end)
+                .min(self.hard_end);
+            match clock() {
+                Ok(at) if at < end => self.slots[index].accepted_at = Some(at),
+                _ => {
+                    self.poison("SCOPE_PROOF_DEADLINE");
+                    self.cancel(None, 0, 0);
+                }
+            }
+        }
+    }
+    fn poll_post_joined(
+        &mut self,
+        start: usize,
+        clock: &mut impl FnMut() -> io::Result<u64>,
+    ) -> bool {
+        let mut observed = false;
+        // Only the edges visited by the containing fair turn can be newly
+        // joined. No recursion, new child, cursor reset or second setup loop.
+        let len = self.slots.len();
+        for offset in 0..len.min(SLOTS_PER_TURN) {
+            let index = (start + offset) % len;
+            if self.slots[index].accepted_at.is_some()
+                || !self.slots[index].edge.post_join_pending()
+            {
+                continue;
+            }
+            if self.finished || self.cancel_end.is_some() {
+                return observed;
+            }
+            let at = match self.admission_clock(clock) {
+                Ok(at) => at,
+                Err(_) => return observed,
+            };
+            let admission = self.owner.borrow().check_admission();
+            if let Err(reason) = admission {
+                self.cancel(Some(reason.0), at, self.hard_end);
+                return observed;
+            }
+            if at >= self.active_end().saturating_sub(RESERVE_NS) {
+                self.cancel(Some("SCOPE_OPERATION_DEADLINE"), at, self.active_end());
+                return observed;
+            }
+            // GroupEdge's existing Stage::Park path clears its flag and uses
+            // the original poll_parked parser and before/after end checks.
+            observed = true;
+            self.poll_slot(index, clock);
+        }
+        observed
     }
     fn all_resources(&self) -> bool {
         self.slots.iter().all(|s| s.accepted_at.is_some())
@@ -1129,6 +1218,7 @@ impl<E: Edge> Core<E> {
         clock: &mut impl FnMut() -> io::Result<u64>,
         poll: &mut impl FnMut(&mut [libc::pollfd], i32) -> io::Result<i32>,
     ) -> io::Result<()> {
+        self.repository_admission_ready()?;
         let sources: Vec<_> = self
             .slots
             .iter()
@@ -1155,6 +1245,13 @@ impl<E: Edge> Core<E> {
             .collect();
         let at = self.admission_clock(clock)?;
         if at >= end {
+            return Ok(());
+        }
+        if self.slots.iter().any(|slot| {
+            slot.accepted_at.is_none()
+                && slot.edge.setup_pending()
+                && slot.edge.setup_buffered_event()
+        }) {
             return Ok(());
         }
         // Block only while at least a full millisecond remains. Readable
@@ -1259,6 +1356,24 @@ impl<E: Edge> Core<E> {
             output: slot.edge.take_output(),
         })
     }
+}
+
+fn upstream_park_probe_allowed(work: Option<&super::protocol::PollWork>) -> bool {
+    work.is_none_or(|work| {
+        work.reads < super::protocol::MAX_READS && work.parsed < super::protocol::MAX_PARSE
+    })
+}
+
+fn poll_joined_after_drain<E: Edge>(
+    core: &mut Core<E>,
+    start: usize,
+    clock: &mut impl FnMut() -> io::Result<u64>,
+    drain: &mut impl FnMut(&mut Core<E>) -> bool,
+) -> bool {
+    if !drain(core) {
+        return false;
+    }
+    core.poll_post_joined(start, clock)
 }
 
 fn await_repository_admission<E: Edge>(
@@ -1824,6 +1939,7 @@ impl Scope {
                     first_fault: None,
                     published: [false; 4],
                     setup_admission: None,
+                    post_join_pending: false,
                 }))
             });
         if result.is_err() {
@@ -1894,6 +2010,7 @@ impl Scope {
                 first_fault: None,
                 published: [false; 4],
                 setup_admission,
+                post_join_pending: false,
             }))
         };
         let result = if installer {
@@ -2064,7 +2181,12 @@ impl Scope {
         let start = core.cursor;
         Self::pump(core, upstream, ledger, start);
         core.poll(&mut now);
-        Self::pump(core, upstream, ledger, start);
+        if poll_joined_after_drain(core, start, &mut now, &mut |core| {
+            Self::pump(core, upstream, ledger, start);
+            upstream_park_probe_allowed(upstream.as_ref().map(|endpoint| &endpoint.last_poll))
+        }) {
+            Self::pump(core, upstream, ledger, start);
+        }
     }
     pub fn request_complete(&mut self, id: &SlotId) -> io::Result<()> {
         let result = match now() {
@@ -2416,6 +2538,9 @@ mod tests {
         begin_ends: Vec<u64>,
         setup_pending: bool,
         setup_wait_source: Option<(i32, u64)>,
+        setup_buffered_event: bool,
+        post_join_pending: bool,
+        post_join_fault: Option<&'static str>,
         #[cfg(feature = "dev-tools")]
         setup_trace: Option<super::super::group::SetupTrace>,
     }
@@ -2429,6 +2554,12 @@ mod tests {
         }
         fn setup_wait_source(&self) -> Option<(i32, u64)> {
             self.setup_wait_source
+        }
+        fn setup_buffered_event(&self) -> bool {
+            self.setup_buffered_event
+        }
+        fn post_join_pending(&self) -> bool {
+            self.post_join_pending
         }
         fn take_events(&mut self) -> Vec<String> {
             self.events
@@ -2450,6 +2581,11 @@ mod tests {
         }
         fn poll(&mut self) -> io::Result<()> {
             self.events.borrow_mut().push(format!("poll:{}", self.name));
+            self.post_join_pending = false;
+            if let Some(reason) = self.post_join_fault {
+                self.facts.first_fault = Some(reason);
+                return Err(error(reason));
+            }
             if self.begun {
                 self.facts.status = Some(ExitStatus::from_raw(0));
                 self.facts.waits_known = true;
@@ -2479,6 +2615,9 @@ mod tests {
             begin_ends: vec![],
             setup_pending: false,
             setup_wait_source: None,
+            setup_buffered_event: false,
+            post_join_pending: false,
+            post_join_fault: None,
             #[cfg(feature = "dev-tools")]
             setup_trace: None,
         }
@@ -2934,6 +3073,332 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(core.hard_end, 50_000_001);
+    }
+
+    mod setup_schedule_tests {
+        use super::*;
+        use std::cell::Cell;
+
+        fn pending_core(buffered: bool, fd: i32) -> (Core<Fake>, SlotId) {
+            let mut core = Core::new(Rc::default(), 500_000_000);
+            let id = core
+                .admit(1, 32, |_| Ok(fake("joined", Rc::default())))
+                .unwrap();
+            core.slots[id.index].edge.setup_pending = true;
+            core.slots[id.index].edge.setup_wait_source = Some((fd, 20_000_000));
+            core.slots[id.index].edge.setup_buffered_event = buffered;
+            (core, id)
+        }
+
+        #[test]
+        fn setup_schedule_buffered_event_skips_wait_without_advancing_or_taking_output() {
+            let (mut core, id) = pending_core(true, 7);
+            let mut clocks = 0;
+            core.wait_repository_setup(
+                &mut || {
+                    clocks += 1;
+                    Ok(10_000_000)
+                },
+                &mut |_, _| panic!("complete buffered frame must return to original parser"),
+            )
+            .unwrap();
+            assert_eq!(clocks, 1);
+            assert!(core.slots[id.index].edge.setup_pending);
+            assert!(core.slots[id.index].accepted_at.is_none());
+            assert!(core.slots[id.index].completion_end.is_none());
+            assert!(!core.slots[id.index].output_taken);
+            assert_eq!(core.hard_end, 500_000_000);
+        }
+
+        #[test]
+        fn setup_schedule_partial_bytes_still_wait_on_the_original_fd_and_end() {
+            let (mut core, id) = pending_core(false, 7);
+            let mut calls = 0;
+            core.wait_repository_setup(&mut || Ok(19_950_000), &mut |fds, timeout| {
+                calls += 1;
+                assert_eq!(
+                    (fds.len(), fds[0].fd, fds[0].events, timeout),
+                    (1, 7, libc::POLLIN, 0)
+                );
+                Ok(0)
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert!(core.slots[id.index].edge.setup_pending);
+            assert!(core.slots[id.index].accepted_at.is_none());
+        }
+
+        #[test]
+        fn setup_schedule_buffer_shortcut_cannot_bypass_invalid_fd_clock_or_owner() {
+            let (mut invalid, _) = pending_core(true, -1);
+            assert_eq!(
+                invalid
+                    .wait_repository_setup(
+                        &mut || panic!("invalid FD refuses first"),
+                        &mut |_, _| { panic!("invalid FD must not poll") }
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                "SCOPE_SETUP_WAIT"
+            );
+            let (mut no_clock, id) = pending_core(true, 7);
+            assert!(no_clock
+                .wait_repository_setup(&mut || Err(error("INJECTED_CLOCK")), &mut |_, _| {
+                    panic!("clock failure must not poll")
+                })
+                .is_err());
+            assert_eq!(no_clock.cancel_end, Some(0));
+            assert_eq!(no_clock.slots[id.index].completion_end, Some(0));
+            for state in ["fault", "cancelled", "finished"] {
+                let (mut core, id) = pending_core(true, 7);
+                match state {
+                    "fault" => core.poison("ORIGINAL_FAULT"),
+                    "cancelled" => core.cancel_end = Some(10),
+                    _ => core.finished = true,
+                }
+                assert!(core
+                    .wait_repository_setup(
+                        &mut || panic!("closed owner must refuse"),
+                        &mut |_, _| { panic!("closed owner must not poll") }
+                    )
+                    .is_err());
+                assert!(core.slots[id.index].accepted_at.is_none());
+                assert!(!core.slots[id.index].output_taken);
+            }
+        }
+
+        #[test]
+        fn setup_schedule_exact_end_returns_to_deadline_parser_without_fake_acceptance() {
+            let (mut core, id) = pending_core(true, 7);
+            let mut clocks = 0;
+            core.wait_repository_setup(
+                &mut || {
+                    clocks += 1;
+                    Ok(20_000_000)
+                },
+                &mut |_, _| panic!("no wait beyond original end"),
+            )
+            .unwrap();
+            assert_eq!(clocks, 1);
+            assert_eq!(
+                core.slots[id.index].edge.setup_wait_source,
+                Some((7, 20_000_000))
+            );
+            assert!(core.slots[id.index].accepted_at.is_none());
+            assert!(!core.slots[id.index].output_taken);
+        }
+
+        #[test]
+        fn setup_schedule_join_retains_all_pipes_before_first_error_and_only_schedules_success() {
+            for state in ["success", "start_error", "attach_error", "both_errors"] {
+                let mut stage = Stage::Ready;
+                let mut pending = true;
+                let attached = Cell::new(false);
+                let started = if state == "start_error" || state == "both_errors" {
+                    Err(error("ORIGINAL_START"))
+                } else {
+                    Ok(())
+                };
+                let result = retain_group_start(&mut stage, &mut pending, started, || {
+                    attached.set(true);
+                    if state == "attach_error" || state == "both_errors" {
+                        Err(error("PIPE_ATTACH"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert!(
+                    attached.get(),
+                    "post-spawn error must not bypass handle retention"
+                );
+                assert!(matches!(stage, Stage::Park));
+                assert_eq!(pending, state == "success");
+                match state {
+                    "success" => assert!(result.is_ok()),
+                    "attach_error" => assert_eq!(result.unwrap_err().to_string(), "PIPE_ATTACH"),
+                    _ => assert_eq!(result.unwrap_err().to_string(), "ORIGINAL_START"),
+                }
+            }
+        }
+
+        #[test]
+        fn setup_schedule_postjoin_observes_once_after_drain_without_sleep_or_result_acceptance() {
+            let (mut core, id) = pending_core(false, 7);
+            core.slots[id.index].edge.post_join_pending = true;
+            let events = core.slots[id.index].edge.events.clone();
+            let original_cursor = core.cursor;
+            assert!(poll_joined_after_drain(
+                &mut core,
+                0,
+                &mut || Ok(19_970_000),
+                &mut |_| {
+                    events.borrow_mut().push("drain".into());
+                    true
+                }
+            ));
+            assert_eq!(events.borrow().as_slice(), ["drain", "poll:joined"]);
+            assert!(!core.slots[id.index].edge.post_join_pending);
+            assert!(!poll_joined_after_drain(
+                &mut core,
+                0,
+                &mut || panic!("no second observation"),
+                &mut |_| true
+            ));
+            assert_eq!(core.cursor, original_cursor);
+            assert_eq!(core.hard_end, 500_000_000);
+            assert!(core.slots[id.index].accepted_at.is_none());
+            assert!(!core.slots[id.index].output_taken);
+        }
+
+        #[test]
+        fn setup_schedule_parent_cancel_after_spawn_wins_before_extra_park_observation() {
+            let (mut core, id) = pending_core(false, 7);
+            core.slots[id.index].edge.post_join_pending = true;
+            let events = core.slots[id.index].edge.events.clone();
+            assert!(!poll_joined_after_drain(
+                &mut core,
+                0,
+                &mut || panic!("cancelled pass must stop"),
+                &mut |core| {
+                    core.cancel(Some("PARENT_CANCELLED"), 2, 3);
+                    true
+                }
+            ));
+            assert!(!events
+                .borrow()
+                .iter()
+                .any(|event| event.starts_with("poll:")));
+            assert_eq!(
+                core.owner.borrow().first_fault,
+                Some(ProtocolError("PARENT_CANCELLED"))
+            );
+            assert_eq!(core.slots[id.index].completion_end, Some(3));
+            assert!(core.slots[id.index].accepted_at.is_none());
+            assert!(!core.slots[id.index].output_taken);
+        }
+
+        #[test]
+        fn setup_schedule_exhausted_upstream_drain_defers_extra_probe_without_acceptance() {
+            for (reads, parsed, allowed) in [
+                (0, 0, true),
+                (
+                    super::super::super::protocol::MAX_READS - 1,
+                    super::super::super::protocol::MAX_PARSE - 1,
+                    true,
+                ),
+                (super::super::super::protocol::MAX_READS, 0, false),
+                (0, super::super::super::protocol::MAX_PARSE, false),
+            ] {
+                let work = super::super::super::protocol::PollWork { reads, parsed };
+                assert_eq!(upstream_park_probe_allowed(Some(&work)), allowed);
+                if allowed {
+                    continue;
+                }
+                let (mut core, id) = pending_core(false, 7);
+                core.slots[id.index].edge.post_join_pending = true;
+                let events = core.slots[id.index].edge.events.clone();
+                assert!(!poll_joined_after_drain(
+                    &mut core,
+                    0,
+                    &mut || {
+                        panic!("an exhausted upstream drain must precede any extra observation")
+                    },
+                    &mut |_| upstream_park_probe_allowed(Some(&work))
+                ));
+                assert!(core.slots[id.index].edge.post_join_pending);
+                assert!(events.borrow().is_empty());
+                assert!(core.slots[id.index].accepted_at.is_none());
+                assert!(!core.slots[id.index].output_taken);
+                // A later proved drain schedules the original Park path once.
+                assert!(poll_joined_after_drain(
+                    &mut core,
+                    0,
+                    &mut || Ok(2),
+                    &mut |_| { upstream_park_probe_allowed(None) }
+                ));
+                assert!(!core.slots[id.index].edge.post_join_pending);
+                assert_eq!(
+                    events
+                        .borrow()
+                        .iter()
+                        .filter(|event| event.starts_with("poll:"))
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        #[test]
+        fn setup_schedule_postjoin_failure_clock_and_exact_operation_end_remain_closed() {
+            for state in ["poll", "clock", "deadline", "owner", "closed"] {
+                let (mut core, id) = pending_core(false, 7);
+                core.slots[id.index].edge.post_join_pending = true;
+                if state == "poll" {
+                    core.slots[id.index].edge.post_join_fault = Some("ORIGINAL_PARK_FAULT");
+                }
+                if state == "owner" {
+                    core.poison("ORIGINAL_OWNER_FAULT");
+                }
+                if state == "closed" {
+                    core.owner.borrow_mut().admission_closed = true;
+                }
+                let events = core.slots[id.index].edge.events.clone();
+                poll_joined_after_drain(
+                    &mut core,
+                    0,
+                    &mut || match state {
+                        "clock" => Err(error("INJECTED_CLOCK")),
+                        "deadline" => Ok(450_000_000),
+                        _ => Ok(2),
+                    },
+                    &mut |_| true,
+                );
+                assert!(core.owner.borrow().first_fault.is_some());
+                assert!(core.cancel_end.is_some());
+                assert_eq!(
+                    events
+                        .borrow()
+                        .iter()
+                        .filter(|event| event.starts_with("poll:"))
+                        .count(),
+                    usize::from(state == "poll")
+                );
+                assert!(core.slots[id.index].accepted_at.is_none());
+                assert!(!core.slots[id.index].output_taken);
+                assert_eq!(core.hard_end, 500_000_000);
+            }
+        }
+
+        #[test]
+        fn setup_schedule_targeted_pass_keeps_the_original_fair_window_and_skips_ordinary_edges() {
+            let events = Rc::new(RefCell::new(vec![]));
+            let mut core = Core::new(Rc::default(), 500_000_000);
+            let mut ids = vec![];
+            for _ in 0..(SLOTS_PER_TURN + 2) {
+                let id = core
+                    .admit(1, 0, |_| Ok(fake("edge", events.clone())))
+                    .unwrap();
+                core.slots[id.index].edge.post_join_pending = true;
+                ids.push(id);
+            }
+            core.slots[ids[2].index].edge.post_join_pending = false;
+            let cursor = core.cursor;
+            assert!(core.poll_post_joined(0, &mut || Ok(2)));
+            assert_eq!(
+                events
+                    .borrow()
+                    .iter()
+                    .filter(|event| event.starts_with("poll:"))
+                    .count(),
+                SLOTS_PER_TURN - 1
+            );
+            assert!(core.slots[ids[SLOTS_PER_TURN].index].edge.post_join_pending);
+            assert_eq!(core.cursor, cursor);
+            assert!(core
+                .slots
+                .iter()
+                .all(|slot| slot.accepted_at.is_none() && !slot.output_taken));
+        }
     }
 
     #[test]

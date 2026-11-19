@@ -136,6 +136,62 @@ fn pause() {
     std::thread::sleep(Duration::from_millis(1));
 }
 
+#[derive(Default)]
+struct ParkObservation {
+    #[cfg(feature = "dev-tools")]
+    before: Option<u64>,
+    #[cfg(feature = "dev-tools")]
+    frame_observed: bool,
+    #[cfg(feature = "dev-tools")]
+    deadline: Option<(&'static str, u64)>,
+}
+fn poll_park_frame<S: Read + Write>(
+    channel: &mut Channel<S>,
+    expected: impl FnOnce() -> String,
+    end: u64,
+    clock: &mut impl FnMut() -> io::Result<u64>,
+    observation: &mut ParkObservation,
+) -> io::Result<bool> {
+    let before = clock()?;
+    #[cfg(feature = "dev-tools")]
+    {
+        observation.before = Some(before);
+    }
+    #[cfg(not(feature = "dev-tools"))]
+    let _ = observation;
+    if before >= end {
+        #[cfg(feature = "dev-tools")]
+        {
+            observation.deadline = Some(("PARK_BEFORE_RECEIVE", before));
+        }
+        return Err(refused("GROUP_DEADLINE"));
+    }
+    let body = channel.receive()?;
+    let after = clock()?;
+    #[cfg(feature = "dev-tools")]
+    {
+        observation.frame_observed |= body.is_some();
+    }
+    if after >= end {
+        #[cfg(feature = "dev-tools")]
+        {
+            observation.deadline = Some(("PARK_AFTER_RECEIVE", after));
+        }
+        return Err(refused("GROUP_DEADLINE"));
+    }
+    let Some(body) = body else {
+        return if channel.eof {
+            Err(refused("GROUP_EOF"))
+        } else {
+            Ok(false)
+        };
+    };
+    if body != expected() {
+        return Err(refused("GROUP_PARK"));
+    }
+    Ok(true)
+}
+
 /// No cached PID is a signalling capability. This machine permits GONE only
 /// while the keeper reservation is held and forbids all operations afterward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +308,9 @@ impl Channel {
     }
 }
 impl<S: Read + Write> Channel<S> {
+    fn buffered_event(&self) -> bool {
+        self.eof || self.pending.contains(&b'\n')
+    }
     fn charge(&mut self, bytes: usize) -> io::Result<()> {
         self.wire = self
             .wire
@@ -686,6 +745,9 @@ enum KeeperProgram<'a> {
     Verified(&'a super::image::VerifiedKeeperImage),
 }
 impl GroupLease {
+    pub(super) fn setup_buffered_event(&self) -> bool {
+        self.channel.buffered_event()
+    }
     pub(super) fn setup_wait_source(&self) -> (i32, u64) {
         (
             self.channel.stream.as_raw_fd(),
@@ -1156,42 +1218,27 @@ impl GroupLease {
                 return Err(refused("GROUP_STATE"));
             }
             let end = self.park_end.ok_or_else(|| refused("GROUP_STATE"))?;
-            let before = now()?;
-            #[cfg(feature = "dev-tools")]
-            self.setup_trace.first_park_poll_ns.get_or_insert(before);
-            if before >= end {
-                #[cfg(feature = "dev-tools")]
-                self.setup_trace
-                    .deadline_observed
-                    .get_or_insert(("PARK_BEFORE_RECEIVE", before));
-                return Err(refused("GROUP_DEADLINE"));
-            }
-            let body = self.channel.receive()?;
-            let after = now()?;
+            let expected = (self.keeper_pid, self.owner_pgid, self.sid);
+            let mut observation = ParkObservation::default();
+            let received = poll_park_frame(
+                &mut self.channel,
+                || format!("PARKED|{}|{}|{}", expected.0, expected.1, expected.2),
+                end,
+                &mut now,
+                &mut observation,
+            );
             #[cfg(feature = "dev-tools")]
             {
-                self.setup_trace.park_frame_observed |= body.is_some();
-            }
-            if after >= end {
-                #[cfg(feature = "dev-tools")]
-                self.setup_trace
-                    .deadline_observed
-                    .get_or_insert(("PARK_AFTER_RECEIVE", after));
-                return Err(refused("GROUP_DEADLINE"));
-            }
-            let Some(body) = body else {
-                if self.channel.eof {
-                    return Err(refused("GROUP_EOF"));
+                if let Some(before) = observation.before {
+                    self.setup_trace.first_park_poll_ns.get_or_insert(before);
                 }
+                self.setup_trace.park_frame_observed |= observation.frame_observed;
+                if let Some(deadline) = observation.deadline {
+                    self.setup_trace.deadline_observed.get_or_insert(deadline);
+                }
+            }
+            if !received? {
                 return Ok(false);
-            };
-            if body
-                != format!(
-                    "PARKED|{}|{}|{}",
-                    self.keeper_pid, self.owner_pgid, self.sid
-                )
-            {
-                return Err(refused("GROUP_PARK"));
             }
             self.settlement.expected_park = None;
             self.settlement
@@ -1642,7 +1689,7 @@ fn wait_keeper_control<G: GroupOps, S: Read + Write>(
 ) -> io::Result<()> {
     session.check_authority()?;
     let at = session.check_time(clock)?;
-    if channel.eof || channel.pending.contains(&b'\n') {
+    if channel.buffered_event() {
         return Ok(());
     }
     let mut end = session.end;
@@ -2671,6 +2718,249 @@ mod tests {
             Ok(())
         }
     }
+    mod setup_schedule_tests {
+        use super::*;
+
+        #[test]
+        fn setup_schedule_unready_and_expired_polls_do_not_format_an_expected_frame() {
+            for expired in [false, true] {
+                let mut channel = scripted_channel(&[]);
+                if expired {
+                    channel.pending = format!("{}|PARKED|42|7|7\n", "a".repeat(32)).into_bytes();
+                }
+                let formatted = std::cell::Cell::new(0);
+                let result = poll_park_frame(
+                    &mut channel,
+                    || {
+                        formatted.set(formatted.get() + 1);
+                        "PARKED|42|7|7".to_owned()
+                    },
+                    20_000_000,
+                    &mut || Ok(if expired { 20_000_000 } else { 1 }),
+                    &mut ParkObservation::default(),
+                );
+                assert_eq!(formatted.get(), 0);
+                if expired {
+                    assert_eq!(result.unwrap_err().to_string(), "GROUP_DEADLINE");
+                    assert!(channel.buffered_event());
+                    assert_eq!(channel.stream.reads, 0);
+                } else {
+                    assert!(!result.unwrap());
+                    assert_eq!(channel.stream.reads, 1);
+                }
+            }
+        }
+
+        #[test]
+        fn setup_schedule_actual_eighth_read_frame_returns_to_original_park_parser() {
+            let nonce = "a".repeat(32);
+            let mut channel = scripted_channel(&[]);
+            channel
+                .stream
+                .actions
+                .extend((0..7).map(|_| ReadAction::Interrupted));
+            channel.stream.actions.push_back(ReadAction::Bytes(
+                format!("{nonce}|PARKED|42|7|7\n").into_bytes(),
+            ));
+            assert!(matches!(
+                channel.receive_event().unwrap(),
+                Receive::BudgetYield
+            ));
+            assert_eq!(channel.stream.reads, 8);
+            assert!(channel.buffered_event());
+            let reads = channel.stream.reads;
+            assert!(poll_park_frame(
+                &mut channel,
+                || "PARKED|42|7|7".to_owned(),
+                20_000_000,
+                &mut || Ok(19_970_000),
+                &mut ParkObservation::default()
+            )
+            .unwrap());
+            assert_eq!(
+                channel.stream.reads, reads,
+                "already buffered frame needs no ninth read"
+            );
+            assert!(!channel.buffered_event());
+            assert!(channel.stream.output.is_empty());
+        }
+
+        #[test]
+        fn setup_schedule_actual_eighth_read_ready_frame_is_buffered_not_phantom_readiness() {
+            let mut channel = scripted_channel(&[]);
+            channel
+                .stream
+                .actions
+                .extend((0..7).map(|_| ReadAction::Interrupted));
+            channel.stream.actions.push_back(ReadAction::Bytes(
+                format!("{}|READY|42|42|7\n", "a".repeat(32)).into_bytes(),
+            ));
+            assert!(matches!(
+                channel.receive_event().unwrap(),
+                Receive::BudgetYield
+            ));
+            assert_eq!(channel.stream.reads, 8);
+            assert!(channel.buffered_event());
+            assert_eq!(channel.receive().unwrap().as_deref(), Some("READY|42|42|7"));
+            assert_eq!(channel.stream.reads, 8);
+            assert!(!channel.buffered_event());
+        }
+
+        #[test]
+        fn setup_schedule_one_quiescent_park_probe_is_nonblocking_without_retry() {
+            let mut channel = scripted_channel(&[]);
+            assert!(!poll_park_frame(
+                &mut channel,
+                || "PARKED|42|7|7".to_owned(),
+                20_000_000,
+                &mut || Ok(1),
+                &mut ParkObservation::default()
+            )
+            .unwrap());
+            assert_eq!(channel.stream.reads, 1);
+            assert!(!channel.buffered_event());
+            assert!(channel.stream.output.is_empty());
+        }
+
+        #[test]
+        fn setup_schedule_missing_post_receive_clock_does_not_accept_the_park_frame() {
+            let mut channel = scripted_channel(&[]);
+            channel.pending = format!("{}|PARKED|42|7|7\n", "a".repeat(32)).into_bytes();
+            let mut reads = 0;
+            assert_eq!(
+                poll_park_frame(
+                    &mut channel,
+                    || "PARKED|42|7|7".to_owned(),
+                    20_000_000,
+                    &mut || {
+                        reads += 1;
+                        if reads == 1 {
+                            Ok(1)
+                        } else {
+                            Err(refused("GROUP_CLOCK"))
+                        }
+                    },
+                    &mut ParkObservation::default()
+                )
+                .unwrap_err()
+                .to_string(),
+                "GROUP_CLOCK"
+            );
+            assert_eq!(reads, 2);
+            assert_eq!(channel.stream.reads, 0);
+        }
+
+        #[test]
+        fn setup_schedule_buffered_wrong_nonce_or_frame_does_not_authorize_park() {
+            for (line, reason) in [
+                (format!("{}|PARKED|42|7|7\n", "b".repeat(32)), "GROUP_NONCE"),
+                (format!("{}|READY|42|42|7\n", "a".repeat(32)), "GROUP_PARK"),
+            ] {
+                let mut channel = scripted_channel(&[]);
+                channel.pending = line.into_bytes();
+                assert!(channel.buffered_event());
+                assert_eq!(
+                    poll_park_frame(
+                        &mut channel,
+                        || "PARKED|42|7|7".to_owned(),
+                        20_000_000,
+                        &mut || Ok(1),
+                        &mut ParkObservation::default()
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                    reason
+                );
+                assert_eq!(channel.stream.reads, 0);
+                assert!(channel.stream.output.is_empty());
+            }
+        }
+
+        #[test]
+        fn setup_schedule_partial_bytes_and_eof_are_distinct_from_park_acceptance() {
+            let mut partial = scripted_channel(format!("{}|PARKED|", "a".repeat(32)).as_bytes());
+            assert!(matches!(
+                partial.receive_event().unwrap(),
+                Receive::BudgetYield
+            ));
+            assert!(!partial.buffered_event());
+            assert!(!poll_park_frame(
+                &mut partial,
+                || "PARKED|42|7|7".to_owned(),
+                20_000_000,
+                &mut || Ok(1),
+                &mut ParkObservation::default()
+            )
+            .unwrap());
+            let mut eof = scripted_channel(&[]);
+            eof.stream.actions.push_back(ReadAction::Bytes(vec![]));
+            assert!(matches!(eof.receive_event().unwrap(), Receive::Eof));
+            assert!(eof.buffered_event());
+            assert_eq!(
+                poll_park_frame(
+                    &mut eof,
+                    || "PARKED|42|7|7".to_owned(),
+                    20_000_000,
+                    &mut || Ok(1),
+                    &mut ParkObservation::default()
+                )
+                .unwrap_err()
+                .to_string(),
+                "GROUP_EOF"
+            );
+        }
+
+        #[test]
+        fn setup_schedule_original_park_checks_refuse_exact_end_and_post_receive_expiry() {
+            for before_expired in [true, false] {
+                let mut channel = scripted_channel(&[]);
+                channel.pending = format!("{}|PARKED|42|7|7\n", "a".repeat(32)).into_bytes();
+                let mut samples = if before_expired {
+                    vec![20_000_000].into_iter()
+                } else {
+                    vec![19_999_999, 20_000_000].into_iter()
+                };
+                assert_eq!(
+                    poll_park_frame(
+                        &mut channel,
+                        || "PARKED|42|7|7".to_owned(),
+                        20_000_000,
+                        &mut || Ok(samples.next().expect("bounded clock samples")),
+                        &mut ParkObservation::default()
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                    "GROUP_DEADLINE"
+                );
+                assert_eq!(channel.stream.reads, 0);
+                if before_expired {
+                    assert!(channel.buffered_event());
+                }
+                assert!(channel.stream.output.is_empty());
+            }
+        }
+
+        #[test]
+        fn setup_schedule_missing_clock_leaves_buffered_frame_unparsed() {
+            let mut channel = scripted_channel(&[]);
+            channel.pending = format!("{}|PARKED|42|7|7\n", "a".repeat(32)).into_bytes();
+            assert_eq!(
+                poll_park_frame(
+                    &mut channel,
+                    || "PARKED|42|7|7".to_owned(),
+                    20_000_000,
+                    &mut || Err(refused("GROUP_CLOCK")),
+                    &mut ParkObservation::default()
+                )
+                .unwrap_err()
+                .to_string(),
+                "GROUP_CLOCK"
+            );
+            assert!(channel.buffered_event());
+            assert_eq!(channel.stream.reads, 0);
+        }
+    }
+
     mod keeper_readiness_tests {
         use super::*;
         use std::cell::Cell;

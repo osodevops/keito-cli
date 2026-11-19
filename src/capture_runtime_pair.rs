@@ -222,8 +222,8 @@ pub fn verify(
     }
     let parent = core.parent().ok_or_else(refused)?;
     let guard = parent.join("keito-capture-guard");
-    let core_sha256 = hash_file(core)?;
-    let guard_sha256 = hash_file(&guard)?;
+    let core_sha256 = crate::capture_profile_measure!(CoreHash, hash_file(core))?;
+    let guard_sha256 = crate::capture_profile_measure!(GuardHash, hash_file(&guard))?;
     if guard_sha256 != guard_hash {
         return Err(refused());
     }

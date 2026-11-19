@@ -847,7 +847,7 @@ impl CaptureTransaction<'_> {
         if let Some(invocation) = invocation {
             invocation.validate(&directory)?;
         }
-        inner.commit().map_err(storage_error)?;
+        crate::capture_profile_measure!(Commit, inner.commit()).map_err(storage_error)?;
         drop(_authority);
         Ok(())
     }
