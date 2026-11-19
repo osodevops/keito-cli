@@ -1,6 +1,22 @@
 use serde_json::json;
 use thiserror::Error;
 
+/// Closed failure reasons: never retain arbitrary probe output or error text.
+#[derive(Clone, Copy, Debug, Error, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureProbeReason {
+    #[error("ownership admission refused")]
+    AdmissionRefused,
+    #[error("original deadline exceeded")]
+    Deadline,
+    #[error("monotonic clock unavailable")]
+    Clock,
+    #[error("ownership proof unavailable")]
+    Ownership,
+    #[error("probe unavailable")]
+    Unavailable,
+}
+
 #[derive(Error, Debug)]
 pub enum AppError {
     #[error("Authentication error: {0}")]
@@ -26,6 +42,13 @@ pub enum AppError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[error("Coding-agent version probe refused: {reason}")]
+    CaptureVersionProbe {
+        reason: CaptureProbeReason,
+        /// A later explicit finish failed; false means not reported, not clean.
+        cleanup_unverified: bool,
+    },
 }
 
 impl AppError {
@@ -39,6 +62,7 @@ impl AppError {
             AppError::ServerError(_) => 6,
             AppError::Network(_) => 7,
             AppError::Config(_) => 8,
+            AppError::CaptureVersionProbe { .. } => 8,
         }
     }
 
@@ -66,6 +90,9 @@ impl AppError {
             }
             AppError::Auth(_) => Some("Set KEITO_API_KEY env var or run 'keito auth login'"),
             AppError::Config(_) => Some("Run 'keito auth login' to configure"),
+            AppError::CaptureVersionProbe { .. } => Some(
+                "Inspect 'keito capture status --json' and retained failure evidence before retrying",
+            ),
             AppError::RateLimited { .. } => Some("Retry after the server's Retry-After delay"),
             _ => None,
         }
@@ -73,6 +100,14 @@ impl AppError {
 
     pub fn details(&self) -> Option<serde_json::Value> {
         match self {
+            AppError::CaptureVersionProbe {
+                reason,
+                cleanup_unverified,
+            } => Some(json!({
+                "kind": "capture_version_probe", "reason": reason,
+                "cleanup_unverified": cleanup_unverified,
+                "cleanup_status": if *cleanup_unverified { "unverified" } else { "not_reported" },
+            })),
             AppError::NotFound(msg) => {
                 if let Some(available_str) = msg
                     .strip_suffix(|_: char| false)

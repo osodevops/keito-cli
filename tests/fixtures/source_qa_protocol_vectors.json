@@ -1,0 +1,181 @@
+{
+  "schema": 1,
+  "cases": [
+    {
+      "name": "empty-child-eof",
+      "parent": false,
+      "close_writer": true,
+      "expected": "fault",
+      "chunks": []
+    },
+    {
+      "name": "parent-eof-before-live",
+      "parent": true,
+      "close_writer": true,
+      "expected": "cancel",
+      "chunks": []
+    },
+    {
+      "name": "live-open",
+      "parent": false,
+      "close_writer": false,
+      "expected": "pending",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n"
+      ]
+    },
+    {
+      "name": "terminal-open",
+      "parent": false,
+      "close_writer": false,
+      "expected": "pending",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|SETTLED|12345\n"
+      ]
+    },
+    {
+      "name": "clean-zero-children",
+      "parent": false,
+      "close_writer": true,
+      "expected": "clean",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|SETTLED|12345\n"
+      ]
+    },
+    {
+      "name": "valid-depth-eight",
+      "parent": false,
+      "close_writer": true,
+      "expected": "clean",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12345|12346|00000000000000000000000000000001|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12346|12347|00000000000000000000000000000002|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12347|12348|00000000000000000000000000000003|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12348|12349|00000000000000000000000000000004|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12349|12350|00000000000000000000000000000005|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12350|12351|00000000000000000000000000000006|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12351|12352|00000000000000000000000000000007|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12352|12353|00000000000000000000000000000008|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12352|12353|00000000000000000000000000000008|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12351|12352|00000000000000000000000000000007|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12350|12351|00000000000000000000000000000006|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12349|12350|00000000000000000000000000000005|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12348|12349|00000000000000000000000000000004|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12347|12348|00000000000000000000000000000003|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12346|12347|00000000000000000000000000000002|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12345|12346|00000000000000000000000000000001|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|SETTLED|12345\n"
+      ]
+    },
+    {
+      "name": "reused-pid-new-nonce-after-wait",
+      "parent": false,
+      "close_writer": true,
+      "expected": "clean",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12345|12346|00000000000000000000000000000001|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12345|12346|00000000000000000000000000000001|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12345|12346|00000000000000000000000000000002|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12345|12346|00000000000000000000000000000002|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|SETTLED|12345\n"
+      ]
+    },
+    {
+      "name": "duplicate-open-pid-new-nonce",
+      "parent": false,
+      "close_writer": true,
+      "expected": "fault",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12345|12346|00000000000000000000000000000001|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12345|12346|00000000000000000000000000000002|1\n"
+      ]
+    },
+    {
+      "name": "closed-child-cannot-register",
+      "parent": false,
+      "close_writer": true,
+      "expected": "fault",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12345|12346|00000000000000000000000000000001|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|WAITED|12345|12346|00000000000000000000000000000001|0\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12346|12347|00000000000000000000000000000002|1\n"
+      ]
+    },
+    {
+      "name": "cycle-to-root",
+      "parent": false,
+      "close_writer": true,
+      "expected": "fault",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12345|12346|00000000000000000000000000000001|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12346|12345|00000000000000000000000000000002|1\n"
+      ]
+    },
+    {
+      "name": "unwaited-child-terminal",
+      "parent": false,
+      "close_writer": true,
+      "expected": "fault",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|REGISTER|12345|12346|00000000000000000000000000000001|1\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|SETTLED|12345\n"
+      ]
+    },
+    {
+      "name": "noncanonical-integer",
+      "parent": false,
+      "close_writer": true,
+      "expected": "fault",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|012345\n"
+      ]
+    },
+    {
+      "name": "failed-terminal",
+      "parent": false,
+      "close_writer": true,
+      "expected": "fault",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|FAILED|12345\n"
+      ]
+    },
+    {
+      "name": "deadline-cancel",
+      "parent": true,
+      "close_writer": true,
+      "expected": "cancel",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|CANCEL|12345|100\n"
+      ]
+    },
+    {
+      "name": "legacy-cancel-missing-deadline",
+      "parent": true,
+      "close_writer": true,
+      "expected": "fault",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|CANCEL|12345\n"
+      ]
+    },
+    {
+      "name": "terminal-trailing-raw",
+      "parent": false,
+      "close_writer": true,
+      "expected": "fault",
+      "chunks": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|LIVE|12345\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|SETTLED|12345\n",
+        "trailing"
+      ]
+    }
+  ]
+}

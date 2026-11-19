@@ -1,0 +1,4254 @@
+//! Metadata-only durable capture. Raw hook JSON is never a storage type.
+use crate::capture_authority::AuthorityGuard;
+use crate::capture_invocations::{self, Permit};
+use crate::capture_usage::{
+    read_active_session, read_active_session_excluding_request_ids,
+    read_active_session_request_ids, ApprovedActiveSession, Harness,
+};
+use crate::capture_usage_ledger::UsageLedger;
+use crate::cli::capture::CaptureEvent;
+use crate::error::AppError;
+use chrono::{DateTime, SecondsFormat};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Command;
+#[cfg(feature = "dev-tools")]
+use std::time::Duration;
+
+pub const MAX_EVENT_BYTES: usize = 1024 * 1024;
+pub const MAX_BODY_BYTES: usize = 16 * 1024;
+const MAX_QUEUE_BYTES: i64 = 100 * 1024 * 1024;
+const MAX_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
+const POLICY: &str = "METADATA_ONLY_OBSERVED_TURNS_V1";
+
+fn storage_error(_: impl std::fmt::Display) -> AppError {
+    AppError::Config("Capture storage unavailable; inspect disk space and permissions. Evidence was not discarded.".into())
+}
+pub fn hash(value: impl AsRef<[u8]>) -> String {
+    Sha256::digest(value.as_ref())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+pub fn identifier(value: &str) -> Result<(), AppError> {
+    if value.is_empty()
+        || !value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || value.contains("..")
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+        || [
+            "kto_",
+            "sk-",
+            "sk_",
+            "AKIA",
+            "ghp_",
+            "gho_",
+            "github_pat_",
+            "xoxb-",
+            "xoxp-",
+        ]
+        .iter()
+        .any(|p| value.starts_with(p))
+    {
+        return Err(AppError::InvalidInput(
+            "Capture identifier rejected; use an opaque identifier without paths or credentials"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+pub fn version_identifier(value: &str) -> Result<(), AppError> {
+    identifier(value)
+}
+
+fn timestamp(seconds: i64) -> Result<String, AppError> {
+    DateTime::from_timestamp(seconds, 0)
+        .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .ok_or_else(|| AppError::InvalidInput("Invalid capture clock".into()))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Clock {
+    pub wall: i64,
+    pub monotonic: i64,
+    pub boot: String,
+}
+#[cfg(target_os = "macos")]
+fn native_boot_identity_from(
+    read: impl FnOnce(&mut libc::timeval, &mut usize) -> i32,
+) -> Option<String> {
+    let mut value = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut length = std::mem::size_of::<libc::timeval>();
+    if read(&mut value, &mut length) != 0
+        || length != std::mem::size_of::<libc::timeval>()
+        || value.tv_sec <= 0
+        || !(0..1_000_000).contains(&value.tv_usec)
+    {
+        return None;
+    }
+    // Never hash ABI padding, localized dates or environment-controlled text.
+    // A pre-upgrade active clock deliberately differs and closes incomplete.
+    Some(hash(format!(
+        "macos-kern-boottime-v1:{}:{}",
+        value.tv_sec, value.tv_usec
+    )))
+}
+#[cfg(target_os = "macos")]
+fn native_boot_identity() -> Option<String> {
+    native_boot_identity_from(|value, length| {
+        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+        // Fixed read-only MIB and exact initialized output ABI. NULL newp and
+        // zero newlen prohibit a write; no subprocess, cache or fallback.
+        unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                (value as *mut libc::timeval).cast(),
+                length,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
+    })
+}
+impl Clock {
+    #[cfg(unix)]
+    pub fn now() -> Result<Self, AppError> {
+        let mut owner = crate::capture_command_owner::CommandOwner::standalone()?;
+        let result = Self::now_with(&mut owner);
+        owner.finish(result)
+    }
+    #[cfg(unix)]
+    pub(crate) fn now_with(
+        runner: &mut impl crate::process_ownership::probes::LeafRunner,
+    ) -> Result<Self, AppError> {
+        // Retain the explicit containing runner API. macOS boot metadata is
+        // now a direct read; repository commands still use the same owner.
+        let _ = runner;
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // CLOCK_MONOTONIC is system-wide across hook processes, unlike Instant.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+            return Err(AppError::Config(
+                "Monotonic clock unavailable; capture paused".into(),
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        let boot = native_boot_identity();
+        #[cfg(not(target_os = "macos"))]
+        let boot = { fs::read("/proc/sys/kernel/random/boot_id").ok().map(hash) };
+        Ok(Self {
+            wall: chrono::Utc::now().timestamp(),
+            monotonic: time.tv_sec,
+            boot: boot.ok_or_else(|| {
+                AppError::Config("Boot identity unavailable; capture paused".into())
+            })?,
+        })
+    }
+    #[cfg(not(unix))]
+    pub fn now() -> Result<Self, AppError> {
+        Err(AppError::Config(
+            "Capture timing is not qualified on this platform".into(),
+        ))
+    }
+    fn elapsed(&self, end: &Self) -> Option<i64> {
+        let wall = end.wall.checked_sub(self.wall)?;
+        let mono = end.monotonic.checked_sub(self.monotonic)?;
+        (self.boot == end.boot
+            && (0..=MAX_INTERVAL_SECONDS).contains(&wall)
+            && (0..=MAX_INTERVAL_SECONDS).contains(&mono)
+            && (wall - mono).abs() <= 2)
+            .then_some(wall)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Repository {
+    pub key: String,
+    pub remote_hash: String,
+    pub hint_hash: String,
+    pub linked_without_hint: bool,
+    pub disabled: bool,
+}
+#[cfg(unix)]
+fn repository_command(directory: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(directory).args(args);
+    command
+}
+#[cfg(unix)]
+fn repository_ownership_error(_: std::io::Error) -> AppError {
+    AppError::Config("Repository command ownership unavailable; capture paused".into())
+}
+#[cfg(unix)]
+fn repository_text(
+    result: crate::process_ownership::scope::CommandResult,
+    empty_no_match: bool,
+) -> Result<String, AppError> {
+    crate::process_ownership::probes::text(result, empty_no_match)
+        .map_err(|_| AppError::Config("Capture requires an identifiable Git repository".into()))
+}
+#[cfg(unix)]
+fn git_with(
+    runner: &mut impl crate::process_ownership::probes::LeafRunner,
+    directory: &Path,
+    args: &[&str],
+    empty_no_match: bool,
+) -> Result<String, AppError> {
+    let command = repository_command(directory, args);
+    let result = runner
+        .output(
+            command,
+            if empty_no_match { 1024 * 1024 } else { 8192 },
+            8192,
+        )
+        .map_err(repository_ownership_error)?;
+    repository_text(result, empty_no_match)
+}
+impl Repository {
+    pub fn matches_binding(&self, binding: &Binding) -> bool {
+        !self.disabled
+            && self.remote_hash == binding.remote_hash
+            && (self.linked_without_hint || self.hint_hash == binding.hint_hash)
+    }
+    pub fn resolve(directory: &Path) -> Result<Self, AppError> {
+        #[cfg(unix)]
+        {
+            let mut owner = crate::capture_command_owner::CommandOwner::standalone()?;
+            let result = Self::resolve_with(directory, &mut owner);
+            owner.finish(result)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = directory;
+            Err(AppError::Config("Automatic capture is unsupported on this platform; manual time commands remain available".into()))
+        }
+    }
+    #[cfg(unix)]
+    pub(crate) fn resolve_with(
+        directory: &Path,
+        runner: &mut impl crate::process_ownership::probes::LeafRunner,
+    ) -> Result<Self, AppError> {
+        let root_args = &["rev-parse", "--show-toplevel"];
+        let common_args = &["rev-parse", "--path-format=absolute", "--git-common-dir"];
+        let identity_args = &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ];
+        let remotes_args = &["config", "--get-regexp", "^remote\\..*\\.url$"];
+        let cohort = runner
+            .repository_outputs([
+                repository_command(directory, identity_args),
+                repository_command(directory, remotes_args),
+            ])
+            .transpose()
+            .map_err(repository_ownership_error)?;
+        let (root, common, remotes) = match cohort {
+            Some([identity, remotes]) => {
+                let identity = crate::process_ownership::probes::text_untrimmed(identity, false)
+                    .map_err(|_| {
+                        AppError::Config("Capture requires an identifiable Git repository".into())
+                    })?;
+                let remotes = repository_text(remotes, true)?;
+                let framed = identity.strip_suffix('\n').unwrap_or(&identity);
+                let mut lines = framed.split('\n');
+                let root = lines.next().unwrap_or_default();
+                let common = lines.next().ok_or_else(|| {
+                    AppError::Config("Capture requires an identifiable Git repository".into())
+                })?;
+                let (root, common) = if lines.next().is_some() {
+                    // Git does not quote these paths, even with --sq. Never
+                    // guess a newline-containing pathname's field boundary.
+                    // Read the original two commands under the SAME owner/end.
+                    (
+                        git_with(runner, directory, root_args, false)?,
+                        git_with(runner, directory, common_args, false)?,
+                    )
+                } else if root.is_empty()
+                    || common.is_empty()
+                    || root.len() >= 8192
+                    || common.len() >= 8192
+                {
+                    return Err(AppError::Config(
+                        "Capture requires an identifiable Git repository".into(),
+                    ));
+                } else {
+                    // Match the legacy classifier for EACH scalar; approval
+                    // and hooks must select the same mapping/disabled policy.
+                    let root = root.trim();
+                    let common = common.trim();
+                    if root.is_empty() || common.is_empty() {
+                        return Err(AppError::Config(
+                            "Capture requires an identifiable Git repository".into(),
+                        ));
+                    }
+                    (root.to_owned(), common.to_owned())
+                };
+                (
+                    PathBuf::from(root).canonicalize().map_err(storage_error)?,
+                    PathBuf::from(common)
+                        .canonicalize()
+                        .map_err(storage_error)?,
+                    remotes,
+                )
+            }
+            None => {
+                let root = PathBuf::from(git_with(runner, directory, root_args, false)?)
+                    .canonicalize()
+                    .map_err(storage_error)?;
+                let common = PathBuf::from(git_with(runner, directory, common_args, false)?)
+                    .canonicalize()
+                    .map_err(storage_error)?;
+                (
+                    root,
+                    common,
+                    git_with(runner, directory, remotes_args, true)?,
+                )
+            }
+        };
+        // All remotes participate in consent; adding/replacing one invalidates it.
+        // Raw remotes may contain credentials. Only their digest is ever retained.
+        let mut remotes: Vec<_> = remotes.lines().collect();
+        remotes.sort_unstable();
+        let key = hash(common.to_string_lossy().as_bytes());
+        let remote_hash = hash(remotes.join("\n"));
+        let hint_path = root.join(".keito/config.yml");
+        let mut disabled = false;
+        let hint_hash = if hint_path.exists() {
+            if fs::symlink_metadata(&hint_path)
+                .map_err(storage_error)?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(AppError::Config(
+                    "Repository mapping hint cannot be a symlink".into(),
+                ));
+            }
+            let file = fs::File::open(&hint_path).map_err(storage_error)?;
+            let mut bytes = Vec::new();
+            file.take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(storage_error)?;
+            if bytes.len() > 64 * 1024 {
+                return Err(AppError::Config("Repository mapping hint too large".into()));
+            }
+            // Hash only mapping/policy fields, never persist the original YAML.
+            let mut budget = serde_saphyr::Budget::default();
+            budget.max_depth = 16;
+            budget.max_events = 4096;
+            budget.max_nodes = 2048;
+            budget.max_documents = 1;
+            budget.max_aliases = 64;
+            budget.max_anchors = 16;
+            budget.max_recorded_anchor_events = 4096;
+            budget.max_recorded_anchor_bytes = 64 * 1024;
+            budget.max_total_scalar_bytes = 64 * 1024;
+            let mut options = serde_saphyr::Options::default();
+            options.budget = Some(budget);
+            options.alias_limits.max_total_replayed_events = 4096;
+            options.alias_limits.max_replay_stack_depth = 16;
+            options.alias_limits.max_alias_expansions_per_anchor = 64;
+            let yaml: serde_json::Value = serde_saphyr::from_slice_with_options(&bytes, options)
+                .map_err(|_| {
+                    AppError::Config("Invalid or over-budget repository mapping hint".into())
+                })?;
+            disabled = yaml
+                .get("agent_tracking")
+                .and_then(|v| v.get("enabled"))
+                .and_then(|v| v.as_bool())
+                == Some(false);
+            let fields = [
+                "workspace_id",
+                "client_id",
+                "project_id",
+                "task_id",
+                "agent_tracking",
+            ];
+            let allowlisted: Vec<_> = fields.iter().map(|k| (k, yaml.get(*k).cloned())).collect();
+            hash(serde_json::to_vec(&allowlisted).map_err(storage_error)?)
+        } else {
+            hash(b"no-mapping-hint")
+        };
+        let linked_without_hint = root.join(".git").is_file() && !hint_path.exists();
+        Ok(Self {
+            key,
+            remote_hash,
+            hint_hash,
+            linked_without_hint,
+            disabled,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Binding {
+    pub repository_key: String,
+    #[serde(default)]
+    pub remote_hash: String,
+    pub hint_hash: String,
+    pub id: String,
+    pub version: i64,
+    pub workspace_id: String,
+    pub owner_id: String,
+    pub origin_hash: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub agents: Vec<String>,
+    pub paused: bool,
+    pub revoked: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Segment {
+    pub segment_key: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub duration_seconds: i64,
+    pub completeness: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ActiveTurn {
+    key: String,
+    clock: Option<Clock>,
+    part: usize,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct NumericAuthority {
+    profile_id: String,
+    profile_digest: String,
+    epoch: u64,
+    #[serde(default)]
+    source_identity: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub source_session_id: String,
+    pub source_namespace: String,
+    pub harness_version: String,
+    pub binding: Binding,
+    pub started_at: i64,
+    pub observed_through: i64,
+    active: Option<ActiveTurn>,
+    pub segments: Vec<Segment>,
+    queued_segments: usize,
+    generation: i64,
+    pub revision: i64,
+    pub lifecycle: String,
+    last_turn: Option<String>,
+    seen_turns: std::collections::BTreeSet<String>,
+    queued_lifecycle: String,
+    pub needs_attention: bool,
+    #[serde(default)]
+    pub canonical_server_id: Option<String>,
+    #[serde(default)]
+    usage_ledger: UsageLedger,
+    #[serde(default)]
+    numeric_authority: Option<NumericAuthority>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapturePayload {
+    pub schema_version: u8,
+    pub source_namespace: String,
+    pub source_session_id: String,
+    pub revision: i64,
+    pub expected_revision: i64,
+    pub harness_version: String,
+    pub repository_binding_id: String,
+    pub binding_version: i64,
+    pub project_id: String,
+    pub task_id: String,
+    pub work_kind: String,
+    pub lifecycle: String,
+    pub started_at: String,
+    pub observed_through: String,
+    pub measurement_method: String,
+    pub segments: Vec<Segment>,
+    pub usage: serde_json::Value,
+}
+fn canonical_session_key(binding: &Binding, source: &str, session_id: &str) -> String {
+    hash(format!(
+        "{}\0{}\0{}\0{}\0{}",
+        binding.origin_hash, binding.workspace_id, binding.owner_id, source, session_id
+    ))
+}
+impl Session {
+    fn begin(
+        binding: &Binding,
+        source: &str,
+        session_id: &str,
+        version: &str,
+        clock: &Clock,
+    ) -> Self {
+        Self {
+            id: canonical_session_key(binding, source, session_id),
+            source_session_id: session_id.into(),
+            source_namespace: source.into(),
+            binding: binding.clone(),
+            harness_version: version.into(),
+            started_at: clock.wall,
+            observed_through: clock.wall,
+            active: None,
+            segments: vec![],
+            queued_segments: 0,
+            generation: 0,
+            revision: 0,
+            lifecycle: "ACTIVE".into(),
+            last_turn: None,
+            seen_turns: Default::default(),
+            queued_lifecycle: "ACTIVE".into(),
+            needs_attention: false,
+            canonical_server_id: None,
+            usage_ledger: UsageLedger::default(),
+            numeric_authority: None,
+        }
+    }
+    fn close(&mut self, clock: &Clock, complete: bool) -> Result<(), AppError> {
+        if let Some(mut active) = self.active.take() {
+            if let Some(start) = active.clock.take() {
+                let elapsed = start.elapsed(clock).filter(|_| complete);
+                let seconds = elapsed.unwrap_or(0);
+                let end = if elapsed.is_some() {
+                    clock.wall
+                } else {
+                    start.wall
+                };
+                self.segments.push(Segment {
+                    segment_key: hash(format!("{}-{}", active.key, active.part)),
+                    started_at: timestamp(start.wall)?,
+                    ended_at: timestamp(end)?,
+                    duration_seconds: seconds,
+                    completeness: if elapsed.is_some() {
+                        "COMPLETE"
+                    } else {
+                        self.needs_attention = true;
+                        "INCOMPLETE"
+                    }
+                    .into(),
+                });
+            }
+            self.seen_turns.insert(active.key.clone());
+            if !complete {
+                self.needs_attention = true;
+            }
+            self.last_turn = Some(active.key);
+        }
+        self.observed_through = self.observed_through.max(clock.wall);
+        Ok(())
+    }
+    fn abandon_native_resume(&mut self, clock: &Clock) -> Result<(), AppError> {
+        let paused = self
+            .active
+            .as_ref()
+            .filter(|active| active.clock.is_none())
+            .map(|active| (active.key.clone(), active.part, self.observed_through));
+        self.close(clock, false)?;
+        if let Some((turn, part, anchor)) = paused {
+            // The pause boundary is known; the resumed continuation was never
+            // measured. Preserve a zero-second incomplete marker for reviewers.
+            self.segments.push(Segment {
+                segment_key: hash(format!("{turn}-{part}")),
+                started_at: timestamp(anchor)?,
+                ended_at: timestamp(anchor)?,
+                duration_seconds: 0,
+                completeness: "INCOMPLETE".into(),
+            });
+        }
+        Ok(())
+    }
+    fn abandon_active(&mut self) -> Result<(), AppError> {
+        let clock = self
+            .active
+            .as_ref()
+            .and_then(|turn| turn.clock.clone())
+            .unwrap_or(Clock {
+                wall: self.observed_through,
+                monotonic: 0,
+                boot: "UNOBSERVED_BOUNDARY".into(),
+            });
+        self.close(&clock, false)
+    }
+    fn payload(&self, segments: Vec<Segment>, revision: i64) -> Result<CapturePayload, AppError> {
+        Ok(CapturePayload {
+            schema_version: 1,
+            source_namespace: self.source_namespace.clone(),
+            source_session_id: self.source_session_id.clone(),
+            revision,
+            expected_revision: revision - 1,
+            harness_version: self.harness_version.clone(),
+            repository_binding_id: self.binding.id.clone(),
+            binding_version: self.binding.version,
+            project_id: self.binding.project_id.clone(),
+            task_id: self.binding.task_id.clone(),
+            work_kind: "HUMAN_ASSISTED_AGENT_ACTIVITY".into(),
+            lifecycle: self.lifecycle.clone(),
+            started_at: timestamp(self.started_at)?,
+            observed_through: timestamp(self.observed_through)?,
+            measurement_method: "OBSERVED_TURN_INTERVALS_V1".into(),
+            segments,
+            usage: serde_json::json!({"status":"UNAVAILABLE","reason":"NO_QUALIFIED_USAGE_EVIDENCE","models":[]}),
+        })
+    }
+}
+
+/// Private transient input. It is never serialized, logged or stored. Ordinary
+/// production callers cannot construct a synthetic qualification capability.
+struct UsageSource<'a> {
+    resolved_home: &'a Path,
+    exact_hook_path: &'a Path,
+    qualified_source: &'a str,
+    qualified_native_session: &'a str,
+}
+#[cfg(unix)]
+struct NormalHookInput<'a> {
+    path: Option<&'a Path>,
+    runtime: Option<&'a crate::capture_runtime_pair::HookRuntime>,
+}
+#[cfg(not(unix))]
+type NormalHookInput<'a> = std::marker::PhantomData<&'a ()>;
+
+#[cfg(unix)]
+struct NormalFactoryArgs<'a, 'r> {
+    connection: &'a Connection,
+    directory: &'a Path,
+    invocation: Option<&'a Permit>,
+    binding: &'a Binding,
+    source: &'a str,
+    source_id: &'a str,
+    version: &'a str,
+    event: CaptureEvent,
+    input: NormalHookInput<'r>,
+}
+#[cfg(unix)]
+struct EventFinalization<'a> {
+    id: &'a str,
+    binding: &'a Binding,
+    source_id: &'a str,
+    was_refused: bool,
+    time_only: Option<&'a Session>,
+}
+#[cfg(unix)]
+struct NormalFactory<'r> {
+    policy: Option<crate::capture_usage_consent::ConsentPolicy>,
+    runtime: Option<&'r crate::capture_runtime_pair::HookRuntime>,
+    approved: Option<ApprovedActiveSession>,
+    profile: Option<crate::capture_usage_profile::ProfileLease>,
+    origin: Option<crate::capture_usage_origin::OriginLease>,
+    source_lease: Option<crate::capture_usage::SourceLease>,
+    reason: Option<&'static str>,
+    invalidate: bool,
+}
+#[cfg(unix)]
+impl NormalFactory<'_> {
+    fn fail(&mut self, session: &mut Session, reason: &'static str) {
+        self.reason = Some(reason);
+        self.invalidate |= matches!(
+            reason,
+            "PROFILE_CHANGED"
+                | "HARNESS_CHANGED"
+                | "REGISTRATION_CHANGED"
+                | "RUNTIME_CHANGED"
+                | "UNSUPPORTED_HARNESS_VERSION"
+        );
+        session.usage_ledger.require_baseline();
+        if self.invalidate {
+            session.numeric_authority = None;
+        } else if let Some(authority) = &mut session.numeric_authority {
+            authority.source_identity = None;
+        }
+    }
+    fn observe(
+        &mut self,
+        session: &mut Session,
+        event: CaptureEvent,
+        source: &str,
+        version: &str,
+        source_id: &str,
+    ) {
+        if self.policy.is_none() {
+            return;
+        }
+        if let Some(reason) = self.reason {
+            self.fail(session, reason);
+            return;
+        }
+        if let Err(reason) = self.valid() {
+            self.fail(session, reason);
+            return;
+        }
+        let Some(approved) = self.approved.as_ref() else {
+            return;
+        };
+        if event == CaptureEvent::Prompt {
+            match crate::capture_usage::read_request_ids_leased(approved) {
+                Ok((baseline, lease))
+                    if baseline.source_session_id == source_id
+                        && baseline.harness_version == version
+                        && baseline.limitations.is_empty()
+                        && baseline.source_adapter
+                            == if source == "claude-code" {
+                                "CLAUDE_JSONL_2_1_319_V1"
+                            } else {
+                                "CODEX_ROLLOUT_0_167_0_V1"
+                            } =>
+                {
+                    let Some(identity) = lease.identity() else {
+                        self.fail(session, "SOURCE_CHANGED");
+                        return;
+                    };
+                    let same_source = session
+                        .numeric_authority
+                        .as_ref()
+                        .and_then(|authority| authority.source_identity.as_ref())
+                        == Some(&identity);
+                    if !same_source && session.usage_ledger.baseline_ready() {
+                        session.usage_ledger.require_baseline();
+                    }
+                    if !session.usage_ledger.baseline_ready()
+                        && !session.usage_ledger.establish_baseline(baseline.record_ids)
+                    {
+                        self.fail(session, "SOURCE_PARSE_UNAVAILABLE");
+                        return;
+                    }
+                    if let Some(authority) = &mut session.numeric_authority {
+                        authority.source_identity = Some(identity);
+                    }
+                    self.source_lease = Some(lease);
+                    self.reason = Some("OBSERVED_REQUEST_RECORDS");
+                }
+                _ => self.fail(session, "SOURCE_PARSE_UNAVAILABLE"),
+            }
+        } else if matches!(event, CaptureEvent::Stop | CaptureEvent::SessionEnd) {
+            let Some(identity) = session
+                .numeric_authority
+                .as_ref()
+                .and_then(|authority| authority.source_identity.as_deref())
+            else {
+                self.fail(session, "MISSING_QUALIFIED_PROMPT");
+                return;
+            };
+            match crate::capture_usage::read_requests_leased(
+                approved,
+                &session.usage_ledger.excluded_request_ids,
+                identity,
+            ) {
+                Ok((evidence, lease)) => {
+                    session
+                        .usage_ledger
+                        .observe(evidence, source, version, source_id);
+                    self.source_lease = Some(lease);
+                    self.reason = Some("OBSERVED_REQUEST_RECORDS");
+                }
+                Err(crate::capture_usage::UsageReadError::SourceChanged) => {
+                    self.fail(session, "SOURCE_CHANGED")
+                }
+                Err(_) => self.fail(session, "SOURCE_PARSE_UNAVAILABLE"),
+            }
+        }
+    }
+    fn validate_current(
+        &self,
+        connection: &Connection,
+        binding: &Binding,
+    ) -> Result<Result<(), &'static str>, AppError> {
+        // An invalidating failure has already discarded this boundary's new
+        // numeric state. Its own transactional revocation is expected; do not
+        // replace the specific local failure reason with "disabled" afterward.
+        if self.invalidate {
+            return Ok(Ok(()));
+        }
+        if let Some(policy) = &self.policy {
+            if !Store::policy_current(connection, binding, policy)? {
+                return Ok(Err("NUMERIC_CAPTURE_DISABLED"));
+            }
+        }
+        Ok(self.valid())
+    }
+    fn valid(&self) -> Result<(), &'static str> {
+        if let (Some(profile), Some(runtime)) = (&self.profile, self.runtime) {
+            profile.validate(runtime.identity())?;
+        }
+        if self.origin.as_ref().is_some_and(|origin| !origin.valid()) {
+            return Err("HARNESS_ORIGIN_UNAVAILABLE");
+        }
+        if self
+            .source_lease
+            .as_ref()
+            .is_some_and(|lease| !lease.valid())
+        {
+            return Err("SOURCE_CHANGED");
+        }
+        Ok(())
+    }
+}
+
+pub struct Signal<'a> {
+    pub source: &'a str,
+    pub resumed: bool,
+    pub source_id: &'a str,
+    pub turn_id: Option<&'a str>,
+    pub version: &'a str,
+    pub event: CaptureEvent,
+    pub clock: &'a Clock,
+}
+
+struct CaptureTransaction<'a> {
+    inner: Transaction<'a>,
+    _authority: AuthorityGuard,
+    notification: Option<crate::capture_busy::ReleaseNotifier>,
+    directory: PathBuf,
+    invocation: Option<Permit>,
+    #[cfg(feature = "dev-tools")]
+    admitted_at: std::time::Instant,
+    #[cfg(feature = "dev-tools")]
+    timing: &'a AdmissionTiming,
+}
+impl<'a> std::ops::Deref for CaptureTransaction<'a> {
+    type Target = Transaction<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl CaptureTransaction<'_> {
+    fn failure(&self) -> Result<Option<CaptureFailure>, AppError> {
+        Ok(read_failure_markers(&self.directory)?
+            .into_iter()
+            .next()
+            .map(|(_, failure)| failure))
+    }
+    fn ensure_no_new_refusal(&self, was_refused: bool) -> Result<(), AppError> {
+        if !was_refused && self.failure()?.is_some() {
+            return Err(AppError::Config(
+                "Capture authority changed during this boundary; collection remains paused".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn commit(self) -> Result<(), AppError> {
+        let Self {
+            inner,
+            _authority,
+            notification,
+            directory,
+            invocation,
+            #[cfg(feature = "dev-tools")]
+            admitted_at,
+            #[cfg(feature = "dev-tools")]
+            timing,
+        } = self;
+        if let Some(invocation) = invocation {
+            crate::capture_profile_measure!(PermitValidation, invocation.validate(&directory))?;
+        }
+        #[cfg(feature = "dev-tools")]
+        let commit_started = {
+            // Includes authority acquisition and every fresh check before commit.
+            // This receipt describes only transactions reaching commit admission.
+            timing
+                .transaction_before_commit
+                .set(Some(admitted_at.elapsed()));
+            std::time::Instant::now()
+        };
+        let committed = crate::capture_profile_measure!(Commit, inner.commit());
+        #[cfg(feature = "dev-tools")]
+        timing.commit.set(Some(commit_started.elapsed()));
+        committed.map_err(storage_error)?;
+        drop(_authority);
+        if let Some(notification) = notification {
+            notification.released_after_authority();
+        }
+        Ok(())
+    }
+}
+/// Developer-only passive phase observations; no identifiers, paths or payloads.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Debug, Default)]
+pub struct AdmissionTiming {
+    pub permit_validation: Option<Duration>,
+    pub sqlite_begin: Option<Duration>,
+    pub sqlite_error: Option<rusqlite::ErrorCode>,
+    pub authority: Option<Duration>,
+    /// After successful BEGIN through final permit validation, before COMMIT.
+    /// None means no commit-admission receipt, not a zero-duration transaction.
+    pub transaction_before_commit: std::cell::Cell<Option<Duration>>,
+    /// The original COMMIT call, including its failure/rollback path if any.
+    pub commit: std::cell::Cell<Option<Duration>>,
+}
+
+pub struct Store {
+    #[cfg(feature = "dev-tools")]
+    last_admission_timing: Option<AdmissionTiming>,
+    connection: Connection,
+    notification: Option<crate::capture_busy::ReleaseNotifier>,
+    directory: PathBuf,
+    invocation: Option<Permit>,
+}
+#[derive(Debug, Serialize)]
+pub struct QueueState {
+    pub source_session_id: String,
+    pub revision: i64,
+    pub state: String,
+    pub reason: Option<String>,
+    pub attempts: i64,
+    pub retry_at: i64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureFailure {
+    pub reason: String,
+    pub boundary_id: String,
+    pub observed_at: i64,
+    #[cfg(feature = "dev-tools")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<HookFailureProbe>,
+}
+// Source-fixture diagnosis only. The default installed marker schema remains
+// unchanged. No path, error body, command, native identity or payload can enter.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFailurePhase {
+    Input,
+    Parse,
+    Repository,
+    Store,
+    Permit,
+    Clock,
+    Event,
+}
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookOwnerFault {
+    GroupDeadline,
+    GroupLifetime,
+    OperationDeadline,
+    ProofDeadline,
+    CleanupDeadline,
+    Clock,
+    Other,
+}
+#[cfg(all(feature = "dev-tools", any(unix, test)))]
+impl HookOwnerFault {
+    pub(crate) fn from_static(reason: &'static str) -> Self {
+        match reason {
+            "GROUP_DEADLINE" => Self::GroupDeadline,
+            "GROUP_LIFETIME" => Self::GroupLifetime,
+            "SCOPE_OPERATION_DEADLINE" | "SCOPE_SETUP_DEADLINE" => Self::OperationDeadline,
+            "SCOPE_PROOF_DEADLINE" => Self::ProofDeadline,
+            "SCOPE_CLEANUP_DEADLINE" => Self::CleanupDeadline,
+            "SCOPE_CLOCK" | "GROUP_CLOCK" => Self::Clock,
+            _ => Self::Other,
+        }
+    }
+}
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookReadyEdge {
+    BeforeReceive,
+    AfterReceive,
+    ParkBeforeReceive,
+    ParkAfterReceive,
+}
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookGroupState {
+    AwaitReady,
+    Ready,
+    Joined,
+    Parked,
+    Cleaning,
+    Gone,
+    Released,
+    Failed,
+    Other,
+}
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookSetupProbe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault_state: Option<HookGroupState>,
+    pub ready_window_ns: Option<u64>,
+    pub pre_spawn_offset_ns: Option<u64>,
+    pub spawn_return_offset_ns: Option<u64>,
+    pub first_ready_poll_offset_ns: Option<u64>,
+    pub deadline_offset_ns: Option<u64>,
+    pub ready_frame_observed: bool,
+    pub ready_eof_observed: bool,
+    pub deadline_edge: Option<HookReadyEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub park_end_offset_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_spawn_return_offset_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_park_poll_offset_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub park_frame_observed: Option<bool>,
+}
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookFailureProbe {
+    pub phase: HookFailurePhase,
+    pub owner_fault: Option<HookOwnerFault>,
+    pub setup: Option<HookSetupProbe>,
+}
+#[derive(Debug, Serialize)]
+pub struct Status {
+    pub policy: &'static str,
+    pub pending: i64,
+    pub held: i64,
+    pub needs_attention: i64,
+    pub delivery_verified: bool,
+    pub trusted: &'static str,
+    pub bindings: Vec<Binding>,
+    pub unfinished: i64,
+    pub queue: Vec<QueueState>,
+    pub queue_truncated: bool,
+    pub storage_paused: bool,
+    pub storage_reason: Option<String>,
+    pub capture_failure: Option<CaptureFailure>,
+    pub pending_invocations: usize,
+}
+#[derive(Clone, Debug)]
+pub struct Queued {
+    pub id: i64,
+    pub body: String,
+    pub hash: String,
+    pub attempts: i64,
+    pub session_id: String,
+    pub revision: i64,
+    pub canonical_server_id: Option<String>,
+}
+impl Store {
+    pub fn open(directory: &Path) -> Result<Self, AppError> {
+        if directory.exists()
+            && fs::symlink_metadata(directory)
+                .map_err(storage_error)?
+                .file_type()
+                .is_symlink()
+        {
+            return Err(AppError::Config(
+                "Capture storage cannot be a symlink".into(),
+            ));
+        }
+        fs::create_dir_all(directory).map_err(storage_error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .map_err(storage_error)?;
+        }
+        let path = directory.join("capture.sqlite3");
+        if path.exists()
+            && fs::symlink_metadata(&path)
+                .map_err(storage_error)?
+                .file_type()
+                .is_symlink()
+        {
+            return Err(AppError::Config(
+                "Capture database cannot be a symlink".into(),
+            ));
+        }
+        if !path.exists() {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(storage_error(e)),
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(storage_error)?;
+        }
+        let mut connection = Connection::open(&path).map_err(storage_error)?;
+        let notification = crate::capture_busy::ReleaseNotifier::for_database(&path);
+        let busy_notification = notification.clone();
+        let origin = std::time::Instant::now();
+        let mut admission_budget = crate::capture_busy::BusyBudget::default();
+        connection
+            .busy_handler(Some(move |count| {
+                admission_budget.retry_hinted(
+                    count,
+                    || std::time::Instant::now().checked_duration_since(origin),
+                    |delay, hints_allowed| match &busy_notification {
+                        Some(notification) if hints_allowed => notification.wait(delay),
+                        _ => {
+                            std::thread::sleep(delay);
+                            false
+                        }
+                    },
+                )
+            }))
+            .map_err(storage_error)?;
+        connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA max_page_count=25600;
+            CREATE TABLE IF NOT EXISTS bindings (repo_key TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, binding_id TEXT NOT NULL, source_id TEXT NOT NULL, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL,
+                payload_hash TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                retry_at INTEGER NOT NULL DEFAULT 0, claimed_until INTEGER NOT NULL DEFAULT 0, reason TEXT,
+                acknowledged_at INTEGER, UNIQUE(session_id,revision));
+            CREATE TABLE IF NOT EXISTS usage_consents (binding_id TEXT NOT NULL, namespace TEXT NOT NULL, data TEXT NOT NULL,
+                PRIMARY KEY(binding_id,namespace));").map_err(storage_error)?;
+        Ok(Self {
+            connection,
+            notification,
+            directory: directory.to_owned(),
+            invocation: None,
+            #[cfg(feature = "dev-tools")]
+            last_admission_timing: None,
+        })
+    }
+    #[cfg(feature = "dev-tools")]
+    #[doc(hidden)]
+    pub fn last_admission_timing(&self) -> Option<&AdmissionTiming> {
+        self.last_admission_timing.as_ref()
+    }
+
+    pub fn hook_invocation(&mut self, nonce: &str) -> Result<(), AppError> {
+        self.invocation = Some(Permit::new(&self.directory, nonce)?);
+        Ok(())
+    }
+    pub fn acknowledge_hook(&self, fd: i32) -> Result<(), AppError> {
+        self.invocation
+            .as_ref()
+            .ok_or_else(|| storage_error("missing invocation"))?
+            .acknowledge(&self.directory, fd)
+    }
+    pub fn invocations_pending(&self) -> Result<bool, AppError> {
+        Ok(!capture_invocations::snapshot(&self.directory)?.is_empty())
+    }
+    fn transaction(&mut self) -> Result<CaptureTransaction<'_>, AppError> {
+        self.transaction_for_event(false)
+    }
+    fn transaction_for_event(&mut self, event: bool) -> Result<CaptureTransaction<'_>, AppError> {
+        #[cfg(feature = "dev-tools")]
+        let permit_started = {
+            self.last_admission_timing = Some(AdmissionTiming::default());
+            std::time::Instant::now()
+        };
+        let directory = self.directory.clone();
+        let invocation = if event { self.invocation.clone() } else { None };
+        if let Some(permit) = &invocation {
+            crate::capture_profile_measure!(PermitValidation, permit.validate(&directory))?;
+        }
+        #[cfg(feature = "dev-tools")]
+        let sqlite_started = {
+            self.last_admission_timing
+                .as_mut()
+                .unwrap()
+                .permit_validation = Some(permit_started.elapsed());
+            std::time::Instant::now()
+        };
+        #[cfg(all(unix, feature = "capture-profile"))]
+        let profile_sqlite_begin =
+            crate::capture_profile::Span::start(crate::capture_profile::Phase::SqliteBegin);
+        let admission = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate);
+        #[cfg(all(unix, feature = "capture-profile"))]
+        drop(profile_sqlite_begin);
+        #[cfg(feature = "dev-tools")]
+        {
+            let timing = self.last_admission_timing.as_mut().unwrap();
+            timing.sqlite_begin = Some(sqlite_started.elapsed());
+            timing.sqlite_error = admission
+                .as_ref()
+                .err()
+                .and_then(rusqlite::Error::sqlite_error_code);
+        }
+        let inner = admission.map_err(storage_error)?;
+        #[cfg(feature = "dev-tools")]
+        let admitted_at = std::time::Instant::now();
+        #[cfg(feature = "dev-tools")]
+        let authority_started = std::time::Instant::now();
+        let authority = crate::capture_profile_measure!(
+            AuthorityAcquire,
+            AuthorityGuard::acquire(&directory, true)
+        );
+        #[cfg(feature = "dev-tools")]
+        {
+            self.last_admission_timing.as_mut().unwrap().authority =
+                Some(authority_started.elapsed());
+        }
+        let authority = authority?;
+        if let Some(permit) = &invocation {
+            crate::capture_profile_measure!(PermitValidation, permit.validate(&directory))?;
+        }
+        let tx = CaptureTransaction {
+            inner,
+            _authority: authority,
+            notification: self.notification.clone(),
+            directory,
+            invocation,
+            #[cfg(feature = "dev-tools")]
+            admitted_at,
+            #[cfg(feature = "dev-tools")]
+            timing: self.last_admission_timing.as_ref().unwrap(),
+        };
+        let markers = capture_invocations::snapshot(&tx.directory)?;
+        for marker in markers.iter().filter(|m| !m.live) {
+            let boundary = hash(format!("INVOCATION\0{}", marker.nonce));
+            if !read_failure_markers(&tx.directory)?
+                .iter()
+                .any(|(_, f)| f.boundary_id == boundary)
+            {
+                record_failure(&tx.directory, &boundary, "BOUNDARY_REFUSED")?;
+            }
+        }
+        if markers.iter().any(|m| !m.live) {
+            Self::reconcile_refusal(&tx)?;
+        }
+        Ok(tx)
+    }
+    fn check_size(tx: &Transaction<'_>) -> Result<(), AppError> {
+        let pages: i64 = tx
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .map_err(storage_error)?;
+        let page_size: i64 = tx
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .map_err(storage_error)?;
+        if pages * page_size >= MAX_QUEUE_BYTES - 64 * 1024 {
+            return Err(AppError::Config(
+                "Capture queue limit reached; sync or inspect held evidence. Nothing was evicted."
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn approve(&mut self, mut binding: Binding) -> Result<Binding, AppError> {
+        for value in [
+            &binding.workspace_id,
+            &binding.owner_id,
+            &binding.project_id,
+            &binding.task_id,
+        ] {
+            identifier(value)?;
+        }
+        let tx = self.transaction()?;
+        let refused = tx.failure()?.is_some();
+        if refused {
+            Self::reconcile_refusal(&tx)?;
+        }
+        Self::check_size(&tx)?;
+        let previous = Self::binding_in(&tx, &binding.repository_key)?;
+        if let Some(old) = &previous {
+            // Repeating metadata-only setup never renews numeric permission.
+            Self::revoke_numeric_binding(&tx, old)?;
+            if old.remote_hash == binding.remote_hash
+                && old.hint_hash == binding.hint_hash
+                && old.workspace_id == binding.workspace_id
+                && old.owner_id == binding.owner_id
+                && old.origin_hash == binding.origin_hash
+                && old.project_id == binding.project_id
+                && old.task_id == binding.task_id
+            {
+                Self::abandon_revoked_turns(
+                    &tx,
+                    &old.id,
+                    if old.revoked { &[] } else { &binding.agents },
+                )?;
+                binding.id = old.id.clone();
+                binding.version = old.version;
+                binding.paused = old.paused && !old.revoked;
+                binding.revoked = false;
+                tx.execute(
+                    "UPDATE bindings SET data=?2 WHERE repo_key=?1",
+                    params![
+                        binding.repository_key,
+                        serde_json::to_string(&binding).map_err(storage_error)?
+                    ],
+                )
+                .map_err(storage_error)?;
+                let mut statement=tx.prepare("SELECT o.id,json_extract(s.data,'$.source_namespace'),o.state,o.reason FROM outbox o JOIN sessions s ON s.id=o.session_id WHERE s.binding_id=?1 AND o.state!='acknowledged'").map_err(storage_error)?;
+                let rows: Vec<(i64, String, String, Option<String>)> = statement
+                    .query_map([&binding.id], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })
+                    .map_err(storage_error)?
+                    .collect::<Result<_, _>>()
+                    .map_err(storage_error)?;
+                drop(statement);
+                for (id, source, state, reason) in rows {
+                    if !binding.agents.contains(&source) {
+                        tx.execute("UPDATE outbox SET state='held',reason='HARNESS_CONSENT_REVOKED' WHERE id=?1",[id]).map_err(storage_error)?;
+                    } else if state == "held"
+                        && matches!(
+                            reason.as_deref(),
+                            Some("HARNESS_CONSENT_REVOKED" | "REPOSITORY_CONSENT_INVALIDATED")
+                        )
+                    {
+                        tx.execute(
+                            "UPDATE outbox SET state='pending',reason=NULL WHERE id=?1",
+                            [id],
+                        )
+                        .map_err(storage_error)?;
+                    }
+                }
+                tx.ensure_no_new_refusal(refused)?;
+                tx.commit().map_err(storage_error)?;
+                return Ok(binding);
+            }
+            Self::abandon_revoked_turns(&tx, &old.id, &[])?;
+            tx.execute("UPDATE outbox SET state='held',reason='MAPPING_CHANGED_REVIEW_REQUIRED' WHERE session_id IN(SELECT id FROM sessions WHERE binding_id=?1) AND state!='acknowledged'",[&old.id]).map_err(storage_error)?;
+            tx.execute("UPDATE sessions SET data=json_set(data,'$.needs_attention',json('true')) WHERE binding_id=?1",[&old.id]).map_err(storage_error)?;
+        }
+        binding.version = previous.as_ref().map_or(1, |b| b.version + 1);
+        binding.id = hash(format!(
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            binding.repository_key,
+            binding.workspace_id,
+            binding.owner_id,
+            binding.project_id,
+            binding.task_id,
+            binding.version,
+            POLICY
+        ));
+        binding.paused = false;
+        binding.revoked = false;
+        tx.execute("INSERT INTO bindings(repo_key,data) VALUES(?1,?2) ON CONFLICT(repo_key) DO UPDATE SET data=excluded.data",
+            params![binding.repository_key, serde_json::to_string(&binding).map_err(storage_error)?]).map_err(storage_error)?;
+        tx.ensure_no_new_refusal(refused)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(binding)
+    }
+    fn abandon_native_gap(
+        tx: &Transaction<'_>,
+        source_id: &str,
+        source: &str,
+    ) -> Result<(), AppError> {
+        let mut statement=tx.prepare("SELECT data FROM sessions WHERE source_id=?1 AND json_extract(data,'$.source_namespace')=?2").map_err(storage_error)?;
+        let rows: Vec<String> = statement
+            .query_map(params![source_id, source], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for raw in rows {
+            let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            session.usage_ledger.require_baseline();
+            session.abandon_active()?;
+            Self::queue(tx, &mut session)?;
+            tx.execute(
+                "UPDATE sessions SET data=?2 WHERE id=?1",
+                params![
+                    session.id,
+                    serde_json::to_string(&session).map_err(storage_error)?
+                ],
+            )
+            .map_err(storage_error)?;
+        }
+        Ok(())
+    }
+    fn hold_binding(tx: &Transaction<'_>, binding_id: &str, reason: &str) -> Result<(), AppError> {
+        tx.execute("UPDATE outbox SET state='held',reason=?2,claimed_until=0 WHERE session_id IN (SELECT id FROM sessions WHERE binding_id=?1) AND state!='acknowledged' AND (state='pending' OR reason IN ('HARNESS_CONSENT_REVOKED','REPOSITORY_CONSENT_INVALIDATED'))",params![binding_id,reason]).map_err(storage_error)?;
+        Ok(())
+    }
+    fn invalidate_binding(
+        tx: &Transaction<'_>,
+        binding: &Binding,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        Self::revoke_numeric_binding(tx, binding)?;
+        Self::abandon_revoked_turns(tx, &binding.id, &[])?;
+        let mut revoked = binding.clone();
+        revoked.revoked = true;
+        revoked.paused = true;
+        tx.execute(
+            "UPDATE bindings SET data=?2 WHERE repo_key=?1",
+            params![
+                binding.repository_key,
+                serde_json::to_string(&revoked).map_err(storage_error)?
+            ],
+        )
+        .map_err(storage_error)?;
+        Self::hold_binding(tx, &binding.id, reason)
+    }
+    fn reconcile_refusal(tx: &Transaction<'_>) -> Result<(), AppError> {
+        let mut statement=tx.prepare("SELECT DISTINCT binding_id FROM sessions WHERE json_type(data,'$.active')='object'").map_err(storage_error)?;
+        let bindings: Vec<String> = statement
+            .query_map([], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for binding in bindings {
+            Self::abandon_revoked_turns(tx, &binding, &[])?;
+        }
+        // Refusal markers have no customer/session identifiers. Conservatively
+        // quarantine all unacknowledged complete bodies; never rewrite frozen bytes
+        // or automatically release an uncertain body during explicit recovery.
+        tx.execute("UPDATE outbox SET state='held',reason='REFUSED_BOUNDARY_REVIEW_REQUIRED',claimed_until=0 WHERE state!='acknowledged' AND EXISTS(SELECT 1 FROM json_each(outbox.body,'$.segments') segment WHERE json_extract(segment.value,'$.completeness')='COMPLETE' AND json_extract(segment.value,'$.duration_seconds')>0)",[]).map_err(storage_error)?;
+        tx.execute("UPDATE sessions SET data=json_set(data,'$.needs_attention',json('true')) WHERE id IN(SELECT session_id FROM outbox WHERE reason='REFUSED_BOUNDARY_REVIEW_REQUIRED')",[]).map_err(storage_error)?;
+        Ok(())
+    }
+    fn abandon_revoked_turns(
+        tx: &Transaction<'_>,
+        binding_id: &str,
+        remaining_agents: &[String],
+    ) -> Result<(), AppError> {
+        let mut statement = tx
+            .prepare("SELECT data FROM sessions WHERE binding_id=?1")
+            .map_err(storage_error)?;
+        let rows: Vec<String> = statement
+            .query_map([binding_id], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for raw in rows {
+            let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            if remaining_agents.contains(&session.source_namespace) {
+                continue;
+            }
+            session.usage_ledger.require_baseline();
+            session.abandon_active()?;
+            Self::queue(tx, &mut session)?;
+            tx.execute(
+                "UPDATE sessions SET data=?2 WHERE id=?1",
+                params![
+                    session.id,
+                    serde_json::to_string(&session).map_err(storage_error)?
+                ],
+            )
+            .map_err(storage_error)?;
+        }
+        Ok(())
+    }
+    fn binding_in(connection: &Connection, key: &str) -> Result<Option<Binding>, AppError> {
+        let value: Option<String> = connection
+            .query_row("SELECT data FROM bindings WHERE repo_key=?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(storage_error)?;
+        value
+            .map(|v| serde_json::from_str(&v).map_err(storage_error))
+            .transpose()
+    }
+    /// Observing changed consent invalidates the old clock durably, even if a
+    /// later command sees the original digest again.
+    pub fn observe_repository(&mut self, repository: &Repository) -> Result<(), AppError> {
+        let tx = self.transaction()?;
+        if tx.failure()?.is_some() {
+            Self::reconcile_refusal(&tx)?;
+        }
+        if let Some(binding) = Self::binding_in(&tx, &repository.key)? {
+            if !repository.matches_binding(&binding) {
+                Self::invalidate_binding(&tx, &binding, "REPOSITORY_CONSENT_INVALIDATED")?;
+            }
+        }
+        tx.commit().map_err(storage_error)
+    }
+    pub fn binding(&self, key: &str) -> Result<Option<Binding>, AppError> {
+        Self::binding_in(&self.connection, key)
+    }
+    /// Path-free local policy inspection. Missing policy exits before any
+    /// functional profile, executable, process-origin or source-file access.
+    pub fn numeric_status(
+        &self,
+        repository: &Repository,
+        namespace: &str,
+    ) -> Result<serde_json::Value, AppError> {
+        use crate::capture_usage_consent::{status, ConsentPolicy};
+        if !matches!(namespace, "claude-code" | "codex") {
+            return Err(AppError::InvalidInput(
+                "Unsupported numeric capture source".into(),
+            ));
+        }
+        let disabled = || status(namespace, false, "NUMERIC_CAPTURE_DISABLED");
+        let Some(binding) = Self::binding_in(&self.connection, &repository.key)? else {
+            return Ok(disabled());
+        };
+        if binding.revoked
+            || binding.paused
+            || !binding.agents.iter().any(|agent| agent == namespace)
+            || !repository.matches_binding(&binding)
+        {
+            return Ok(disabled());
+        }
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT data FROM usage_consents WHERE binding_id=?1 AND namespace=?2",
+                params![binding.id, namespace],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let Some(raw) = raw else {
+            return Ok(disabled());
+        };
+        let policy = serde_json::from_str::<ConsentPolicy>(&raw)
+            .ok()
+            .filter(|policy| policy.matches(&binding, namespace));
+        Ok(match policy {
+            None => status(namespace, false, "NUMERIC_CONSENT_NEEDS_REVIEW"),
+            Some(policy) if !policy.enabled => status(
+                namespace,
+                false,
+                policy
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("NUMERIC_CAPTURE_DISABLED"),
+            ),
+            Some(policy) => status(
+                namespace,
+                true,
+                policy
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("NUMERIC_SOURCE_UNQUALIFIED"),
+            ),
+        })
+    }
+    #[cfg(unix)]
+    fn numeric_eligible(repository: &Repository, binding: &Binding, namespace: &str) -> bool {
+        matches!(namespace, "claude-code" | "codex")
+            && !binding.revoked
+            && !binding.paused
+            && repository.matches_binding(binding)
+            && binding.agents.iter().any(|agent| agent == namespace)
+    }
+    #[cfg(unix)]
+    pub(crate) fn numeric_binding(
+        &self,
+        repository: &Repository,
+        namespace: &str,
+    ) -> Result<Binding, AppError> {
+        Self::binding_in(&self.connection, &repository.key)?.filter(|binding| Self::numeric_eligible(repository, binding, namespace))
+            .ok_or_else(|| AppError::Config("Numeric capture requires a current active metadata-only repository mapping; run capture setup first".into()))
+    }
+    fn numeric_reset_sessions(
+        tx: &Transaction<'_>,
+        binding: &Binding,
+        namespace: &str,
+    ) -> Result<(), AppError> {
+        let mut statement = tx.prepare("SELECT data FROM sessions WHERE binding_id=?1 AND json_extract(data,'$.source_namespace')=?2").map_err(storage_error)?;
+        let rows: Vec<String> = statement
+            .query_map(params![binding.id, namespace], |row| row.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for raw in rows {
+            let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            session.usage_ledger.require_baseline();
+            session.numeric_authority = None;
+            tx.execute(
+                "UPDATE sessions SET data=?2 WHERE id=?1",
+                params![
+                    session.id,
+                    serde_json::to_string(&session).map_err(storage_error)?
+                ],
+            )
+            .map_err(storage_error)?;
+        }
+        Ok(())
+    }
+    fn revoke_numeric_namespace(
+        tx: &Transaction<'_>,
+        binding: &Binding,
+        namespace: &str,
+        create: bool,
+    ) -> Result<(), AppError> {
+        use crate::capture_usage_consent::ConsentPolicy;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT data FROM usage_consents WHERE binding_id=?1 AND namespace=?2",
+                params![binding.id, namespace],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if raw.is_none() && !create {
+            return Ok(());
+        }
+        let old = raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<ConsentPolicy>(raw).ok())
+            .filter(|old| old.matches(binding, namespace));
+        let epoch = old.as_ref().map_or(1, |old| {
+            if old.enabled {
+                old.epoch.saturating_add(1)
+            } else {
+                old.epoch
+            }
+        });
+        let policy = ConsentPolicy {
+            policy_version: 1,
+            binding_id: binding.id.clone(),
+            binding_version: binding.version,
+            source_namespace: namespace.into(),
+            profile_id: old
+                .as_ref()
+                .map_or_else(|| "0".repeat(64), |old| old.profile_id.clone()),
+            profile_digest: old
+                .as_ref()
+                .map_or_else(|| "0".repeat(64), |old| old.profile_digest.clone()),
+            epoch,
+            enabled: false,
+            unavailable_reason: Some("NUMERIC_CAPTURE_DISABLED".into()),
+        };
+        tx.execute("INSERT INTO usage_consents(binding_id,namespace,data) VALUES(?1,?2,?3) ON CONFLICT(binding_id,namespace) DO UPDATE SET data=excluded.data",
+            params![binding.id,namespace,serde_json::to_string(&policy).map_err(storage_error)?]).map_err(storage_error)?;
+        Self::numeric_reset_sessions(tx, binding, namespace)?;
+        tx.execute("UPDATE outbox SET state='held',reason='NUMERIC_CONSENT_REVOKED',claimed_until=0 WHERE state!='acknowledged' AND json_array_length(body,'$.usage.records')>0 AND session_id IN(SELECT id FROM sessions WHERE binding_id=?1 AND json_extract(data,'$.source_namespace')=?2)", params![binding.id,namespace]).map_err(storage_error)?;
+        Ok(())
+    }
+    fn revoke_numeric_binding(tx: &Transaction<'_>, binding: &Binding) -> Result<(), AppError> {
+        for namespace in ["claude-code", "codex"] {
+            Self::revoke_numeric_namespace(tx, binding, namespace, false)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn disable_numeric(
+        &mut self,
+        repository: &Repository,
+        namespace: &str,
+    ) -> Result<serde_json::Value, AppError> {
+        if !matches!(namespace, "claude-code" | "codex") {
+            return Err(AppError::InvalidInput(
+                "Unsupported numeric capture source".into(),
+            ));
+        }
+        let tx = self.transaction()?;
+        let binding = Self::binding_in(&tx, &repository.key)?
+            .ok_or_else(|| AppError::Config("Repository not approved; run capture setup".into()))?;
+        Self::revoke_numeric_namespace(&tx, &binding, namespace, true)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(crate::capture_usage_consent::status(
+            namespace,
+            false,
+            "NUMERIC_CAPTURE_DISABLED",
+        ))
+    }
+    #[cfg(unix)]
+    pub(crate) fn enable_numeric(
+        &mut self,
+        repository: &Repository,
+        namespace: &str,
+        prepared: &crate::capture_usage_profile::PreparedProfile,
+    ) -> Result<serde_json::Value, AppError> {
+        use crate::capture_usage_consent::ConsentPolicy;
+        let tx = self.transaction()?;
+        let refused = tx.failure()?.is_some();
+        if refused {
+            return Err(AppError::Config(
+                "Capture remains paused after a refusal; recover before numeric approval".into(),
+            ));
+        }
+        let binding = Self::binding_in(&tx, &repository.key)?.filter(|binding| Self::numeric_eligible(repository,binding,namespace))
+            .filter(|binding| prepared.matches(binding,namespace)).ok_or_else(|| AppError::Config("Numeric consent changed during approval; explicitly qualify the current profile and mapping again".into()))?;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT data FROM usage_consents WHERE binding_id=?1 AND namespace=?2",
+                params![binding.id, namespace],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let old = raw
+            .as_deref()
+            .map(serde_json::from_str::<ConsentPolicy>)
+            .transpose()
+            .map_err(|_| {
+                AppError::Config(
+                    "Numeric consent needs review; disable it before approving again".into(),
+                )
+            })?;
+        let epoch = old
+            .as_ref()
+            .map_or(Some(1), |old| old.epoch.checked_add(1))
+            .ok_or_else(|| {
+                AppError::Config(
+                    "Numeric consent epoch is exhausted; collection remains disabled".into(),
+                )
+            })?;
+        let policy = ConsentPolicy {
+            policy_version: 1,
+            binding_id: binding.id.clone(),
+            binding_version: binding.version,
+            source_namespace: namespace.into(),
+            profile_id: prepared.id().into(),
+            profile_digest: prepared.digest().into(),
+            epoch,
+            enabled: true,
+            unavailable_reason: Some("NUMERIC_SOURCE_UNQUALIFIED".into()),
+        };
+        tx.execute("INSERT INTO usage_consents(binding_id,namespace,data) VALUES(?1,?2,?3) ON CONFLICT(binding_id,namespace) DO UPDATE SET data=excluded.data", params![binding.id,namespace,serde_json::to_string(&policy).map_err(storage_error)?]).map_err(storage_error)?;
+        Self::numeric_reset_sessions(&tx, &binding, namespace)?;
+        if !prepared.matches(&binding, namespace) {
+            return Err(AppError::Config(
+                "Numeric profile changed before approval committed; explicitly reapprove".into(),
+            ));
+        }
+        tx.ensure_no_new_refusal(refused)?;
+        tx.commit().map_err(storage_error)?;
+        let mut status =
+            crate::capture_usage_consent::status(namespace, true, "NUMERIC_SOURCE_UNQUALIFIED");
+        status["notice"] = serde_json::json!("Only minimized partial request observations may be retained after a qualified new Prompt. Provider expenditure remains unknown; charges require review.");
+        Ok(status)
+    }
+    #[cfg(unix)]
+    fn numeric_policy_in(
+        connection: &Connection,
+        binding: &Binding,
+        source: &str,
+    ) -> Result<Option<crate::capture_usage_consent::ConsentPolicy>, AppError> {
+        let raw: Option<String> = connection
+            .query_row(
+                "SELECT data FROM usage_consents WHERE binding_id=?1 AND namespace=?2",
+                params![binding.id, source],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        Ok(raw
+            .filter(|raw| raw.len() <= 4096)
+            .as_deref()
+            .and_then(|raw| {
+                serde_json::from_str::<crate::capture_usage_consent::ConsentPolicy>(raw).ok()
+            })
+            .filter(|policy| policy.matches(binding, source)))
+    }
+    #[cfg(unix)]
+    fn policy_current(
+        connection: &Connection,
+        binding: &Binding,
+        policy: &crate::capture_usage_consent::ConsentPolicy,
+    ) -> Result<bool, AppError> {
+        Ok(
+            Self::numeric_policy_in(connection, binding, &policy.source_namespace)?.is_some_and(
+                |current| {
+                    current.enabled
+                        && current.epoch == policy.epoch
+                        && current.profile_id == policy.profile_id
+                        && current.profile_digest == policy.profile_digest
+                },
+            ),
+        )
+    }
+    #[cfg(unix)]
+    fn normal_factory<'r>(
+        args: NormalFactoryArgs<'_, 'r>,
+        session: &mut Session,
+    ) -> Result<NormalFactory<'r>, AppError> {
+        let mut state = NormalFactory {
+            policy: None,
+            runtime: args.input.runtime,
+            approved: None,
+            profile: None,
+            origin: None,
+            source_lease: None,
+            reason: None,
+            invalidate: false,
+        };
+        // This database decision precedes every functional profile, native
+        // image/provenance and source-file operation. Old/default bindings are
+        // denied without consulting an executable, profile root or hook path.
+        let Some(policy) = Self::numeric_policy_in(args.connection, args.binding, args.source)?
+            .filter(|policy| policy.enabled)
+        else {
+            if session.numeric_authority.take().is_some() {
+                session.usage_ledger.require_baseline();
+            }
+            return Ok(state);
+        };
+        let same_epoch = session.numeric_authority.as_ref().is_some_and(|authority| {
+            authority.profile_id == policy.profile_id
+                && authority.profile_digest == policy.profile_digest
+                && authority.epoch == policy.epoch
+        });
+        if !same_epoch {
+            session.usage_ledger.require_baseline();
+            session.numeric_authority = Some(NumericAuthority {
+                profile_id: policy.profile_id.clone(),
+                profile_digest: policy.profile_digest.clone(),
+                epoch: policy.epoch,
+                source_identity: None,
+            });
+        }
+        state.policy = Some(policy);
+        if !matches!(
+            args.event,
+            CaptureEvent::Prompt | CaptureEvent::Stop | CaptureEvent::SessionEnd
+        ) {
+            return Ok(state);
+        }
+        if args.event != CaptureEvent::Prompt
+            && (!session.usage_ledger.baseline_ready()
+                || session
+                    .numeric_authority
+                    .as_ref()
+                    .and_then(|authority| authority.source_identity.as_ref())
+                    .is_none())
+        {
+            state.reason = Some("MISSING_QUALIFIED_PROMPT");
+            return Ok(state);
+        }
+        let Some(runtime) = args.input.runtime else {
+            state.reason = Some("LIVE_GUARD_REQUIRED");
+            return Ok(state);
+        };
+        if !args
+            .invocation
+            .is_some_and(|invocation| invocation.validate(args.directory).is_ok())
+        {
+            state.reason = Some("LIVE_GUARD_REQUIRED");
+            return Ok(state);
+        }
+        let expected = match args.source {
+            "claude-code" => "2.1.319",
+            "codex" => "0.167.0",
+            _ => "",
+        };
+        if args.version != expected || session.harness_version != args.version {
+            state.reason = Some("UNSUPPORTED_HARNESS_VERSION");
+            state.invalidate = true;
+            return Ok(state);
+        }
+        let policy = state.policy.as_ref().unwrap();
+        let profile = match crate::capture_usage_profile::ProfileLease::load(
+            args.directory,
+            policy,
+            runtime.identity(),
+        ) {
+            Ok(profile) => profile,
+            Err(reason) => {
+                state.reason = Some(reason);
+                state.invalidate = true;
+                return Ok(state);
+            }
+        };
+        if profile.version() != args.version {
+            state.reason = Some("UNSUPPORTED_HARNESS_VERSION");
+            state.invalidate = true;
+            return Ok(state);
+        }
+        let (native, stamp) = profile.native();
+        let Some(origin) = crate::capture_usage_origin::OriginLease::verify(native, stamp) else {
+            state.reason = Some("HARNESS_ORIGIN_UNAVAILABLE");
+            return Ok(state);
+        };
+        let Some(path) = args.input.path else {
+            state.reason = Some("ACTIVE_SOURCE_UNAVAILABLE");
+            return Ok(state);
+        };
+        let harness = if args.source == "claude-code" {
+            Harness::ClaudeCode
+        } else {
+            Harness::Codex
+        };
+        let approved = match ApprovedActiveSession::new(
+            harness,
+            args.version,
+            profile.home(),
+            path,
+            args.source_id,
+        ) {
+            Ok(approved) => approved,
+            Err(_) => {
+                state.reason = Some("ACTIVE_SOURCE_UNAVAILABLE");
+                return Ok(state);
+            }
+        };
+        // Recheck the still-current row immediately before allowing the caller
+        // to open the exact active source. Transaction ordering makes revoke
+        // before admission win; a stale command-side read cannot authorize it.
+        if !Self::policy_current(args.connection, args.binding, policy)? {
+            state.reason = Some("NUMERIC_CAPTURE_DISABLED");
+            return Ok(state);
+        }
+        state.profile = Some(profile);
+        state.origin = Some(origin);
+        state.approved = Some(approved);
+        Ok(state)
+    }
+    #[cfg(unix)]
+    fn save_numeric_reason(
+        tx: &Transaction<'_>,
+        binding: &Binding,
+        state: &NormalFactory<'_>,
+    ) -> Result<(), AppError> {
+        let (Some(policy), Some(reason)) = (&state.policy, state.reason) else {
+            return Ok(());
+        };
+        if state.invalidate {
+            Self::revoke_numeric_namespace(tx, binding, &policy.source_namespace, false)?;
+        }
+        let Some(mut current) = Self::numeric_policy_in(tx, binding, &policy.source_namespace)?
+        else {
+            return Ok(());
+        };
+        if !state.invalidate
+            && (current.epoch != policy.epoch
+                || current.profile_id != policy.profile_id
+                || current.profile_digest != policy.profile_digest)
+        {
+            return Ok(());
+        }
+        current.unavailable_reason = Some(reason.into());
+        tx.execute(
+            "UPDATE usage_consents SET data=?3 WHERE binding_id=?1 AND namespace=?2",
+            params![
+                binding.id,
+                policy.source_namespace,
+                serde_json::to_string(&current).map_err(storage_error)?
+            ],
+        )
+        .map_err(storage_error)?;
+        Ok(())
+    }
+    pub fn event(&mut self, repository: &Repository, signal: Signal<'_>) -> Result<(), AppError> {
+        self.event_inner(repository, signal, None, None)
+    }
+    #[cfg(unix)]
+    pub(crate) fn event_hook(
+        &mut self,
+        repository: &Repository,
+        signal: Signal<'_>,
+        path: Option<&Path>,
+        runtime: Option<&crate::capture_runtime_pair::HookRuntime>,
+    ) -> Result<(), AppError> {
+        self.event_inner(
+            repository,
+            signal,
+            None,
+            Some(NormalHookInput { path, runtime }),
+        )
+    }
+    // Synthetic ledger qualification is accessible only to this private test
+    // child. It cannot be selected by CLI, environment, default or dev-tools.
+    #[cfg(all(test, unix))]
+    fn event_with_usage(
+        &mut self,
+        repository: &Repository,
+        signal: Signal<'_>,
+        usage_source: Option<&UsageSource<'_>>,
+    ) -> Result<(), AppError> {
+        self.event_inner(repository, signal, usage_source, None)
+    }
+    fn event_inner(
+        &mut self,
+        repository: &Repository,
+        signal: Signal<'_>,
+        usage_source: Option<&UsageSource<'_>>,
+        normal_hook: Option<NormalHookInput<'_>>,
+    ) -> Result<(), AppError> {
+        let Signal {
+            source,
+            resumed,
+            source_id,
+            turn_id,
+            version,
+            event,
+            clock,
+        } = signal;
+        identifier(source_id)?;
+        version_identifier(version)?;
+        if matches!(event, CaptureEvent::Prompt | CaptureEvent::Stop) && turn_id.is_none() {
+            return Err(AppError::InvalidInput(
+                "Missing native turn identity; capture requires qualified prompt_id/turn_id".into(),
+            ));
+        }
+        if let Some(id) = turn_id {
+            identifier(id)?;
+        }
+        #[cfg(unix)]
+        let (factory_directory, factory_invocation) =
+            (self.directory.clone(), self.invocation.clone());
+        #[cfg(not(unix))]
+        let _ = normal_hook;
+        let tx = self.transaction_for_event(true)?;
+        let self_failure_present = tx.failure()?.is_some();
+        if self_failure_present {
+            Self::reconcile_refusal(&tx)?;
+            if matches!(event, CaptureEvent::Prompt | CaptureEvent::SessionStart) {
+                tx.commit().map_err(storage_error)?;
+                return Err(AppError::Config("Capture is paused after a refused boundary; inspect status and explicitly recover".into()));
+            }
+        }
+        Self::check_size(&tx)?;
+        let Some(binding) = Self::binding_in(&tx, &repository.key)? else {
+            // A known native session leaving approved repositories is an
+            // unobserved gap, not authority to keep its old clock alive.
+            Self::abandon_native_gap(&tx, source_id, source)?;
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(());
+        };
+        if !repository.matches_binding(&binding) {
+            Self::invalidate_binding(&tx, &binding, "REPOSITORY_CONSENT_INVALIDATED")?;
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(());
+        }
+        if binding.revoked || !binding.agents.iter().any(|a| a == source) {
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(());
+        }
+        if binding.paused
+            && !matches!(
+                event,
+                CaptureEvent::Stop | CaptureEvent::Interrupt | CaptureEvent::SessionEnd
+            )
+            && !(resumed && event == CaptureEvent::SessionStart)
+        {
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(());
+        }
+        let mut statement=tx.prepare("SELECT data FROM sessions WHERE source_id=?1 AND json_extract(data,'$.source_namespace')=?2 AND json_extract(data,'$.binding.workspace_id')=?3 AND json_extract(data,'$.binding.owner_id')=?4 AND json_extract(data,'$.binding.origin_hash')=?5 LIMIT 2").map_err(storage_error)?;
+        let matches: Vec<String> = statement
+            .query_map(
+                params![
+                    source_id,
+                    source,
+                    binding.workspace_id,
+                    binding.owner_id,
+                    binding.origin_hash
+                ],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        if matches.len() > 1 {
+            return Err(AppError::Config(
+                "Conflicting canonical session state; evidence requires review".into(),
+            ));
+        }
+        let raw = matches.into_iter().next();
+        if raw.is_none() && !matches!(event, CaptureEvent::SessionStart | CaptureEvent::Prompt) {
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(());
+        }
+        let mut session: Session = raw
+            .map(|v| serde_json::from_str(&v).map_err(storage_error))
+            .transpose()?
+            .unwrap_or_else(|| Session::begin(&binding, source, source_id, version, clock));
+        if session.binding.id != binding.id {
+            return Err(AppError::Config("Native session mapping changed; review held evidence and begin a new native session".into()));
+        }
+        // A native session cannot switch parser versions mid-stream.
+        let usage_version_matches = session.harness_version == version;
+        let id = session.id.clone();
+        if self_failure_present
+            && matches!(
+                event,
+                CaptureEvent::Stop | CaptureEvent::Interrupt | CaptureEvent::SessionEnd
+            )
+        {
+            session.abandon_active()?;
+        }
+        if resumed && event == CaptureEvent::SessionStart {
+            session.usage_ledger.require_baseline();
+            session.abandon_native_resume(clock)?;
+        }
+        match event {
+            CaptureEvent::SessionStart => {} // Resume must never reset the baseline.
+            CaptureEvent::Prompt => {
+                if turn_id.is_some_and(|id| session.seen_turns.contains(id)) {
+                    tx.ensure_no_new_refusal(self_failure_present)?;
+                    tx.commit().map_err(storage_error)?;
+                    return Ok(());
+                }
+                if let Some(active) = &session.active {
+                    if turn_id.is_some_and(|key| key != active.key) {
+                        session.close(clock, false)?;
+                    } else {
+                        tx.ensure_no_new_refusal(self_failure_present)?;
+                        tx.commit().map_err(storage_error)?;
+                        return Ok(());
+                    } // Concurrent duplicate hook registrations.
+                }
+                if turn_id.is_some_and(|key| session.last_turn.as_deref() == Some(key)) {
+                    tx.ensure_no_new_refusal(self_failure_present)?;
+                    tx.commit().map_err(storage_error)?;
+                    return Ok(());
+                }
+                session.generation += 1;
+                let key = turn_id
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("turn-{}", session.generation));
+                session.active = Some(ActiveTurn {
+                    key,
+                    clock: Some(clock.clone()),
+                    part: 0,
+                });
+                session.lifecycle = "ACTIVE".into();
+            }
+            CaptureEvent::Stop => {
+                if session
+                    .active
+                    .as_ref()
+                    .is_some_and(|a| turn_id.is_some_and(|id| id != a.key))
+                {
+                    tx.ensure_no_new_refusal(self_failure_present)?;
+                    tx.commit().map_err(storage_error)?;
+                    return Ok(());
+                }
+                session.close(clock, true)?;
+            }
+            CaptureEvent::Interrupt | CaptureEvent::SessionEnd => {
+                if event == CaptureEvent::Interrupt
+                    && session
+                        .active
+                        .as_ref()
+                        .is_some_and(|a| turn_id.is_some_and(|id| id != a.key))
+                {
+                    tx.ensure_no_new_refusal(self_failure_present)?;
+                    tx.commit().map_err(storage_error)?;
+                    return Ok(());
+                }
+                session.close(clock, false)?;
+                if event == CaptureEvent::SessionEnd {
+                    session.lifecycle = if session.needs_attention {
+                        "INCOMPLETE"
+                    } else {
+                        "COMPLETED"
+                    }
+                    .into();
+                }
+            }
+        }
+        #[cfg(unix)]
+        let mut numeric_time_only = None;
+        #[cfg(unix)]
+        let mut normal_factory = if !binding.paused && !self_failure_present {
+            if let Some(input) = normal_hook {
+                // Clone only for an enabled row, after legitimate timing has
+                // been reconciled. A late lease failure can roll back numeric
+                // finalization without dropping that measured interval.
+                if Self::numeric_policy_in(&tx, &binding, source)?
+                    .is_some_and(|policy| policy.enabled)
+                {
+                    numeric_time_only = Some(session.clone());
+                }
+                let mut factory = Self::normal_factory(
+                    NormalFactoryArgs {
+                        connection: &tx,
+                        directory: &factory_directory,
+                        invocation: factory_invocation.as_ref(),
+                        binding: &binding,
+                        source,
+                        source_id,
+                        version,
+                        event,
+                        input,
+                    },
+                    &mut session,
+                )?;
+                factory.observe(&mut session, event, source, version, source_id);
+                Some(factory)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Timing terminal reconciliation remains available during a pause. It
+        // never authorizes a transcript read or changes the numeric consent epoch.
+        if !binding.paused && !self_failure_present && usage_source.is_some() {
+            let approved = usage_source.and_then(|input| {
+                let harness = match source {
+                    "claude-code" => Some(Harness::ClaudeCode),
+                    "codex" => Some(Harness::Codex),
+                    _ => None,
+                };
+                harness
+                    .filter(|_| {
+                        usage_version_matches
+                            && input.qualified_source == source
+                            && input.qualified_native_session == source_id
+                    })
+                    .and_then(|h| {
+                        ApprovedActiveSession::new(
+                            h,
+                            version,
+                            input.resolved_home,
+                            input.exact_hook_path,
+                            source_id,
+                        )
+                        .ok()
+                    })
+            });
+            if event == CaptureEvent::Prompt {
+                if let Some(approved) = &approved {
+                    if !session.usage_ledger.baseline_ready() {
+                        let baseline =
+                            read_active_session_request_ids(approved)
+                                .ok()
+                                .filter(|baseline| {
+                                    baseline.source_session_id == source_id
+                                        && baseline.harness_version == version
+                                        && baseline.limitations.is_empty()
+                                        && baseline.source_adapter
+                                            == if source == "claude-code" {
+                                                "CLAUDE_JSONL_2_1_319_V1"
+                                            } else {
+                                                "CODEX_ROLLOUT_0_167_0_V1"
+                                            }
+                                });
+                        if let Some(baseline) = baseline {
+                            session.usage_ledger.establish_baseline(baseline.record_ids);
+                        } else {
+                            session.usage_ledger.baseline_epoch = None;
+                            session.usage_ledger.incomplete = true;
+                        }
+                    }
+                } else {
+                    // This turn was not opted into qualified usage at its prompt.
+                    // A terminal capability cannot retroactively authorize it.
+                    session.usage_ledger.require_baseline();
+                }
+            } else if matches!(event, CaptureEvent::Stop | CaptureEvent::SessionEnd) {
+                if session.usage_ledger.baseline_ready() {
+                    let evidence = approved.and_then(|approved| {
+                        if session.usage_ledger.excluded_request_ids.is_empty() {
+                            read_active_session(&approved).ok()
+                        } else {
+                            read_active_session_excluding_request_ids(
+                                &approved,
+                                &session.usage_ledger.excluded_request_ids,
+                            )
+                            .ok()
+                        }
+                    });
+                    if let Some(evidence) = evidence {
+                        session
+                            .usage_ledger
+                            .observe(evidence, source, version, source_id);
+                    } else {
+                        session.usage_ledger.incomplete = true;
+                    }
+                } else if usage_source.is_some() {
+                    session.usage_ledger.incomplete = true;
+                }
+            }
+        }
+        #[cfg(unix)]
+        Self::finalize_normal_event(
+            &tx,
+            &mut session,
+            normal_factory.as_mut(),
+            EventFinalization {
+                id: &id,
+                binding: &binding,
+                source_id,
+                was_refused: self_failure_present,
+                time_only: numeric_time_only.as_ref(),
+            },
+        )?;
+        #[cfg(not(unix))]
+        {
+            tx.ensure_no_new_refusal(self_failure_present)?;
+            Self::finish_event(&tx, &mut session, &id, &binding, source_id)?;
+            tx.ensure_no_new_refusal(self_failure_present)?;
+        }
+        // Leases remain in this frame until the transaction commit completes.
+        tx.commit().map_err(storage_error)
+    }
+    #[cfg(unix)]
+    fn finalize_normal_event(
+        tx: &CaptureTransaction<'_>,
+        session: &mut Session,
+        mut factory: Option<&mut NormalFactory<'_>>,
+        args: EventFinalization<'_>,
+    ) -> Result<(), AppError> {
+        if let Some(factory) = factory.as_deref_mut() {
+            if let Err(reason) = factory.validate_current(tx, args.binding)? {
+                if let Some(time_only) = args.time_only {
+                    *session = time_only.clone();
+                }
+                factory.fail(session, reason);
+            }
+        }
+        // Only this boundary's finalization is rollback-able. Previous frozen
+        // bodies and accepted request identities remain immutable.
+        let numeric_savepoint = factory
+            .as_ref()
+            .is_some_and(|factory| factory.policy.is_some());
+        if numeric_savepoint {
+            tx.execute_batch("SAVEPOINT numeric_finalization")
+                .map_err(storage_error)?;
+        }
+        if let Some(factory) = factory.as_deref() {
+            Self::save_numeric_reason(tx, args.binding, factory)?;
+        }
+        tx.ensure_no_new_refusal(args.was_refused)?;
+        Self::finish_event(tx, session, args.id, args.binding, args.source_id)?;
+        #[cfg(test)]
+        if numeric_savepoint {
+            crate::capture_usage_test_io::after_numeric_write(tx);
+        }
+        if let Some(factory) = factory {
+            if let Err(reason) = factory.validate_current(tx, args.binding)? {
+                if numeric_savepoint {
+                    tx.execute_batch("ROLLBACK TO numeric_finalization")
+                        .map_err(storage_error)?;
+                }
+                if let Some(time_only) = args.time_only {
+                    *session = time_only.clone();
+                }
+                factory.fail(session, reason);
+                Self::save_numeric_reason(tx, args.binding, factory)?;
+                Self::finish_event(tx, session, args.id, args.binding, args.source_id)?;
+            }
+        }
+        if numeric_savepoint {
+            tx.execute_batch("RELEASE numeric_finalization")
+                .map_err(storage_error)?;
+        }
+        tx.ensure_no_new_refusal(args.was_refused)?;
+        Ok(())
+    }
+    fn finish_event(
+        tx: &Transaction<'_>,
+        session: &mut Session,
+        id: &str,
+        binding: &Binding,
+        source_id: &str,
+    ) -> Result<(), AppError> {
+        if session.usage_ledger.held {
+            session.needs_attention = true;
+        }
+        Self::queue(tx, session)?;
+        if session.usage_ledger.held {
+            tx.execute("UPDATE outbox SET state='held',reason='USAGE_RECORD_CONFLICT',claimed_until=0 WHERE session_id=?1 AND state!='acknowledged'",[&session.id]).map_err(storage_error)?;
+        }
+        tx.execute("INSERT INTO sessions(id,binding_id,source_id,data) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+            params![id,binding.id,source_id,serde_json::to_string(&session).map_err(storage_error)?]).map_err(storage_error)?;
+        Ok(())
+    }
+    fn queue(tx: &Transaction<'_>, session: &mut Session) -> Result<(), AppError> {
+        if session.active.is_some() {
+            return Ok(());
+        }
+        let final_checkpoint =
+            session.revision > 0 && session.queued_lifecycle != session.lifecycle;
+        let mut final_checkpoint_sent = false;
+        while session.queued_segments < session.segments.len()
+            || (!session.usage_ledger.held
+                && session.usage_ledger.queued < session.usage_ledger.records.len())
+            || (final_checkpoint && !final_checkpoint_sent)
+        {
+            let start = session.queued_segments;
+            let mut end = (start + 100).min(session.segments.len());
+            let usage_start = session.usage_ledger.queued;
+            let mut usage_end = if session.usage_ledger.held {
+                usage_start
+            } else {
+                (usage_start + 25).min(session.usage_ledger.records.len())
+            };
+            let mut body;
+            loop {
+                let mut payload =
+                    session.payload(session.segments[start..end].to_vec(), session.revision + 1)?;
+                payload.usage = session.usage_ledger.payload(usage_start, usage_end);
+                body = serde_json::to_string(&payload).map_err(storage_error)?;
+                if body.len() <= MAX_BODY_BYTES {
+                    break;
+                }
+                if usage_end > usage_start {
+                    usage_end -= 1;
+                } else if end > start {
+                    end -= 1;
+                } else {
+                    return Err(AppError::Config(
+                        "Capture request exceeds limit; evidence held".into(),
+                    ));
+                }
+            }
+            if session.revision >= i32::MAX as i64 {
+                return Err(AppError::Config(
+                    "Capture revision limit reached; evidence held for review".into(),
+                ));
+            }
+            session.revision += 1;
+            tx.execute(
+                "INSERT INTO outbox(session_id,revision,body,payload_hash) VALUES(?1,?2,?3,?4)",
+                params![session.id, session.revision, body, hash(body.as_bytes())],
+            )
+            .map_err(storage_error)?;
+            session.queued_segments = end;
+            for index in usage_start..usage_end {
+                session.usage_ledger.record_revisions[index] = session.revision;
+            }
+            session.usage_ledger.queued = usage_end;
+            session.queued_lifecycle = session.lifecycle.clone();
+            final_checkpoint_sent = true;
+        }
+        Ok(())
+    }
+    pub fn control(
+        &mut self,
+        repository: &Repository,
+        action: &str,
+        clock: &Clock,
+    ) -> Result<(), AppError> {
+        let tx = self.transaction()?;
+        let refused = tx.failure()?.is_some();
+        if refused {
+            Self::reconcile_refusal(&tx)?;
+        }
+        let mut binding = Self::binding_in(&tx, &repository.key)?
+            .ok_or_else(|| AppError::Config("Repository not approved; run capture setup".into()))?;
+        if !repository.matches_binding(&binding) {
+            Self::invalidate_binding(&tx, &binding, "REPOSITORY_CONSENT_INVALIDATED")?;
+            tx.commit().map_err(storage_error)?;
+            return Err(AppError::Config(
+                "Binding changed; explicit reapproval required".into(),
+            ));
+        }
+        if refused && action == "resume" {
+            tx.commit().map_err(storage_error)?;
+            return Err(AppError::Config(
+                "Storage refusal remains paused; explicitly recover before resuming".into(),
+            ));
+        }
+        if action != "resume" {
+            Self::revoke_numeric_binding(&tx, &binding)?;
+        }
+        if action == "resume" && binding.revoked {
+            return Err(AppError::Config(
+                "Binding changed or revoked; run capture setup to approve again".into(),
+            ));
+        }
+        if (action == "resume" && !binding.paused) || (action == "pause" && binding.paused) {
+            tx.ensure_no_new_refusal(refused)?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(());
+        }
+        let mut statement = tx
+            .prepare("SELECT data FROM sessions WHERE binding_id=?1")
+            .map_err(storage_error)?;
+        let sessions: Vec<String> = statement
+            .query_map([&binding.id], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for raw in sessions {
+            let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            if action != "resume" {
+                session.usage_ledger.require_baseline();
+            }
+            if let Some(mut active) = session.active.take() {
+                if action == "pause" {
+                    let key = active.key.clone();
+                    let part = active.part;
+                    session.active = Some(active);
+                    session.close(clock, true)?;
+                    active = ActiveTurn {
+                        key,
+                        clock: None,
+                        part: part + 1,
+                    };
+                    session.active = Some(active);
+                } else if action == "resume" {
+                    active.clock = Some(clock.clone());
+                    session.active = Some(active);
+                } else {
+                    session.active = Some(active);
+                    session.close(clock, false)?;
+                }
+            }
+            Self::queue(&tx, &mut session)?;
+            tx.execute(
+                "UPDATE sessions SET data=?2 WHERE id=?1",
+                params![
+                    session.id,
+                    serde_json::to_string(&session).map_err(storage_error)?
+                ],
+            )
+            .map_err(storage_error)?;
+        }
+        binding.paused = action != "resume";
+        if action == "disable" {
+            binding.revoked = true;
+        }
+        tx.execute(
+            "UPDATE bindings SET data=?2 WHERE repo_key=?1",
+            params![
+                repository.key,
+                serde_json::to_string(&binding).map_err(storage_error)?
+            ],
+        )
+        .map_err(storage_error)?;
+        if binding.revoked {
+            Self::hold_binding(&tx, &binding.id, "HARNESS_CONSENT_REVOKED")?;
+        }
+        tx.ensure_no_new_refusal(refused)?;
+        tx.commit().map_err(storage_error)
+    }
+    pub fn disable_all(&mut self) -> Result<(), AppError> {
+        let tx = self.transaction()?;
+        let refused = tx.failure()?.is_some();
+        if refused {
+            Self::reconcile_refusal(&tx)?;
+        }
+        let mut statement = tx
+            .prepare("SELECT data FROM bindings")
+            .map_err(storage_error)?;
+        let rows: Vec<String> = statement
+            .query_map([], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        let bindings: Vec<Binding> = rows
+            .into_iter()
+            .map(|raw| serde_json::from_str(&raw).map_err(storage_error))
+            .collect::<Result<_, _>>()?;
+        for mut binding in bindings {
+            Self::revoke_numeric_binding(&tx, &binding)?;
+            Self::abandon_revoked_turns(&tx, &binding.id, &[])?;
+            binding.paused = true;
+            binding.revoked = true;
+            tx.execute(
+                "UPDATE bindings SET data=?2 WHERE repo_key=?1",
+                params![
+                    binding.repository_key,
+                    serde_json::to_string(&binding).map_err(storage_error)?
+                ],
+            )
+            .map_err(storage_error)?;
+            Self::hold_binding(&tx, &binding.id, "HARNESS_CONSENT_REVOKED")?;
+        }
+        tx.ensure_no_new_refusal(refused)?;
+        tx.commit().map_err(storage_error)
+    }
+    pub fn binding_delivery_history(&self, binding_id: &str) -> Result<bool, AppError> {
+        self.connection.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE binding_id=?1 AND json_type(data,'$.canonical_server_id')='text')",[binding_id],|r|r.get(0)).map_err(storage_error)
+    }
+    pub fn status(&self) -> Result<Status, AppError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT data FROM bindings ORDER BY repo_key")
+            .map_err(storage_error)?;
+        let bindings: Vec<Binding> = statement
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(storage_error)?
+            .map(|r| serde_json::from_str(&r.map_err(storage_error)?).map_err(storage_error))
+            .collect::<Result<_, _>>()?;
+        let pending = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE state='pending'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?;
+        let held = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM outbox WHERE state='held'", [], |r| {
+                r.get(0)
+            })
+            .map_err(storage_error)?;
+        let needs_attention = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE json_extract(data,'$.needs_attention')=1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?;
+        let unfinished: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE json_type(data,'$.active')='object'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?;
+        let mut queue_statement=self.connection.prepare("SELECT s.source_id,o.revision,o.state,o.reason,o.attempts,o.retry_at FROM outbox o JOIN sessions s ON s.id=o.session_id WHERE o.state!='acknowledged' ORDER BY o.id LIMIT 101").map_err(storage_error)?;
+        let mut queue: Vec<QueueState> = queue_statement
+            .query_map([], |r| {
+                Ok(QueueState {
+                    source_session_id: r.get(0)?,
+                    revision: r.get(1)?,
+                    state: r.get(2)?,
+                    reason: r.get(3)?,
+                    attempts: r.get(4)?,
+                    retry_at: r.get(5)?,
+                })
+            })
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        let queue_truncated = queue.len() > 100;
+        queue.truncate(100);
+        let delivered: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE state='acknowledged'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?;
+        let capture_failure = self.failure()?;
+        let pages: i64 = self
+            .connection
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .map_err(storage_error)?;
+        let page_size: i64 = self
+            .connection
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .map_err(storage_error)?;
+        let full = pages * page_size >= MAX_QUEUE_BYTES - 64 * 1024;
+        let invocation_markers = capture_invocations::snapshot(&self.directory)?;
+        let dead_invocation = invocation_markers.iter().any(|marker| !marker.live);
+        let storage_paused = full || capture_failure.is_some() || dead_invocation;
+        let storage_reason = if full {
+            Some("QUEUE_LIMIT_REACHED".into())
+        } else {
+            capture_failure
+                .as_ref()
+                .map(|f| f.reason.clone())
+                .or_else(|| dead_invocation.then(|| "UNACKNOWLEDGED_INVOCATION".into()))
+        };
+        Ok(Status {
+            policy: POLICY,
+            pending,
+            held,
+            needs_attention,
+            delivery_verified: delivered > 0,
+            trusted: "UNKNOWN",
+            bindings,
+            unfinished,
+            queue,
+            queue_truncated,
+            storage_paused,
+            storage_reason,
+            capture_failure,
+            pending_invocations: invocation_markers.len(),
+        })
+    }
+    fn failure(&self) -> Result<Option<CaptureFailure>, AppError> {
+        Ok(read_failure_markers(&self.directory)?
+            .into_iter()
+            .next()
+            .map(|(_, failure)| failure))
+    }
+    /// Source-fixture failure diagnosis only; status retains its earliest refusal.
+    /// Reuse the bounded strict marker reader and expose no paths or raw bodies.
+    #[cfg(feature = "dev-tools")]
+    pub fn developer_failure_probes(&self) -> Result<Vec<HookFailureProbe>, AppError> {
+        Ok(read_failure_markers(&self.directory)?
+            .into_iter()
+            .filter_map(|(_, failure)| failure.probe)
+            .collect())
+    }
+    /// Failure-only source-fixture summary, never a normal capture hot path.
+    /// Selection order is the status reader's order, not causal chronology.
+    /// Missing associations remain unknown even after a successful snapshot.
+    /// selected_for_status describes this marker snapshot; reads are not atomic.
+    #[cfg(feature = "dev-tools")]
+    pub fn developer_failure_summary(&self) -> Result<serde_json::Value, AppError> {
+        const SAMPLE_LIMIT: usize = 8;
+        const BYTE_LIMIT: usize = 16 * 1024;
+        let markers = read_failure_markers(&self.directory)?;
+        let invocations = capture_invocations::snapshot(&self.directory).ok();
+        let total = markers.len();
+        let probed = markers.iter().filter(|(_, f)| f.probe.is_some()).count();
+        // Keep the selected marker and at least one of each observed probe kind.
+        let mut selected = Vec::new();
+        if total > 0 {
+            selected.push(0);
+        }
+        for has_probe in [false, true] {
+            if let Some(index) = markers
+                .iter()
+                .position(|(_, f)| f.probe.is_some() == has_probe)
+            {
+                if !selected.contains(&index) {
+                    selected.push(index);
+                }
+            }
+        }
+        for index in 0..total {
+            if selected.len() == SAMPLE_LIMIT {
+                break;
+            }
+            if !selected.contains(&index) {
+                selected.push(index);
+            }
+        }
+        selected.sort_unstable();
+        let records: Vec<_> = selected
+            .into_iter()
+            .map(|index| {
+                let (path, failure) = &markers[index];
+                let filename_boundary_match = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("capture-refusal-"))
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .filter(|suffix| {
+                        suffix.len() == 64 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                    .map(|suffix| suffix == failure.boundary_id);
+                // Positive relations only: a missing/raced snapshot is not absence.
+                let invocation_nonce_match = invocations.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .iter()
+                        .any(|marker| marker.nonce == failure.boundary_id)
+                        .then_some(true)
+                });
+                let dead_invocation_boundary_match = invocations.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .iter()
+                        .any(|marker| {
+                            !marker.live
+                                && hash(format!("INVOCATION\0{}", marker.nonce))
+                                    == failure.boundary_id
+                        })
+                        .then_some(true)
+                });
+                // State belongs to this same non-atomic snapshot, not a cause.
+                let dead_state_match = |preparing| {
+                    invocations.as_ref().and_then(|snapshot| {
+                        snapshot
+                            .iter()
+                            .any(|marker| {
+                                !marker.live
+                                    && marker.preparing_state() == Some(preparing)
+                                    && hash(format!("INVOCATION\0{}", marker.nonce))
+                                        == failure.boundary_id
+                            })
+                            .then_some(true)
+                    })
+                };
+                serde_json::json!({
+                    "selection_index": index,
+                    "selected_for_status": index == 0,
+                    "failure": failure,
+                    "filename_boundary_match": filename_boundary_match,
+                    "invocation_nonce_match": invocation_nonce_match,
+                    "dead_invocation_boundary_match": dead_invocation_boundary_match,
+                    "dead_preparing_invocation_boundary_match": dead_state_match(true),
+                    "dead_pending_invocation_boundary_match": dead_state_match(false),
+                })
+            })
+            .collect();
+        let summary = serde_json::json!({
+            "selection_order": "observed_at_seconds_then_filename_not_causal",
+            "association_missing": "UNKNOWN",
+            "snapshot_relation": "marker_status_and_invocation_reads_are_not_atomic",
+            "invocation_snapshot": if invocations.is_some() { "observed" } else { "unknown" },
+            "total_records": total,
+            "probed_records": probed,
+            "unprobed_records": total - probed,
+            "sample_limit": SAMPLE_LIMIT,
+            "sampled_records": records.len(),
+            "omitted_records": total - records.len(),
+            "byte_limit": BYTE_LIMIT,
+            "records": records,
+        });
+        if serde_json::to_vec(&summary).map_err(storage_error)?.len() > BYTE_LIMIT {
+            return Err(storage_error("failure summary limit"));
+        }
+        Ok(summary)
+    }
+    pub fn recover(&mut self, clock: &Clock) -> Result<(), AppError> {
+        let tx = self.transaction()?;
+        let invocations = capture_invocations::snapshot(&tx.directory)?;
+        if invocations.iter().any(|marker| marker.live) {
+            return Err(storage_error("live invocation prevents recovery"));
+        }
+        Self::check_size(&tx)?;
+        let markers = read_failure_markers(&tx.directory)?;
+        if !markers.is_empty() {
+            Self::reconcile_refusal(&tx)?;
+        }
+        let mut statement = tx
+            .prepare("SELECT data FROM sessions")
+            .map_err(storage_error)?;
+        let rows: Vec<String> = statement
+            .query_map([], |r| r.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for raw in rows {
+            let mut session: Session = serde_json::from_str(&raw).map_err(storage_error)?;
+            session.usage_ledger.require_baseline();
+            session.close(clock, false)?;
+            Self::queue(&tx, &mut session)?;
+            tx.execute(
+                "UPDATE sessions SET data=?2 WHERE id=?1",
+                params![
+                    session.id,
+                    serde_json::to_string(&session).map_err(storage_error)?
+                ],
+            )
+            .map_err(storage_error)?;
+        }
+        let directory = tx.directory.clone();
+        // Hold authority through commit and exact snapshot removal. New fallback
+        // publications have unique names and therefore cannot be removed here.
+        let CaptureTransaction {
+            inner,
+            _authority,
+            notification,
+            ..
+        } = tx;
+        inner.commit().map_err(storage_error)?;
+        capture_invocations::remove_dead(&directory, &invocations)?;
+        for (path, _) in markers {
+            fs::remove_file(path).map_err(storage_error)?;
+        }
+        fs::File::open(&directory)
+            .and_then(|f| f.sync_all())
+            .map_err(storage_error)?;
+        if !read_failure_markers(&directory)?.is_empty()
+            || !capture_invocations::snapshot(&directory)?.is_empty()
+        {
+            return Err(AppError::Config(
+                "Another boundary was refused during recovery; collection remains paused".into(),
+            ));
+        }
+        drop(_authority);
+        if let Some(notification) = notification {
+            notification.released_after_authority();
+        }
+        Ok(())
+    }
+    /// Bounded worker maintenance also runs on empty, disabled and held queues.
+    pub fn maintain(&mut self, now: i64) -> Result<(), AppError> {
+        let tx = self.transaction()?;
+        if tx.failure()?.is_some() {
+            Self::reconcile_refusal(&tx)?;
+        }
+        tx.execute("DELETE FROM outbox WHERE id IN (SELECT id FROM outbox WHERE state='acknowledged' AND acknowledged_at<?1 LIMIT 1000)",[now-7*24*3600]).map_err(storage_error)?;
+        tx.commit().map_err(storage_error)
+    }
+    pub fn preview(&self, source_id: &str) -> Result<Vec<Session>, AppError> {
+        identifier(source_id)?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT data FROM sessions WHERE source_id=?1 ORDER BY id")
+            .map_err(storage_error)?;
+        let result = statement
+            .query_map([source_id], |r| r.get::<_, String>(0))
+            .map_err(storage_error)?
+            .map(|r| serde_json::from_str(&r.map_err(storage_error)?).map_err(storage_error))
+            .collect();
+        result
+    }
+    pub fn has_ready(&self, binding: &Binding, now: i64) -> Result<bool, AppError> {
+        if self.failure()?.is_some() || self.invocations_pending()? {
+            return Ok(false);
+        }
+        self.connection.query_row("SELECT EXISTS(SELECT 1 FROM outbox o JOIN sessions s ON s.id=o.session_id WHERE s.binding_id=?1 AND o.state='pending' AND o.retry_at<=?2 AND o.claimed_until<=?2 AND NOT EXISTS(SELECT 1 FROM outbox prior WHERE prior.session_id=o.session_id AND prior.revision<o.revision AND prior.state!='acknowledged'))",params![binding.id,now],|r|r.get(0)).map_err(storage_error)
+    }
+    /// Claims only the next revision of each session. Lease expiry permits lost-response replay.
+    pub fn claim(&mut self, binding: &Binding, now: i64) -> Result<Option<Queued>, AppError> {
+        let tx = self.transaction()?;
+        let refused = tx.failure()?.is_some();
+        if refused {
+            Self::reconcile_refusal(&tx)?;
+        }
+        if !capture_invocations::snapshot(&tx.directory)?.is_empty() {
+            tx.commit().map_err(storage_error)?;
+            return Ok(None);
+        }
+        let current = Self::binding_in(&tx, &binding.repository_key)?;
+        if !current.is_some_and(|b| b.id == binding.id && !b.paused && !b.revoked) {
+            tx.commit().map_err(storage_error)?;
+            return Ok(None);
+        }
+        let row = tx.query_row("SELECT o.id,o.session_id,o.body,o.payload_hash,o.attempts,o.revision,json_extract(s.data,'$.canonical_server_id'),s.data FROM outbox o JOIN sessions s ON s.id=o.session_id
+            WHERE s.binding_id=?1 AND o.state='pending' AND o.retry_at<=?2 AND o.claimed_until<=?2
+            AND NOT EXISTS (SELECT 1 FROM outbox prior WHERE prior.session_id=o.session_id AND prior.revision<o.revision AND prior.state!='acknowledged') ORDER BY o.id LIMIT 1",
+            params![binding.id,now],|r| Ok((Queued{id:r.get(0)?,session_id:r.get(1)?,body:r.get(2)?,hash:r.get(3)?,attempts:r.get(4)?,revision:r.get(5)?,canonical_server_id:r.get(6)?},r.get::<_,String>(7)?))).optional().map_err(storage_error)?;
+        let row = if let Some((row, raw)) = row {
+            let valid = serde_json::from_str::<Session>(&raw)
+                .ok()
+                .zip(serde_json::from_str::<CapturePayload>(&row.body).ok())
+                .is_some_and(|(session, payload)| {
+                    validate_frozen(&row, &payload, &session, binding)
+                });
+            if !valid {
+                tx.execute("UPDATE outbox SET state='held',reason='FROZEN_PAYLOAD_INVALID',claimed_until=0 WHERE id=?1",[row.id]).map_err(storage_error)?;
+                tx.execute("UPDATE sessions SET data=json_set(data,'$.needs_attention',json('true')) WHERE id=?1",[&row.session_id]).map_err(storage_error)?;
+                tx.commit().map_err(storage_error)?;
+                return Err(AppError::Config("Frozen capture evidence failed integrity checks; quarantined without transmission".into()));
+            }
+            tx.execute(
+                "UPDATE outbox SET claimed_until=?2 WHERE id=?1",
+                params![row.id, now + 30],
+            )
+            .map_err(storage_error)?;
+            Some(row)
+        } else {
+            None
+        };
+        tx.ensure_no_new_refusal(refused)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(row)
+    }
+    pub fn acknowledge(&mut self, row: &Queued, server_id: &str, now: i64) -> Result<(), AppError> {
+        identifier(server_id)?;
+        let tx = self.transaction()?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(data,'$.canonical_server_id') FROM sessions WHERE id=?1",
+                [&row.session_id],
+                |r| r.get(0),
+            )
+            .map_err(storage_error)?;
+        if current.as_deref().is_some_and(|id| id != server_id) {
+            return Err(AppError::Conflict(
+                "Canonical capture identity changed; acknowledgement refused".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE sessions SET data=json_set(data,'$.canonical_server_id',?2) WHERE id=?1",
+            params![row.session_id, server_id],
+        )
+        .map_err(storage_error)?;
+        tx.execute("UPDATE outbox SET state='acknowledged',reason='ACCEPTED',attempts=attempts+1,claimed_until=0,acknowledged_at=?2 WHERE id=?1 AND payload_hash=?3",params![row.id,now,row.hash]).map_err(storage_error)?;
+        tx.execute(
+            "DELETE FROM outbox WHERE state='acknowledged' AND acknowledged_at<?1",
+            [now - 7 * 24 * 3600],
+        )
+        .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)
+    }
+    pub fn finish(
+        &mut self,
+        row: &Queued,
+        state: &str,
+        reason: &str,
+        now: i64,
+        retry_after: Option<i64>,
+    ) -> Result<(), AppError> {
+        let delay = retry_after
+            .unwrap_or_else(|| (2_i64.pow((row.attempts as u32).min(8)) + (row.id % 7)).min(300))
+            .clamp(1, 3600);
+        let tx = self.transaction()?;
+        if tx.failure()?.is_some() {
+            Self::reconcile_refusal(&tx)?;
+        }
+        tx.execute("UPDATE outbox SET state=?2,reason=?3,attempts=attempts+1,retry_at=?4,claimed_until=0,acknowledged_at=?5 WHERE id=?1 AND payload_hash=?6 AND state!='held'",
+            params![row.id,state,reason,now+delay,if state=="acknowledged" {Some(now)} else {None},row.hash]).map_err(storage_error)?;
+        // Only acknowledged payloads expire. Never silently evict unsent evidence.
+        tx.execute(
+            "DELETE FROM outbox WHERE state='acknowledged' AND acknowledged_at<?1",
+            [now - 7 * 24 * 3600],
+        )
+        .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "../tests/unit/capture_usage_factory.rs"]
+mod usage_factory_tests;
+#[cfg(all(test, unix))]
+#[path = "../tests/unit/capture_usage_qualification.rs"]
+mod usage_qualification_tests;
+
+fn validate_frozen(
+    row: &Queued,
+    payload: &CapturePayload,
+    session: &Session,
+    binding: &Binding,
+) -> bool {
+    if row.body.len() > MAX_BODY_BYTES
+        || hash(&row.body) != row.hash
+        || payload.schema_version != 1
+        || payload.revision != row.revision
+        || payload.expected_revision != row.revision - 1
+        || payload.source_namespace != session.source_namespace
+        || payload.source_session_id != session.source_session_id
+        || payload.harness_version != session.harness_version
+        || payload.repository_binding_id != session.binding.id
+        || payload.repository_binding_id != binding.id
+        || payload.binding_version != session.binding.version
+        || payload.project_id != session.binding.project_id
+        || payload.task_id != session.binding.task_id
+        || payload.work_kind != "HUMAN_ASSISTED_AGENT_ACTIVITY"
+        || payload.measurement_method != "OBSERVED_TURN_INTERVALS_V1"
+        || !matches!(payload.source_namespace.as_str(), "claude-code" | "codex")
+        || !matches!(
+            payload.lifecycle.as_str(),
+            "ACTIVE" | "COMPLETED" | "INCOMPLETE"
+        )
+        || payload.segments.len() > 100
+        || !session.usage_ledger.validate_payload(
+            &payload.usage,
+            &session.source_namespace,
+            &session.harness_version,
+            row.revision,
+        )
+    {
+        return false;
+    }
+    for id in [
+        &payload.source_session_id,
+        &payload.repository_binding_id,
+        &payload.project_id,
+        &payload.task_id,
+        &payload.harness_version,
+    ] {
+        if identifier(id).is_err() {
+            return false;
+        }
+    }
+    let parse = |s: &str| DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp());
+    let Some(start) = parse(&payload.started_at) else {
+        return false;
+    };
+    let Some(end) = parse(&payload.observed_through) else {
+        return false;
+    };
+    if start != session.started_at
+        || end < start
+        || payload.revision < 1
+        || payload.revision > i32::MAX as i64
+    {
+        return false;
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for segment in &payload.segments {
+        let Some(a) = parse(&segment.started_at) else {
+            return false;
+        };
+        let Some(b) = parse(&segment.ended_at) else {
+            return false;
+        };
+        if identifier(&segment.segment_key).is_err()
+            || !keys.insert(&segment.segment_key)
+            || a < start
+            || b > end
+            || b < a
+            || b - a > MAX_INTERVAL_SECONDS
+            || (segment.completeness == "COMPLETE" && segment.duration_seconds != b - a)
+            || (segment.completeness == "INCOMPLETE" && segment.duration_seconds != 0)
+            || !matches!(segment.completeness.as_str(), "COMPLETE" | "INCOMPLETE")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Bounded metadata-only refusal state. Unique immutable filenames prevent a
+/// recovering process from deleting a concurrently published refusal.
+fn read_failure_markers(directory: &Path) -> Result<Vec<(PathBuf, CaptureFailure)>, AppError> {
+    crate::capture_profile_measure!(RefusalReads, {
+        let mut markers = Vec::new();
+        for entry in fs::read_dir(directory).map_err(storage_error)? {
+            let entry = entry.map_err(storage_error)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name != "capture-failure.json"
+                && !(name.starts_with("capture-refusal-") && name.ends_with(".json"))
+            {
+                continue;
+            }
+            if markers.len() >= 1024 {
+                return Err(storage_error("refusal marker limit"));
+            }
+            let path = entry.path();
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+            }
+            let file = options.open(&path).map_err(storage_error)?;
+            let metadata = file.metadata().map_err(storage_error)?;
+            if !metadata.is_file() || metadata.len() > 1024 {
+                return Err(storage_error("invalid refusal marker"));
+            }
+            let mut bytes = Vec::new();
+            file.take(1025)
+                .read_to_end(&mut bytes)
+                .map_err(storage_error)?;
+            if bytes.len() > 1024 {
+                return Err(storage_error("invalid refusal marker"));
+            }
+            let value: CaptureFailure = serde_json::from_slice(&bytes).map_err(storage_error)?;
+            if !matches!(
+                value.reason.as_str(),
+                "STORAGE_UNAVAILABLE" | "QUEUE_LIMIT_REACHED" | "BOUNDARY_REFUSED"
+            ) || value.boundary_id.len() != 64
+                || !value.boundary_id.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(storage_error("invalid refusal marker"));
+            }
+            markers.push((path, value));
+        }
+        markers
+            .sort_by(|(ap, a), (bp, b)| a.observed_at.cmp(&b.observed_at).then_with(|| ap.cmp(bp)));
+        Ok(markers)
+    })
+}
+
+// Emergency markers use the reviewed POSIX fsync contract, not Apple's
+// stronger drive-wide F_FULLFSYNC used by File::sync_all. SQLite is unchanged.
+fn sync_refusal(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        file.sync_all()
+    }
+}
+
+pub fn record_failure(directory: &Path, boundary_id: &str, reason: &str) -> Result<(), AppError> {
+    write_failure(directory, boundary_id, reason, |_| {})
+}
+#[cfg(feature = "dev-tools")]
+pub(crate) fn record_failure_probed(
+    directory: &Path,
+    boundary_id: &str,
+    reason: &str,
+    probe: HookFailureProbe,
+) -> Result<(), AppError> {
+    write_failure(directory, boundary_id, reason, |failure| {
+        failure.probe = Some(probe);
+    })
+}
+fn write_failure(
+    directory: &Path,
+    boundary_id: &str,
+    reason: &str,
+    enrich: impl FnOnce(&mut CaptureFailure),
+) -> Result<(), AppError> {
+    if !matches!(
+        reason,
+        "STORAGE_UNAVAILABLE" | "QUEUE_LIMIT_REACHED" | "BOUNDARY_REFUSED"
+    ) || boundary_id.len() != 64
+        || !boundary_id.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(storage_error("invalid failure marker"));
+    }
+    if directory.exists()
+        && fs::symlink_metadata(directory)
+            .map_err(storage_error)?
+            .file_type()
+            .is_symlink()
+    {
+        return Err(storage_error("symlink"));
+    }
+    fs::create_dir_all(directory).map_err(storage_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(storage_error)?;
+    }
+    // Bound reserved refusal storage as well as each marker. At exhaustion,
+    // existing durable refusal state still keeps collection paused; this new
+    // boundary is explicitly reported unsaved rather than silently evicted.
+    let existing = fs::read_dir(directory)
+        .map_err(storage_error)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("capture-refusal-") && name.ends_with(".json"))
+        })
+        .take(1024)
+        .count();
+    if existing >= 1024 {
+        return Err(storage_error("refusal marker limit"));
+    }
+    // Never add another busy wait after SQLite's 500ms timeout. Failure of the
+    // nonblocking lock still permits this append-only emergency publication.
+    let _authority = AuthorityGuard::acquire(directory, false).ok();
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = hash(format!(
+        "{}-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let temporary = directory.join(format!(".capture-refusal-{unique}.tmp"));
+    let path = directory.join(format!("capture-refusal-{unique}.json"));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temporary).map_err(storage_error)?;
+        let mut failure = CaptureFailure {
+            reason: reason.into(),
+            boundary_id: boundary_id.into(),
+            observed_at: chrono::Utc::now().timestamp(),
+            #[cfg(feature = "dev-tools")]
+            probe: None,
+        };
+        enrich(&mut failure);
+        use std::io::Write;
+        file.write_all(&serde_json::to_vec(&failure).map_err(storage_error)?)
+            .map_err(storage_error)?;
+        sync_refusal(&file).map_err(storage_error)?;
+        fs::rename(&temporary, &path).map_err(storage_error)?;
+        fs::File::open(directory)
+            .and_then(|f| sync_refusal(&f))
+            .map_err(storage_error)?;
+        Ok(())
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+#[cfg(test)]
+mod failure_probe_tests {
+    use super::*;
+
+    fn legacy() -> serde_json::Value {
+        serde_json::json!({
+            "reason": "STORAGE_UNAVAILABLE",
+            "boundary_id": "a".repeat(64),
+            "observed_at": 1794932360,
+        })
+    }
+
+    #[cfg(feature = "dev-tools")]
+    fn observed() -> serde_json::Value {
+        let mut value = legacy();
+        value["probe"] = serde_json::json!({
+            "phase": "repository",
+            "owner_fault": "group_deadline",
+            "setup": null,
+        });
+        value
+    }
+
+    #[test]
+    fn legacy_failure_keeps_exact_schema_without_a_probe() {
+        let failure: CaptureFailure = serde_json::from_value(legacy()).unwrap();
+        assert_eq!(serde_json::to_value(failure).unwrap(), legacy());
+    }
+
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn developer_failure_retains_closed_probe_provenance() {
+        let failure: CaptureFailure = serde_json::from_value(observed()).unwrap();
+        assert_eq!(serde_json::to_value(failure).unwrap(), observed());
+    }
+
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn developer_probe_refuses_unknown_fields_and_variants() {
+        for (key, value) in [
+            ("phase", serde_json::json!("PRIVATE_RAW_CANARY")),
+            ("owner_fault", serde_json::json!("PRIVATE_RAW_CANARY")),
+            ("unknown", serde_json::json!("PRIVATE_RAW_CANARY")),
+        ] {
+            let mut marker = observed();
+            marker["probe"][key] = value;
+            assert!(serde_json::from_value::<CaptureFailure>(marker).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn developer_setup_probe_is_strict_and_fits_the_existing_marker_limit() {
+        let mut marker = observed();
+        marker["probe"]["setup"] = serde_json::json!({
+            "ready_window_ns": u64::MAX,
+            "pre_spawn_offset_ns": u64::MAX,
+            "spawn_return_offset_ns": u64::MAX,
+            "first_ready_poll_offset_ns": u64::MAX,
+            "deadline_offset_ns": u64::MAX,
+            "ready_frame_observed": false,
+            "ready_eof_observed": false,
+            "deadline_edge": "park_after_receive",
+            "fault_state": "await_ready",
+            "park_end_offset_ns": u64::MAX,
+            "workload_spawn_return_offset_ns": u64::MAX,
+            "first_park_poll_offset_ns": u64::MAX,
+            "park_frame_observed": true,
+        });
+        let failure: CaptureFailure = serde_json::from_value(marker.clone()).unwrap();
+        assert!(serde_json::to_vec(&failure).unwrap().len() <= 1024);
+        assert_eq!(serde_json::to_value(failure).unwrap(), marker);
+        let mut older = marker.clone();
+        older["probe"]["setup"]["deadline_edge"] = serde_json::json!("before_receive");
+        for key in [
+            "park_end_offset_ns",
+            "workload_spawn_return_offset_ns",
+            "first_park_poll_offset_ns",
+            "park_frame_observed",
+        ] {
+            older["probe"]["setup"].as_object_mut().unwrap().remove(key);
+        }
+        let failure: CaptureFailure = serde_json::from_value(older.clone()).unwrap();
+        assert_eq!(serde_json::to_value(failure).unwrap(), older);
+        for (key, value) in [
+            ("deadline_edge", serde_json::json!("PRIVATE_RAW_CANARY")),
+            ("fault_state", serde_json::json!("PRIVATE_RAW_CANARY")),
+            ("unknown", serde_json::json!("PRIVATE_RAW_CANARY")),
+        ] {
+            let mut invalid = marker.clone();
+            invalid["probe"]["setup"][key] = value;
+            assert!(serde_json::from_value::<CaptureFailure>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dev-tools")]
+    fn developer_owner_fault_mapping_never_serializes_unselected_text() {
+        for (reason, expected) in [
+            ("GROUP_DEADLINE", HookOwnerFault::GroupDeadline),
+            ("GROUP_LIFETIME", HookOwnerFault::GroupLifetime),
+            (
+                "SCOPE_OPERATION_DEADLINE",
+                HookOwnerFault::OperationDeadline,
+            ),
+            ("SCOPE_SETUP_DEADLINE", HookOwnerFault::OperationDeadline),
+            ("SCOPE_PROOF_DEADLINE", HookOwnerFault::ProofDeadline),
+            ("SCOPE_CLEANUP_DEADLINE", HookOwnerFault::CleanupDeadline),
+            ("SCOPE_CLOCK", HookOwnerFault::Clock),
+            ("GROUP_CLOCK", HookOwnerFault::Clock),
+            ("PRIVATE_RAW_CANARY", HookOwnerFault::Other),
+        ] {
+            let fault = HookOwnerFault::from_static(reason);
+            assert_eq!(fault, expected);
+            assert!(!serde_json::to_string(&fault).unwrap().contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "dev-tools", unix))]
+    fn developer_probe_uses_one_existing_immutable_failure_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let failure: CaptureFailure = serde_json::from_value(observed()).unwrap();
+        record_failure_probed(
+            directory.path(),
+            &failure.boundary_id,
+            &failure.reason,
+            failure.probe.unwrap(),
+        )
+        .unwrap();
+        let markers = read_failure_markers(directory.path()).unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].1.reason, failure.reason);
+        assert_eq!(markers[0].1.boundary_id, failure.boundary_id);
+        assert!(markers[0].1.probe.is_some());
+        assert!(fs::read(&markers[0].0).unwrap().len() <= 1024);
+
+        let ordinary = tempfile::tempdir().unwrap();
+        record_failure(ordinary.path(), &failure.boundary_id, &failure.reason).unwrap();
+        let ordinary = read_failure_markers(ordinary.path()).unwrap();
+        assert_eq!(ordinary.len(), 1);
+        let value = serde_json::to_value(&ordinary[0].1).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert!(value.get("probe").is_none());
+    }
+
+    #[test]
+    #[cfg(all(feature = "dev-tools", unix))]
+    fn developer_failure_probes_keep_later_core_diagnostics_after_an_earlier_guard_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut first = legacy();
+        first["reason"] = serde_json::json!("BOUNDARY_REFUSED");
+        first["observed_at"] = serde_json::json!(1);
+        let first_path = directory.path().join("capture-failure.json");
+        let original = serde_json::to_vec(&first).unwrap();
+        fs::write(&first_path, &original).unwrap();
+        let mut expected = Vec::new();
+        for phase in [HookFailurePhase::Repository, HookFailurePhase::Permit] {
+            let probe = HookFailureProbe {
+                phase,
+                owner_fault: Some(HookOwnerFault::GroupDeadline),
+                setup: None,
+            };
+            expected.push(serde_json::to_value(probe).unwrap());
+            record_failure_probed(
+                directory.path(),
+                &"a".repeat(64),
+                "STORAGE_UNAVAILABLE",
+                probe,
+            )
+            .unwrap();
+        }
+        assert_eq!(store.failure().unwrap().unwrap().reason, "BOUNDARY_REFUSED");
+        let probes = store.developer_failure_probes().unwrap();
+        let mut actual = probes
+            .into_iter()
+            .map(|probe| serde_json::to_value(probe).unwrap())
+            .collect::<Vec<_>>();
+        // Same-second immutable marker filename ordering is not phase ordering.
+        actual.sort_by_key(|value| value.to_string());
+        expected.sort_by_key(|value| value.to_string());
+        assert_eq!(actual, expected);
+        assert_eq!(fs::read(&first_path).unwrap(), original);
+        assert_eq!(read_failure_markers(directory.path()).unwrap().len(), 3);
+        fs::write(
+            directory.path().join("capture-refusal-malformed.json"),
+            b"PRIVATE_MALFORMED_CANARY",
+        )
+        .unwrap();
+        assert!(store.developer_failure_probes().is_err());
+    }
+
+    #[test]
+    #[cfg(not(feature = "dev-tools"))]
+    fn production_reader_rejects_source_fixture_probe_metadata() {
+        let mut marker = legacy();
+        marker["probe"] = serde_json::json!({ "phase": "repository" });
+        assert!(serde_json::from_value::<CaptureFailure>(marker).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "dev-tools", unix))]
+mod failure_summary_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::{symlink, DirBuilderExt, OpenOptionsExt};
+
+    fn fixture() -> (tempfile::TempDir, Store) {
+        let directory = tempfile::Builder::new()
+            .prefix("PRIVATE_SUMMARY_PATH_")
+            .tempdir()
+            .unwrap();
+        // macOS temporary paths can traverse /var -> /private/var.
+        // Supply the real path to the production no-symlink admission checks.
+        let store = Store::open(&directory.path().canonicalize().unwrap()).unwrap();
+        (directory, store)
+    }
+    fn probe() -> HookFailureProbe {
+        HookFailureProbe {
+            phase: HookFailurePhase::Permit,
+            owner_fault: None,
+            setup: None,
+        }
+    }
+    fn private_write(path: &Path, bytes: impl AsRef<[u8]>) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes.as_ref()).unwrap();
+    }
+    fn marker(
+        directory: &Path,
+        suffix: &str,
+        boundary: &str,
+        at: i64,
+        probe: Option<HookFailureProbe>,
+    ) -> Vec<u8> {
+        let failure = CaptureFailure {
+            reason: "BOUNDARY_REFUSED".into(),
+            boundary_id: boundary.into(),
+            observed_at: at,
+            probe,
+        };
+        let bytes = serde_json::to_vec(&failure).unwrap();
+        assert!(bytes.len() <= 1024);
+        private_write(
+            &directory.join(format!("capture-refusal-{suffix}.json")),
+            &bytes,
+        );
+        bytes
+    }
+    fn invocation(directory: &Path, nonce: &str, preparing: bool, bytes: &[u8]) -> PathBuf {
+        let root = directory.join("capture-invocations");
+        if !root.exists() {
+            fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        }
+        let publication = directory.join("capture-invocations-publication.lock");
+        if !publication.exists() {
+            private_write(&publication, []);
+        }
+        let path = root.join(format!(
+            "{nonce}.{}",
+            if preparing { "preparing" } else { "pending" }
+        ));
+        private_write(&path, bytes);
+        path
+    }
+    fn summary(store: &Store) -> serde_json::Value {
+        let summary = store.developer_failure_summary().unwrap();
+        let bytes = serde_json::to_vec(&summary).unwrap();
+        assert!(bytes.len() <= 16 * 1024);
+        assert!(!String::from_utf8(bytes).unwrap().contains("PRIVATE"));
+        for record in summary["records"].as_array().unwrap() {
+            for key in [
+                "dead_preparing_invocation_boundary_match",
+                "dead_pending_invocation_boundary_match",
+            ] {
+                assert!(record.as_object().unwrap().contains_key(key));
+                assert!(record[key].is_null() || record[key] == true);
+            }
+        }
+        summary
+    }
+
+    #[test]
+    fn direct_dead_preparing_dead_pending_and_core_records_keep_their_associations() {
+        let (directory, store) = fixture();
+        let preparing = "b".repeat(64);
+        let pending = "c".repeat(64);
+        invocation(
+            directory.path(),
+            &preparing,
+            true,
+            b"KEITO_CAPTURE_PENDING_V1\n",
+        );
+        invocation(
+            directory.path(),
+            &pending,
+            false,
+            b"KEITO_CAPTURE_PENDING_V1\n",
+        );
+        let direct = "d".repeat(64);
+        let first = marker(directory.path(), &direct, &direct, 1, None);
+        marker(
+            directory.path(),
+            &"e".repeat(64),
+            &hash(format!("INVOCATION\0{preparing}")),
+            2,
+            None,
+        );
+        marker(
+            directory.path(),
+            &"f".repeat(64),
+            &hash(format!("INVOCATION\0{pending}")),
+            3,
+            None,
+        );
+        marker(
+            directory.path(),
+            &"a".repeat(64),
+            &hash("synthetic core boundary"),
+            4,
+            Some(probe()),
+        );
+        marker(directory.path(), &preparing, &preparing, 5, None);
+        let value = summary(&store);
+        assert_eq!(value["total_records"], 5);
+        assert_eq!(value["unprobed_records"], 4);
+        assert_eq!(value["probed_records"], 1);
+        assert_eq!(value["invocation_snapshot"], "observed");
+        let records = value["records"].as_array().unwrap();
+        assert_eq!(records[0]["selected_for_status"], true);
+        assert_eq!(records[0]["failure"]["boundary_id"], direct);
+        assert_eq!(records[0]["filename_boundary_match"], true);
+        assert!(records[0]["invocation_nonce_match"].is_null());
+        assert_eq!(records[1]["dead_invocation_boundary_match"], true);
+        assert_eq!(records[1]["filename_boundary_match"], false);
+        assert_eq!(records[2]["dead_invocation_boundary_match"], true);
+        assert_eq!(records[1]["dead_preparing_invocation_boundary_match"], true);
+        assert!(records[1]["dead_pending_invocation_boundary_match"].is_null());
+        assert_eq!(records[2]["dead_pending_invocation_boundary_match"], true);
+        assert!(records[2]["dead_preparing_invocation_boundary_match"].is_null());
+        for index in [0, 3, 4] {
+            assert!(records[index]["dead_preparing_invocation_boundary_match"].is_null());
+            assert!(records[index]["dead_pending_invocation_boundary_match"].is_null());
+        }
+        assert_eq!(records[3]["failure"]["probe"]["phase"], "permit");
+        assert!(records[3]["dead_invocation_boundary_match"].is_null());
+        assert_eq!(records[4]["invocation_nonce_match"], true);
+        assert_eq!(
+            fs::read(
+                directory
+                    .path()
+                    .join(format!("capture-refusal-{direct}.json"))
+            )
+            .unwrap(),
+            first
+        );
+        assert_eq!(store.failure().unwrap().unwrap().boundary_id, direct);
+    }
+
+    #[test]
+    fn same_second_selection_is_lexical_not_write_order_or_causality() {
+        let (directory, store) = fixture();
+        let later_name = "f".repeat(64);
+        let selected_name = "a".repeat(64);
+        marker(
+            directory.path(),
+            &later_name,
+            &later_name,
+            10,
+            Some(probe()),
+        );
+        marker(directory.path(), &selected_name, &selected_name, 10, None);
+        let value = summary(&store);
+        assert_eq!(
+            value["selection_order"],
+            "observed_at_seconds_then_filename_not_causal"
+        );
+        assert_eq!(value["records"][0]["failure"]["boundary_id"], selected_name);
+        assert_eq!(value["records"][0]["selection_index"], 0);
+        assert_eq!(value["records"][1]["selected_for_status"], false);
+        assert_eq!(store.failure().unwrap().unwrap().boundary_id, selected_name);
+    }
+
+    #[test]
+    fn invalid_invocation_snapshot_keeps_records_but_associations_unknown() {
+        let (directory, store) = fixture();
+        let nonce = "b".repeat(64);
+        let boundary = hash(format!("INVOCATION\0{nonce}"));
+        marker(directory.path(), &"a".repeat(64), &boundary, 1, None);
+        invocation(directory.path(), &nonce, false, b"PRIVATE_INVALID_MARKER");
+        let value = summary(&store);
+        assert_eq!(value["total_records"], 1);
+        assert_eq!(value["invocation_snapshot"], "unknown");
+        assert!(value["records"][0]["invocation_nonce_match"].is_null());
+        assert!(value["records"][0]["dead_invocation_boundary_match"].is_null());
+        assert!(value["records"][0]["dead_preparing_invocation_boundary_match"].is_null());
+        assert!(value["records"][0]["dead_pending_invocation_boundary_match"].is_null());
+    }
+
+    #[test]
+    fn lost_invocation_association_remains_unknown_after_a_valid_empty_snapshot() {
+        let (directory, store) = fixture();
+        let nonce = "b".repeat(64);
+        let boundary = hash(format!("INVOCATION\0{nonce}"));
+        marker(directory.path(), &"a".repeat(64), &boundary, 1, None);
+        let path = invocation(
+            directory.path(),
+            &nonce,
+            false,
+            b"KEITO_CAPTURE_PENDING_V1\n",
+        );
+        let before = summary(&store);
+        assert_eq!(before["records"][0]["dead_invocation_boundary_match"], true);
+        assert_eq!(
+            before["records"][0]["dead_pending_invocation_boundary_match"],
+            true
+        );
+        assert!(before["records"][0]["dead_preparing_invocation_boundary_match"].is_null());
+        fs::remove_file(path).unwrap();
+        let value = summary(&store);
+        assert_eq!(value["invocation_snapshot"], "observed");
+        assert_eq!(value["association_missing"], "UNKNOWN");
+        assert_eq!(
+            value["snapshot_relation"],
+            "marker_status_and_invocation_reads_are_not_atomic"
+        );
+        assert!(value["records"][0]["dead_invocation_boundary_match"].is_null());
+        assert!(value["records"][0]["dead_preparing_invocation_boundary_match"].is_null());
+        assert!(value["records"][0]["dead_pending_invocation_boundary_match"].is_null());
+    }
+
+    #[test]
+    fn malformed_symlink_and_oversized_failure_inputs_are_unavailable() {
+        for kind in 0..3 {
+            let (directory, store) = fixture();
+            let path = directory
+                .path()
+                .join(format!("capture-refusal-{}.json", "a".repeat(64)));
+            match kind {
+                0 => private_write(&path, b"PRIVATE_MALFORMED_CANARY"),
+                1 => {
+                    let target = directory.path().join("PRIVATE_TARGET");
+                    private_write(&target, b"PRIVATE_SYMLINK_CANARY");
+                    symlink(target, &path).unwrap();
+                }
+                _ => private_write(&path, vec![b'x'; 1025]),
+            }
+            assert!(store.developer_failure_summary().is_err());
+        }
+    }
+
+    #[test]
+    fn reader_cap_and_sample_cap_preserve_selected_and_unprobed_counts() {
+        let (directory, store) = fixture();
+        for index in 0..1024 {
+            let suffix = format!("{index:064x}");
+            marker(
+                directory.path(),
+                &suffix,
+                &suffix,
+                index,
+                if index == 0 { Some(probe()) } else { None },
+            );
+        }
+        let value = summary(&store);
+        assert_eq!(value["total_records"], 1024);
+        assert_eq!(value["sampled_records"], 8);
+        assert_eq!(value["omitted_records"], 1016);
+        assert_eq!(value["unprobed_records"], 1023);
+        assert_eq!(value["probed_records"], 1);
+        assert_eq!(value["records"][0]["selected_for_status"], true);
+        marker(
+            directory.path(),
+            &format!("{:064x}", 1024),
+            &"a".repeat(64),
+            1024,
+            None,
+        );
+        assert!(store.developer_failure_summary().is_err());
+    }
+
+    #[test]
+    fn bounded_sample_keeps_a_later_probe_without_losing_the_selected_marker() {
+        let (directory, store) = fixture();
+        let full = HookFailureProbe {
+            phase: HookFailurePhase::Event,
+            owner_fault: Some(HookOwnerFault::GroupDeadline),
+            setup: Some(HookSetupProbe {
+                fault_state: Some(HookGroupState::AwaitReady),
+                ready_window_ns: Some(u64::MAX),
+                pre_spawn_offset_ns: Some(u64::MAX),
+                spawn_return_offset_ns: Some(u64::MAX),
+                first_ready_poll_offset_ns: Some(u64::MAX),
+                deadline_offset_ns: Some(u64::MAX),
+                ready_frame_observed: true,
+                ready_eof_observed: true,
+                deadline_edge: Some(HookReadyEdge::ParkAfterReceive),
+                park_end_offset_ns: Some(u64::MAX),
+                workload_spawn_return_offset_ns: Some(u64::MAX),
+                first_park_poll_offset_ns: Some(u64::MAX),
+                park_frame_observed: Some(true),
+            }),
+        };
+        for index in 0..12 {
+            let suffix = format!("{index:064x}");
+            marker(
+                directory.path(),
+                &suffix,
+                &suffix,
+                index,
+                if index == 11 { Some(full) } else { None },
+            );
+        }
+        let value = summary(&store);
+        assert_eq!(value["total_records"], 12);
+        assert_eq!(value["sampled_records"], 8);
+        assert_eq!(value["omitted_records"], 4);
+        assert_eq!(value["records"][0]["selected_for_status"], true);
+        assert!(value["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["selection_index"] == 11));
+    }
+
+    #[test]
+    fn legacy_filename_has_no_invented_filename_relation_and_empty_summary_is_bounded() {
+        let (directory, store) = fixture();
+        let empty = summary(&store);
+        assert_eq!(empty["total_records"], 0);
+        assert_eq!(empty["sampled_records"], 0);
+        assert_eq!(empty["records"].as_array().unwrap().len(), 0);
+        let bytes = serde_json::to_vec(&CaptureFailure {
+            reason: "STORAGE_UNAVAILABLE".into(),
+            boundary_id: "a".repeat(64),
+            observed_at: 1,
+            probe: None,
+        })
+        .unwrap();
+        private_write(&directory.path().join("capture-failure.json"), bytes);
+        let value = summary(&store);
+        assert!(value["records"][0]["filename_boundary_match"].is_null());
+        assert!(value["records"][0]["invocation_nonce_match"].is_null());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod owned_probe_tests {
+    use super::*;
+    use crate::process_ownership::{io::CommandOutput, probes::LeafRunner, scope::CommandResult};
+    use std::{collections::VecDeque, io, os::unix::process::ExitStatusExt};
+    struct Replies {
+        values: VecDeque<io::Result<CommandResult>>,
+        calls: usize,
+    }
+    impl LeafRunner for Replies {
+        fn output(
+            &mut self,
+            command: Command,
+            stdout_cap: usize,
+            stderr_cap: usize,
+        ) -> io::Result<CommandResult> {
+            assert_eq!(command.get_program(), "git");
+            assert!(stdout_cap <= 1024 * 1024 && stderr_cap <= 8192);
+            self.calls += 1;
+            self.values.pop_front().expect("unexpected extra command")
+        }
+    }
+    fn reply(code: i32, bytes: Vec<u8>) -> io::Result<CommandResult> {
+        Ok(CommandResult {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            output: CommandOutput {
+                stdout: bytes,
+                stderr: Vec::new(),
+            },
+        })
+    }
+    #[test]
+    fn r40_real_repository_resolver_uses_three_results_and_known_empty_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let bytes = root.to_str().unwrap().as_bytes().to_vec();
+        let mut replies = Replies {
+            values: [
+                reply(0, bytes.clone()),
+                reply(0, bytes),
+                reply(1, Vec::new()),
+            ]
+            .into(),
+            calls: 0,
+        };
+        let repository = Repository::resolve_with(&root, &mut replies).unwrap();
+        assert_eq!(replies.calls, 3);
+        assert_eq!(repository.remote_hash, hash(""));
+    }
+    #[test]
+    fn r40_real_repository_resolver_never_swallows_ownership_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let bytes = root.to_str().unwrap().as_bytes().to_vec();
+        let mut replies = Replies {
+            values: [
+                reply(0, bytes.clone()),
+                reply(0, bytes),
+                Err(io::Error::other("OWNERSHIP_FAILED")),
+            ]
+            .into(),
+            calls: 0,
+        };
+        assert!(Repository::resolve_with(&root, &mut replies).is_err());
+        assert_eq!(replies.calls, 3);
+    }
+    struct CohortReplies {
+        directory: PathBuf,
+        results: Option<io::Result<[CommandResult; 2]>>,
+        fallback: VecDeque<io::Result<CommandResult>>,
+    }
+    impl LeafRunner for CohortReplies {
+        fn repository_outputs(
+            &mut self,
+            commands: [Command; 2],
+        ) -> Option<io::Result<[CommandResult; 2]>> {
+            let expected: [&[&str]; 2] = [
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--show-toplevel",
+                    "--git-common-dir",
+                ],
+                &["config", "--get-regexp", "^remote\\..*\\.url$"],
+            ];
+            for (command, args) in commands.into_iter().zip(expected) {
+                assert_eq!(command.get_program(), "git");
+                let actual: Vec<_> = command.get_args().collect();
+                assert_eq!(actual[0], "-C");
+                assert_eq!(actual[1], self.directory.as_os_str());
+                assert_eq!(
+                    actual[2..],
+                    args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+                );
+                assert!(command.get_envs().next().is_none());
+            }
+            Some(self.results.take().expect("one repository cohort"))
+        }
+        fn output(
+            &mut self,
+            command: Command,
+            stdout_cap: usize,
+            stderr_cap: usize,
+        ) -> io::Result<CommandResult> {
+            assert_eq!(command.get_program(), "git");
+            assert_eq!((stdout_cap, stderr_cap), (8192, 8192));
+            let arguments = command.get_args().collect::<Vec<_>>();
+            assert_eq!(arguments[0], "-C");
+            assert_eq!(arguments[1], self.directory.as_os_str());
+            let expected: &[&str] = if self.fallback.len() == 2 {
+                &["rev-parse", "--show-toplevel"]
+            } else {
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"]
+            };
+            assert_eq!(
+                arguments[2..],
+                expected
+                    .iter()
+                    .map(std::ffi::OsStr::new)
+                    .collect::<Vec<_>>()
+            );
+            self.fallback
+                .pop_front()
+                .expect("unexpected sequential repository lookup")
+        }
+    }
+    #[test]
+    fn repository_cohort_resolver_preserves_commands_remote_sorting_and_empty_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = format!("{}\n{}\n", root.display(), root.display()).into_bytes();
+        for remotes in [
+            reply(1, Vec::new()).unwrap(),
+            reply(0, b"z url2\na url1\n".to_vec()).unwrap(),
+        ] {
+            let expected = if remotes.status.code() == Some(1) {
+                hash("")
+            } else {
+                hash("a url1\nz url2")
+            };
+            let mut runner = CohortReplies {
+                directory: root.clone(),
+                fallback: VecDeque::new(),
+                results: Some(Ok([reply(0, path.clone()).unwrap(), remotes])),
+            };
+            let result = Repository::resolve_with(&root, &mut runner).unwrap();
+            assert_eq!(result.key, hash(root.to_string_lossy().as_bytes()));
+            assert_eq!(result.remote_hash, expected);
+            assert!(runner.results.is_none());
+        }
+    }
+    #[test]
+    fn repository_cohort_resolver_retains_ownership_and_text_refusals() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = format!("{}\n{}\n", root.display(), root.display()).into_bytes();
+        for refusal in ["owner", "root", "common", "remote"] {
+            let mut results = [
+                reply(0, path.clone()).unwrap(),
+                reply(1, Vec::new()).unwrap(),
+            ];
+            match refusal {
+                "root" => results[0] = reply(128, Vec::new()).unwrap(),
+                "common" => results[0] = reply(0, vec![255]).unwrap(),
+                "remote" => results[1].output.stderr = b"private error never published".to_vec(),
+                _ => (),
+            }
+            let mut runner = CohortReplies {
+                directory: root.clone(),
+                fallback: VecDeque::new(),
+                results: Some(if refusal == "owner" {
+                    Err(io::Error::other("private owner error"))
+                } else {
+                    Ok(results)
+                }),
+            };
+            let error = Repository::resolve_with(&root, &mut runner).unwrap_err();
+            assert!(!error.to_string().contains("private"));
+        }
+    }
+    #[test]
+    fn repository_cohort_newline_paths_use_original_queries_without_guessing_or_hiding_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("line\nbreak");
+        let common = temp.path().join("common");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&common).unwrap();
+        let root = root.canonicalize().unwrap();
+        let common = common.canonicalize().unwrap();
+        for fail in [false, true] {
+            let mut runner = CohortReplies {
+                directory: root.clone(),
+                results: Some(Ok([
+                    reply(
+                        0,
+                        format!("{}\n{}\n", root.display(), common.display()).into_bytes(),
+                    )
+                    .unwrap(),
+                    reply(0, b"z url2\na url1\n".to_vec()).unwrap(),
+                ])),
+                fallback: [
+                    if fail {
+                        Err(io::Error::other("PRIVATE_OWNER_ERROR"))
+                    } else {
+                        reply(0, root.to_str().unwrap().as_bytes().to_vec())
+                    },
+                    reply(0, common.to_str().unwrap().as_bytes().to_vec()),
+                ]
+                .into(),
+            };
+            let result = Repository::resolve_with(&root, &mut runner);
+            if fail {
+                assert!(!result.unwrap_err().to_string().contains("PRIVATE"));
+                assert_eq!(runner.fallback.len(), 1);
+            } else {
+                let repository = result.unwrap();
+                assert_eq!(repository.key, hash(common.to_string_lossy().as_bytes()));
+                assert_eq!(repository.remote_hash, hash("a url1\nz url2"));
+                assert!(runner.fallback.is_empty());
+            }
+        }
+    }
+    #[test]
+    fn repository_cohort_matches_scalar_trimming_and_hint_selection_for_sibling_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = temp.path().join("repo");
+        let actual = temp.path().join("repo ");
+        fs::create_dir_all(selected.join(".keito")).unwrap();
+        fs::create_dir_all(actual.join(".git")).unwrap();
+        fs::write(
+            selected.join(".keito/config.yml"),
+            b"agent_tracking:\n  enabled: false\n",
+        )
+        .unwrap();
+        let actual = actual.canonicalize().unwrap();
+        let common = actual.join(".git");
+        let mut scalar = Replies {
+            values: [
+                reply(0, format!("{}\n", actual.display()).into_bytes()),
+                reply(0, format!("{}\n", common.display()).into_bytes()),
+                reply(1, Vec::new()),
+            ]
+            .into(),
+            calls: 0,
+        };
+        let expected = Repository::resolve_with(&actual, &mut scalar).unwrap();
+        assert!(expected.disabled);
+        let mut cohort = CohortReplies {
+            directory: actual.clone(),
+            results: Some(Ok([
+                reply(
+                    0,
+                    format!("{}\n{}\n", actual.display(), common.display()).into_bytes(),
+                )
+                .unwrap(),
+                reply(1, Vec::new()).unwrap(),
+            ])),
+            fallback: VecDeque::new(),
+        };
+        let observed = Repository::resolve_with(&actual, &mut cohort).unwrap();
+        assert_eq!(observed.key, expected.key);
+        assert_eq!(observed.remote_hash, expected.remote_hash);
+        assert_eq!(observed.disabled, expected.disabled);
+        assert_eq!(observed.hint_hash, expected.hint_hash);
+        assert_eq!(observed.linked_without_hint, expected.linked_without_hint);
+    }
+    #[test]
+    fn repository_cohort_refused_remote_does_not_start_ambiguous_path_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut runner = CohortReplies {
+            directory: root.clone(),
+            results: Some(Ok([
+                reply(0, b"/ambiguous\npath\n/common\n".to_vec()).unwrap(),
+                reply(128, Vec::new()).unwrap(),
+            ])),
+            fallback: VecDeque::new(),
+        };
+        assert!(Repository::resolve_with(&root, &mut runner).is_err());
+        assert!(runner.fallback.is_empty());
+    }
+    #[test]
+    fn repository_cohort_missing_invalid_and_oversized_identity_does_not_fall_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for identity in [
+            Vec::new(),
+            b"one".to_vec(),
+            b"\n\n".to_vec(),
+            b" \n \n".to_vec(),
+            vec![255],
+            format!("{}\n{}", root.display(), "a".repeat(8192)).into_bytes(),
+            format!(
+                "{}\n{}{}\n",
+                root.display(),
+                root.display(),
+                " ".repeat(8192)
+            )
+            .into_bytes(),
+        ] {
+            let mut runner = CohortReplies {
+                directory: root.clone(),
+                results: Some(Ok([
+                    reply(0, identity).unwrap(),
+                    reply(1, Vec::new()).unwrap(),
+                ])),
+                fallback: VecDeque::new(),
+            };
+            assert!(Repository::resolve_with(&root, &mut runner).is_err());
+            assert!(runner.fallback.is_empty());
+        }
+    }
+    #[test]
+    fn repository_default_canonicalization_refusal_does_not_start_later_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runner = Replies {
+            values: [reply(
+                0,
+                temp.path()
+                    .join("absent")
+                    .to_str()
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            )]
+            .into(),
+            calls: 0,
+        };
+        assert!(Repository::resolve_with(temp.path(), &mut runner).is_err());
+        assert_eq!(runner.calls, 1);
+    }
+    #[test]
+    fn repository_cohort_default_runner_still_short_circuits_invalid_root() {
+        let mut runner = Replies {
+            values: [reply(128, Vec::new())].into(),
+            calls: 0,
+        };
+        assert!(Repository::resolve_with(Path::new("/unused"), &mut runner).is_err());
+        assert_eq!(runner.calls, 1);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod native_boot_clock_tests {
+    use super::*;
+
+    fn sample(seconds: i64, micros: i32) -> String {
+        native_boot_identity_from(|value, length| {
+            assert_eq!(value.tv_sec, 0);
+            assert_eq!(value.tv_usec, 0);
+            assert_eq!(*length, std::mem::size_of::<libc::timeval>());
+            value.tv_sec = seconds;
+            value.tv_usec = micros;
+            0
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn native_boot_clock_valid_sample_has_stable_domain_and_field_identity() {
+        let first = sample(1_700_000_000, 123);
+        assert_eq!(first, hash("macos-kern-boottime-v1:1700000000:123"));
+        assert_eq!(first, sample(1_700_000_000, 123));
+        assert_ne!(first, sample(1_700_000_001, 123));
+        assert_ne!(first, sample(1_700_000_000, 124));
+        assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn native_boot_clock_invalid_status_size_and_values_never_fall_back() {
+        for (status, length, seconds, micros) in [
+            (-1, std::mem::size_of::<libc::timeval>(), 1, 0),
+            (0, 0, 1, 0),
+            (0, std::mem::size_of::<libc::timeval>() - 1, 1, 0),
+            (0, std::mem::size_of::<libc::timeval>() + 1, 1, 0),
+            (0, std::mem::size_of::<libc::timeval>(), 0, 0),
+            (0, std::mem::size_of::<libc::timeval>(), -1, 0),
+            (0, std::mem::size_of::<libc::timeval>(), 1, -1),
+            (0, std::mem::size_of::<libc::timeval>(), 1, 1_000_000),
+        ] {
+            assert!(native_boot_identity_from(|value, size| {
+                value.tv_sec = seconds;
+                value.tv_usec = micros;
+                *size = length;
+                status
+            })
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn native_boot_clock_keeps_elapsed_boot_rollback_and_drift_refusals() {
+        let start = Clock {
+            wall: 100,
+            monotonic: 100,
+            boot: sample(1_700_000_000, 0),
+        };
+        let mut end = Clock {
+            wall: 130,
+            monotonic: 130,
+            boot: start.boot.clone(),
+        };
+        assert_eq!(start.elapsed(&end), Some(30));
+        end.boot = sample(1_700_000_001, 0);
+        assert_eq!(start.elapsed(&end), None);
+        end.boot = start.boot.clone();
+        end.wall = 99;
+        assert_eq!(start.elapsed(&end), None);
+        end.wall = 140;
+        assert_eq!(start.elapsed(&end), None);
+    }
+
+    #[test]
+    fn native_boot_clock_legacy_identity_closes_zero_incomplete_with_attention() {
+        let before = Clock {
+            wall: 100,
+            monotonic: 100,
+            boot: hash("legacy-formatted-sysctl-output"),
+        };
+        let after = Clock {
+            wall: 130,
+            monotonic: 130,
+            boot: sample(1_700_000_000, 0),
+        };
+        let binding = Binding {
+            repository_key: hash("repo"),
+            remote_hash: hash(""),
+            hint_hash: hash("hint"),
+            id: hash("binding"),
+            version: 1,
+            workspace_id: "co_synthetic".into(),
+            owner_id: "owner_synthetic".into(),
+            origin_hash: hash("origin"),
+            project_id: "project_synthetic".into(),
+            task_id: "task_synthetic".into(),
+            agents: vec!["codex".into()],
+            paused: false,
+            revoked: false,
+        };
+        let mut session = Session::begin(&binding, "codex", "session", "0.167.0", &before);
+        session.active = Some(ActiveTurn {
+            key: "turn".into(),
+            part: 0,
+            clock: Some(before),
+        });
+        session.close(&after, true).unwrap();
+        assert!(session.needs_attention);
+        assert!(session.active.is_none());
+        assert_eq!(session.segments.len(), 1);
+        assert_eq!(session.segments[0].duration_seconds, 0);
+        assert_eq!(session.segments[0].completeness, "INCOMPLETE");
+        assert_eq!(session.segments[0].started_at, session.segments[0].ended_at);
+    }
+}

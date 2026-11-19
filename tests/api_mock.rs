@@ -396,7 +396,10 @@ async fn create_time_entry_success() {
         .and(header("Keito-Account-Id", "co_test"))
         .and(header("X-Keito-Client", "cli"))
         .and(header("X-Keito-Client-Version", env!("CARGO_PKG_VERSION")))
-        .and(header_regex("User-Agent", r"^keito-cli/\d+\.\d+\.\d+$"))
+        .and(header(
+            "User-Agent",
+            concat!("keito-cli/", env!("CARGO_PKG_VERSION")),
+        ))
         .and(header_regex("Idempotency-Key", r"^keito-cli-\d+-\d+-\d+$"))
         .and(body_json(serde_json::json!({
             "project_id": "p1",

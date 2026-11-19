@@ -3,9 +3,14 @@
 /tapes/*
 !/tapes/
 !/tapes/*.tape
-/scripts
+/scripts/*
+!/scripts/qualify-capture-artifact.sh
 *.swp
 *.swo
 .DS_Store
 .env
 recordings/time-start-stop.gif
+
+# Developer-only Python QA must never become source or an installed payload.
+__pycache__/
+*.py[cod]

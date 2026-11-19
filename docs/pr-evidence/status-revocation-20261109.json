@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "scope": "repository-consent observation before numeric usage status",
+  "product_commit": "6c0735252c1a212cc4a43a6b8f8eb5a70e9c9342",
+  "base_commit": "76276a2782af884329348d737b27956b556caf0c",
+  "production_runtime": "Rust; no installed Python dependency introduced",
+  "parent_developer_acceptance": {
+    "baseline": {
+      "tests": 5,
+      "passed": 5
+    },
+    "red": {
+      "tests": 6,
+      "passed": 5,
+      "failed": 1,
+      "regressionCasesFailed": 6,
+      "setupFailure": false
+    },
+    "green": {
+      "tests": 6,
+      "passed": 6,
+      "regressionCasesPassed": 6
+    },
+    "factory_units": {
+      "tests": 8,
+      "passed": 8,
+      "filteredUnrelated": 145
+    },
+    "rustfmt": "PASS",
+    "diff_check": "PASS"
+  },
+  "evidence_sha256": {
+    "status-boundary-build-first.log": "96286a5ba7c4fb731a10bcef9e4b0e23827f6e6d9d9fbce1ec64a28c07f028d7",
+    "status-boundary-build-fetch.log": "577ff53395da2ed0b726ea3d91aee0a0c25dcf8a98f099ea3ac7d3a80fd350a5",
+    "status-baseline-first.log": "cc474c8adc2614b8c8f3c809faa047d48fe7169de8cd3ea7d197eab907697c86",
+    "status-red-first.log": "6d91ef19732590788285c16b25e0dfc6ddd7ff3aa119d1910065088334cd6d84",
+    "status-green-first.log": "4e0ac3a3c1446538dcf89a4de06e6266cda00ab8f1184eb660a8ee74018d28f6",
+    "status-factory-units-first.log": "f5f0fa02fbfc850c279e200eabfc532b9be4255666fb1566a3a4dc8858c2645b",
+    "status-factory-units-corrected-filter.log": "02cdbc51819dadc6ceed90fce0e7a60ebb6284eae299956b7b46d31889109cf6"
+  },
+  "setup_limits": [
+    "First offline boundary build missed cached tabled dependency; public locked fetch/build successor succeeded.",
+    "First factory unit filter selected zero tests; not accepted as evidence; corrected exact module filter ran8."
+  ],
+  "independent_review": {
+    "review_id": "status-r15-independent-source-only",
+    "verdict": "APPROVE",
+    "scope": "status-revocation source delta only",
+    "executed_by_reviewer": false,
+    "blocking_findings": [],
+    "report_sha256": "78508577daac6ae40dc07568bda31958b147bd14cdb2956d75c8d7214ed1c6d7",
+    "verdict_sha256": "1069c8f06057345f6cd61f7e9bd454ff0a5b38346518eb7ab0eb2fe254c8db28"
+  },
+  "isolation": {
+    "synthetic_private_fixtures": true,
+    "normal_profile_access": false,
+    "proxy_routing_changed": false,
+    "actual_service_utility_executed": false,
+    "real_harness_model_requests": 0,
+    "automatic_fixture_cleanup": true,
+    "owned_test_handles_waited": true
+  },
+  "unresolved": [
+    "OWNERSHIP-R13-01 whole-group settlement",
+    "OWNERSHIP-R13-02 sticky protocol failure",
+    "independent runtime and exact release artifact qualification",
+    "actual app and both worker image runtime gates",
+    "full numeric qualification of Claude Code2.1.319 AND Codex0.167.0",
+    "recovery and rehearsals",
+    "guarded delivery and intended-audience availability"
+  ],
+  "release_qualified": false,
+  "production_enabled": false,
+  "attribution": "Fresh parent developer test execution; independent reviewer performed source inspection only. Historical artifact results are not reused as current execution proof."
+}

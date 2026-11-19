@@ -1,0 +1,585 @@
+//! Bounded transient pipes. Only read(0) establishes output EOF.
+//! Buffers deliberately have no Debug/Serialize implementation.
+use std::{
+    io::{self, Read, Write},
+    os::fd::AsRawFd,
+    process::{ChildStderr, ChildStdin, ChildStdout},
+};
+
+pub const MAX_STREAM_BYTES: usize = 1024 * 1024;
+const TURN_BYTES: usize = 4096;
+
+pub struct IoPlan {
+    input: Vec<u8>,
+    stdout_cap: usize,
+    stderr_cap: usize,
+}
+impl IoPlan {
+    pub fn new(input: Vec<u8>, stdout_cap: usize, stderr_cap: usize) -> io::Result<Self> {
+        if input.capacity() > MAX_STREAM_BYTES
+            || stdout_cap > MAX_STREAM_BYTES
+            || stderr_cap > MAX_STREAM_BYTES
+        {
+            return Err(io::Error::other("IO_LIMIT"));
+        }
+        Ok(Self {
+            input,
+            stdout_cap,
+            stderr_cap,
+        })
+    }
+    pub(super) fn capacity(&self) -> usize {
+        // Retained slots keep this allocation even after input is consumed.
+        // Initialized bytes alone are not the owned-buffer reservation.
+        self.input.capacity() + self.stdout_cap + self.stderr_cap
+    }
+    pub(super) fn prepare(self) -> io::Result<PipeIo> {
+        Ok(PipeIo {
+            input: Input {
+                bytes: self.input,
+                offset: 0,
+                closed: false,
+            },
+            stdout: Output::new(self.stdout_cap)?,
+            stderr: Output::new(self.stderr_cap)?,
+            stdin_pipe: None,
+            stdout_pipe: None,
+            stderr_pipe: None,
+            stdin_ready: false,
+            stdout_ready: false,
+            stderr_ready: false,
+            fault: None,
+        })
+    }
+}
+
+struct Input {
+    bytes: Vec<u8>,
+    offset: usize,
+    closed: bool,
+}
+impl Input {
+    fn poll(&mut self, writer: &mut impl Write) -> Option<&'static str> {
+        if self.closed {
+            return None;
+        }
+        if self.offset == self.bytes.len() {
+            self.closed = true;
+            return None;
+        }
+        let end = (self.offset + TURN_BYTES).min(self.bytes.len());
+        match writer.write(&self.bytes[self.offset..end]) {
+            Ok(0) => {
+                self.closed = true;
+                Some("IO_STDIN_ZERO")
+            }
+            Ok(count) if count <= end - self.offset => {
+                self.offset += count;
+                if self.offset == self.bytes.len() {
+                    self.closed = true;
+                }
+                None
+            }
+            Ok(_) => {
+                self.closed = true;
+                Some("IO_STDIN_WRITE")
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                None
+            }
+            Err(_) => {
+                self.closed = true;
+                Some("IO_STDIN_WRITE")
+            }
+        }
+    }
+}
+struct Output {
+    bytes: Vec<u8>,
+    cap: usize,
+    count: usize,
+    eof: bool,
+    fault: Option<&'static str>,
+}
+impl Output {
+    fn new(cap: usize) -> io::Result<Self> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(cap)
+            .map_err(|_| io::Error::other("IO_ALLOCATION"))?;
+        // A reserve_exact implementation may overallocate. Refuse before any
+        // child exists unless the retained capacity fits the charged budget.
+        if bytes.capacity() > cap {
+            return Err(io::Error::other("IO_ALLOCATION"));
+        }
+        Ok(Self {
+            bytes,
+            cap,
+            count: 0,
+            eof: false,
+            fault: None,
+        })
+    }
+    fn poll(&mut self, reader: &mut impl Read) -> Option<&'static str> {
+        if self.eof {
+            return self.fault;
+        }
+        let mut scratch = [0u8; TURN_BYTES];
+        match reader.read(&mut scratch) {
+            Ok(0) => self.eof = true,
+            Ok(count) if count <= scratch.len() => {
+                self.count = self.count.saturating_add(count);
+                let room = self.cap - self.bytes.len();
+                self.bytes.extend_from_slice(&scratch[..count.min(room)]);
+                if count > room {
+                    self.fault.get_or_insert("IO_OUTPUT_LIMIT");
+                }
+            }
+            Ok(_) => {
+                self.fault.get_or_insert("IO_OUTPUT_READ");
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => {
+                self.fault.get_or_insert("IO_OUTPUT_READ");
+            }
+        }
+        self.fault
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoFacts {
+    pub stdin_closed: bool,
+    pub stdout_eof: bool,
+    pub stderr_eof: bool,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+    pub first_fault: Option<&'static str>,
+}
+impl IoFacts {
+    pub fn complete(&self) -> bool {
+        self.stdin_closed && self.stdout_eof && self.stderr_eof
+    }
+}
+
+pub struct CommandOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+pub(super) struct PipeIo {
+    input: Input,
+    stdout: Output,
+    stderr: Output,
+    stdin_pipe: Option<ChildStdin>,
+    stdout_pipe: Option<ChildStdout>,
+    stderr_pipe: Option<ChildStderr>,
+    stdin_ready: bool,
+    stdout_ready: bool,
+    stderr_ready: bool,
+    fault: Option<&'static str>,
+}
+fn flags(pipe: &impl AsRawFd) -> io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    let old = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if old < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, old | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::other("IO_FLAGS"));
+    }
+    let old = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if old < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, old | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::other("IO_FLAGS"));
+    }
+    Ok(())
+}
+impl PipeIo {
+    // Move ALL handles in before any fallible flags operation. Failure leaves
+    // them retained; callers must continue collection under their original end.
+    pub(super) fn attach(
+        &mut self,
+        input: Option<ChildStdin>,
+        output: Option<ChildStdout>,
+        error: Option<ChildStderr>,
+    ) -> io::Result<()> {
+        self.stdin_pipe = input;
+        self.stdout_pipe = output;
+        self.stderr_pipe = error;
+        self.stdin_ready = self.stdin_pipe.as_ref().is_some_and(|p| flags(p).is_ok());
+        self.stdout_ready = self.stdout_pipe.as_ref().is_some_and(|p| flags(p).is_ok());
+        self.stderr_ready = self.stderr_pipe.as_ref().is_some_and(|p| flags(p).is_ok());
+        if !(self.stdin_ready && self.stdout_ready && self.stderr_ready) {
+            self.fault.get_or_insert("IO_FLAGS");
+            self.cancel_input();
+            // Failed descriptors remain retained but are not read with unknown
+            // flags. Other independently configured streams continue draining.
+            return Err(io::Error::other("IO_FLAGS"));
+        }
+        Ok(())
+    }
+    pub(super) fn cancel_input(&mut self) {
+        self.stdin_pipe.take();
+        self.input.closed = true;
+    }
+    pub(super) fn poll(&mut self) {
+        if let Some(pipe) = self.stdin_pipe.as_mut().filter(|_| self.stdin_ready) {
+            if let Some(reason) = self.input.poll(pipe) {
+                self.fault.get_or_insert(reason);
+            }
+            if self.input.closed {
+                self.stdin_pipe.take();
+            }
+        }
+        if let Some(pipe) = self.stdout_pipe.as_mut().filter(|_| self.stdout_ready) {
+            if let Some(reason) = self.stdout.poll(pipe) {
+                self.fault.get_or_insert(reason);
+            }
+        }
+        if let Some(pipe) = self.stderr_pipe.as_mut().filter(|_| self.stderr_ready) {
+            if let Some(reason) = self.stderr.poll(pipe) {
+                self.fault.get_or_insert(reason);
+            }
+        }
+    }
+    // Scheduling hints from the SAME retained, independently configured pipes.
+    // Only their original read/write operations can change closure/EOF facts.
+    pub(super) fn progress_wait_sources(&self, descriptors: &mut Vec<libc::pollfd>) {
+        if self.stdin_ready && !self.input.closed && self.input.offset < self.input.bytes.len() {
+            if let Some(pipe) = &self.stdin_pipe {
+                descriptors.push(libc::pollfd {
+                    fd: pipe.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                });
+            }
+        }
+        for (pipe, ready, eof) in [
+            (
+                self.stdout_pipe.as_ref().map(AsRawFd::as_raw_fd),
+                self.stdout_ready,
+                self.stdout.eof,
+            ),
+            (
+                self.stderr_pipe.as_ref().map(AsRawFd::as_raw_fd),
+                self.stderr_ready,
+                self.stderr.eof,
+            ),
+        ] {
+            if ready && !eof {
+                if let Some(fd) = pipe {
+                    descriptors.push(libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    });
+                }
+            }
+        }
+    }
+    pub(super) fn facts(&self) -> IoFacts {
+        IoFacts {
+            stdin_closed: self.input.closed,
+            stdout_eof: self.stdout.eof,
+            stderr_eof: self.stderr.eof,
+            stdout_bytes: self.stdout.count,
+            stderr_bytes: self.stderr.count,
+            first_fault: self.fault,
+        }
+    }
+    pub(super) fn take_output(&mut self) -> CommandOutput {
+        CommandOutput {
+            stdout: std::mem::take(&mut self.stdout.bytes),
+            stderr: std::mem::take(&mut self.stderr.bytes),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    enum ReadStep {
+        Data(Vec<u8>),
+        Block,
+        Interrupt,
+        Fail,
+        Eof,
+    }
+    struct Reader {
+        steps: VecDeque<ReadStep>,
+        calls: usize,
+    }
+    impl Read for Reader {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            match self.steps.pop_front().unwrap_or(ReadStep::Block) {
+                ReadStep::Data(bytes) => {
+                    assert!(bytes.len() <= out.len());
+                    out[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                ReadStep::Block => Err(io::ErrorKind::WouldBlock.into()),
+                ReadStep::Interrupt => Err(io::ErrorKind::Interrupted.into()),
+                ReadStep::Fail => Err(io::ErrorKind::BrokenPipe.into()),
+                ReadStep::Eof => Ok(0),
+            }
+        }
+    }
+    fn reader(steps: Vec<ReadStep>) -> Reader {
+        Reader {
+            steps: steps.into(),
+            calls: 0,
+        }
+    }
+    #[test]
+    fn output_requires_read_zero_not_wouldblock_interruption_or_error() {
+        let mut output = Output::new(8).unwrap();
+        let mut input = reader(vec![
+            ReadStep::Block,
+            ReadStep::Interrupt,
+            ReadStep::Fail,
+            ReadStep::Eof,
+        ]);
+        for _ in 0..3 {
+            output.poll(&mut input);
+            assert!(!output.eof);
+        }
+        output.poll(&mut input);
+        assert!(output.eof);
+        assert_eq!(output.fault, Some("IO_OUTPUT_READ"));
+        assert_eq!(input.calls, 4);
+    }
+    #[test]
+    fn exact_cap_is_valid_cap_plus_one_remains_failed_after_drain_and_eof() {
+        let mut output = Output::new(3).unwrap();
+        let mut input = reader(vec![
+            ReadStep::Data(b"abc".to_vec()),
+            ReadStep::Block,
+            ReadStep::Data(b"d".to_vec()),
+            ReadStep::Data(vec![0; TURN_BYTES]),
+            ReadStep::Eof,
+        ]);
+        output.poll(&mut input);
+        assert_eq!(output.fault, None);
+        assert!(!output.eof);
+        output.poll(&mut input);
+        assert!(!output.eof);
+        output.poll(&mut input);
+        assert_eq!(output.fault, Some("IO_OUTPUT_LIMIT"));
+        output.poll(&mut input);
+        output.poll(&mut input);
+        assert!(output.eof);
+        assert_eq!(output.bytes, b"abc");
+        assert_eq!(output.count, TURN_BYTES + 4);
+        assert_eq!(output.fault, Some("IO_OUTPUT_LIMIT"));
+    }
+    struct Writer {
+        bytes: Vec<u8>,
+        block: bool,
+        fail: bool,
+        calls: usize,
+    }
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.fail {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            if self.block {
+                self.block = false;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let count = bytes.len().min(2);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            panic!("no blocking flush")
+        }
+    }
+    #[test]
+    fn stdin_partial_backpressure_and_epipe_preserve_offset_and_close() {
+        let mut state = Input {
+            bytes: b"abcde".to_vec(),
+            offset: 0,
+            closed: false,
+        };
+        let mut writer = Writer {
+            bytes: vec![],
+            block: true,
+            fail: false,
+            calls: 0,
+        };
+        assert_eq!(state.poll(&mut writer), None);
+        assert_eq!(state.offset, 0);
+        assert_eq!(state.poll(&mut writer), None);
+        assert_eq!(state.offset, 2);
+        writer.fail = true;
+        assert_eq!(state.poll(&mut writer), Some("IO_STDIN_WRITE"));
+        assert!(state.closed);
+        state.poll(&mut writer);
+        assert_eq!(writer.calls, 3);
+        assert_eq!(writer.bytes, b"ab");
+    }
+    #[test]
+    fn input_completion_and_cancellation_are_separate_from_output_eof() {
+        let mut io = IoPlan::new(vec![], 0, 0).unwrap().prepare().unwrap();
+        io.cancel_input();
+        assert!(io.facts().stdin_closed);
+        assert!(!io.facts().complete());
+        assert!(!io.facts().stdout_eof);
+        assert!(!io.facts().stderr_eof);
+        assert!(IoPlan::new(vec![], MAX_STREAM_BYTES + 1, 0).is_err());
+    }
+    #[test]
+    fn each_output_turn_is_one_bounded_read_and_zero_cap_still_needs_eof() {
+        let mut output = Output::new(0).unwrap();
+        let mut input = reader(vec![ReadStep::Data(vec![0; TURN_BYTES]), ReadStep::Eof]);
+        output.poll(&mut input);
+        assert_eq!(input.calls, 1);
+        assert!(!output.eof);
+        assert_eq!(output.bytes.len(), 0);
+        assert_eq!(output.fault, Some("IO_OUTPUT_LIMIT"));
+        output.poll(&mut input);
+        assert!(output.eof);
+    }
+    #[test]
+    fn r38_unused_input_allocation_cannot_bypass_the_limit() {
+        let mut input = Vec::with_capacity(MAX_STREAM_BYTES + 1);
+        input.push(b'x');
+        assert_eq!(input.len(), 1);
+        assert!(input.capacity() > MAX_STREAM_BYTES);
+        assert!(IoPlan::new(input, 0, 0).is_err());
+        let empty = Vec::with_capacity(MAX_STREAM_BYTES + 1);
+        assert!(empty.is_empty());
+        assert!(IoPlan::new(empty, 0, 0).is_err());
+    }
+    #[test]
+    fn retained_input_capacity_is_charged_without_changing_bytes() {
+        let mut input = Vec::with_capacity(4096);
+        input.push(b'x');
+        let capacity = input.capacity();
+        let plan = IoPlan::new(input, 7, 11).unwrap();
+        assert_eq!(plan.capacity(), capacity + 18);
+        let pipes = plan.prepare().unwrap();
+        assert_eq!(pipes.input.bytes, b"x");
+        assert_eq!(pipes.input.bytes.capacity(), capacity);
+    }
+    // Inert retained descriptors only: these tests create no process.
+    fn socket_pipe_io(
+        input: Vec<u8>,
+    ) -> (
+        PipeIo,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+        [i32; 3],
+    ) {
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+        let (stdin, input_peer) = UnixStream::pair().unwrap();
+        let (stdout, output_peer) = UnixStream::pair().unwrap();
+        let (stderr, error_peer) = UnixStream::pair().unwrap();
+        for peer in [&input_peer, &output_peer, &error_peer] {
+            peer.set_nonblocking(true).unwrap();
+        }
+        let fds = [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()];
+        let mut pipes = IoPlan::new(input, 32, 32).unwrap().prepare().unwrap();
+        let stdin: OwnedFd = stdin.into();
+        let stdout: OwnedFd = stdout.into();
+        let stderr: OwnedFd = stderr.into();
+        pipes
+            .attach(
+                Some(ChildStdin::from(stdin)),
+                Some(ChildStdout::from(stdout)),
+                Some(ChildStderr::from(stderr)),
+            )
+            .unwrap();
+        (pipes, input_peer, output_peer, error_peer, fds)
+    }
+    #[test]
+    fn retained_pipe_readiness_matches_pending_fd_directions_without_advancing_io() {
+        let (mut pipes, mut input_peer, mut output_peer, mut error_peer, fds) =
+            socket_pipe_io(b"in".to_vec());
+        let mut descriptors = Vec::new();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|fd| (fd.fd, fd.events))
+                .collect::<Vec<_>>(),
+            [
+                (fds[0], libc::POLLOUT),
+                (fds[1], libc::POLLIN),
+                (fds[2], libc::POLLIN)
+            ]
+        );
+        let mut bytes = [0u8; 8];
+        assert_eq!(
+            input_peer.read(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        output_peer.write_all(b"out").unwrap();
+        error_peer.write_all(b"err").unwrap();
+        descriptors.clear();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert_eq!(pipes.facts().stdout_bytes, 0);
+        assert_eq!(pipes.facts().stderr_bytes, 0);
+        assert!(!pipes.facts().stdout_eof && !pipes.facts().stderr_eof);
+        assert!(!pipes.facts().stdin_closed);
+        pipes.poll();
+        assert_eq!(input_peer.read(&mut bytes).unwrap(), 2);
+        assert_eq!(&bytes[..2], b"in");
+        assert_eq!(pipes.facts().stdout_bytes, 3);
+        assert_eq!(pipes.facts().stderr_bytes, 3);
+        assert!(pipes.facts().stdin_closed);
+        descriptors.clear();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert!(descriptors.iter().all(|fd| fd.fd != fds[0]));
+        assert_eq!(descriptors.len(), 2);
+        output_peer.shutdown(std::net::Shutdown::Write).unwrap();
+        error_peer.shutdown(std::net::Shutdown::Write).unwrap();
+        descriptors.clear();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert_eq!(
+            descriptors.len(),
+            2,
+            "HUP was mistaken for physical read(0)"
+        );
+        assert!(!pipes.facts().stdout_eof && !pipes.facts().stderr_eof);
+        pipes.poll();
+        assert!(pipes.facts().stdout_eof && pipes.facts().stderr_eof);
+        descriptors.clear();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert!(
+            descriptors.is_empty(),
+            "known EOF would cause repeated HUP wakeups"
+        );
+        assert!(pipes.facts().complete());
+    }
+    #[test]
+    fn retained_pipe_readiness_omits_empty_input_before_original_close_then_keeps_it_closed() {
+        let (mut pipes, mut input_peer, _output_peer, _error_peer, fds) =
+            socket_pipe_io(Vec::new());
+        let mut descriptors = Vec::new();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert!(
+            !pipes.facts().stdin_closed,
+            "hint performed original stdin close"
+        );
+        assert!(descriptors.iter().all(|fd| fd.fd != fds[0]));
+        assert_eq!(descriptors.len(), 2);
+        pipes.poll();
+        assert!(pipes.facts().stdin_closed);
+        assert_eq!(input_peer.read(&mut [0u8; 1]).unwrap(), 0);
+        descriptors.clear();
+        pipes.progress_wait_sources(&mut descriptors);
+        assert!(descriptors.iter().all(|fd| fd.fd != fds[0]));
+        assert_eq!(descriptors.len(), 2);
+    }
+}

@@ -1,5 +1,8 @@
-## Keito Time Tracking
+## Keito coding-agent capture
 
-This repository is configured for Keito agent time tracking. Use
-`/track-time-keito status` to check whether tracking is enabled, and
-`/track-time-keito pause` before doing one-off unbillable work in this repo.
+Capture is optional until this device's user explicitly approves the repository
+mapping through `keito capture setup`. Use `keito capture status --json` for
+consent, queue and delivery state, and `keito capture pause --repo` before work
+that should not be collected. A checked-in config is only a mapping hint.
+Never send prompts, responses, transcripts, code or full paths to Keito, and
+never use model judgement to log duration or create a client charge.

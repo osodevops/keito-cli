@@ -91,8 +91,8 @@ async fn maybe_offer_skill_install(global: &GlobalFlags, mode: OutputMode) -> Re
     }
 
     let install = Confirm::new()
-        .with_prompt("Install the Keito agent skill for Claude Code / Codex?")
-        .default(true)
+        .with_prompt("Choose and install coding-agent adapters now?")
+        .default(false)
         .interact()
         .map_err(|e| AppError::Config(format!("Input error: {e}")))?;
 

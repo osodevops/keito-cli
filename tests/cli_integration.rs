@@ -1,11 +1,12 @@
 #![allow(deprecated)]
 use assert_cmd::Command;
+#[cfg(unix)]
+#[path = "support/mutation_environment.rs"]
+mod mutation_isolation;
 use chrono::Local;
 use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
-#[cfg(unix)]
-use std::process::Command as StdCommand;
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -31,6 +32,7 @@ fn write_test_config(home: &Path, api_url: &str) {
 fn command_with_mock_config(home: &Path, api_url: &str) -> Command {
     let mut cmd = Command::cargo_bin("keito").unwrap();
     cmd.env("HOME", home)
+        .env("KEITO_CAPTURE_HOME", home.join("capture"))
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("APPDATA", home.join("AppData").join("Roaming"))
         .env("KEITO_API_URL", api_url)
@@ -41,81 +43,18 @@ fn command_with_mock_config(home: &Path, api_url: &str) -> Command {
 }
 
 #[cfg(unix)]
-fn prepend_path(cmd: &mut Command, dir: &Path) {
-    let mut paths = vec![dir.to_path_buf()];
-    if let Some(current_path) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&current_path));
-    }
-    cmd.env("PATH", std::env::join_paths(paths).unwrap());
-}
-
-#[cfg(unix)]
 fn write_fake_skill_tools(home: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let bin = home.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-
+    fs::create_dir(&bin).unwrap();
     let npx = bin.join("npx");
     fs::write(
         &npx,
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >> "$KEITO_FAKE_NPX_LOG"
-echo "fake npx install output"
-agent=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "-a" ]; then
-    shift
-    agent="${1:-}"
-  fi
-  shift || true
-done
-
-case "$agent" in
-  codex)
-    root="$HOME/.agents/skills/keito-time-track"
-    mkdir -p "$root/installers"
-    cat > "$root/installers/install-codex.sh" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-echo "fake codex installer output"
-mkdir -p "$HOME/.codex"
-printf '{"hooks":{"SessionStart":[{"hooks":[{"command":"keito-time-track/hooks/session-start.sh"}]}],"Stop":[{"hooks":[{"command":"keito-time-track/hooks/session-end.sh"}]}]}}\n' > "$HOME/.codex/hooks.json"
-SH
-    chmod +x "$root/installers/install-codex.sh"
-    ;;
-  claude-code)
-    root="$HOME/.claude/skills/keito-time-track"
-    mkdir -p "$root/installers"
-    cat > "$root/installers/install-claude-code.sh" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-echo "fake claude installer output"
-mkdir -p "$HOME/.claude"
-printf '{"hooks":{"SessionStart":[{"hooks":[{"command":"keito-time-track/hooks/session-start.sh"}]}],"Stop":[{"hooks":[{"command":"keito-time-track/hooks/session-end.sh"}]}]}}\n' > "$HOME/.claude/settings.json"
-SH
-    chmod +x "$root/installers/install-claude-code.sh"
-    ;;
-  *)
-    echo "unexpected agent: $agent" >&2
-    exit 2
-    ;;
-esac
-"#,
+        "#!/bin/sh\nprintf forbidden > \"$KEITO_FAKE_NPX_LOG\"\nexit 89\n",
     )
     .unwrap();
-    set_executable(&npx);
-
-    let jq = bin.join("jq");
-    fs::write(&jq, "#!/usr/bin/env bash\nexit 0\n").unwrap();
-    set_executable(&jq);
-
+    fs::set_permissions(&npx, fs::Permissions::from_mode(0o700)).unwrap();
     bin
-}
-
-#[cfg(unix)]
-fn set_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[test]
@@ -248,73 +187,76 @@ fn skill_help_works() {
 
 #[test]
 #[cfg(unix)]
-fn skill_install_configures_agent_hooks_with_fake_skills_cli() {
+fn unqualified_source_build_refuses_before_external_installer_or_profile_mutation() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let bin = write_fake_skill_tools(temp_dir.path());
-    let npx_log = temp_dir.path().join("npx.log");
-
-    let mut cmd = Command::cargo_bin("keito").unwrap();
-    prepend_path(&mut cmd, &bin);
-    let output = cmd
-        .env("HOME", temp_dir.path())
-        .env("XDG_CONFIG_HOME", temp_dir.path().join("config"))
-        .env("APPDATA", temp_dir.path().join("AppData").join("Roaming"))
-        .env("KEITO_FAKE_NPX_LOG", &npx_log)
-        .env("KEITO_API_KEY", "kto_test_key")
-        .env("KEITO_ACCOUNT_ID", "co_test")
+    let case = temp_dir.path().canonicalize().unwrap();
+    let home = case.join("home");
+    fs::create_dir(&home).unwrap();
+    let capture = home.join("capture");
+    fs::create_dir(&capture).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&capture, fs::Permissions::from_mode(0o700)).unwrap();
+    let core = case.join("keito");
+    fs::copy(assert_cmd::cargo::cargo_bin!("keito"), &core).unwrap();
+    let environment =
+        mutation_isolation::checked(&case, &case, Some(&home), Some(&capture), Some(&core))
+            .unwrap();
+    let bin = write_fake_skill_tools(&home);
+    let log = home.join("npx.log");
+    let mut cmd = Command::new(&environment.core);
+    cmd.env_clear().env("PATH", &bin);
+    cmd.env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("AppData"))
+        .env("HOME", &environment.home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("KEITO_CAPTURE_HOME", &environment.capture)
+        .env("KEITO_FAKE_NPX_LOG", &log)
         .args([
-            "--json",
             "skill",
             "install",
             "--source",
-            "/tmp/keito-skill",
+            "/tmp/inert-unread-source",
             "--agent",
             "codex",
-            "--agent",
-            "claude-code",
         ])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    let status_json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(status_json["authenticated"], true);
-    assert_eq!(status_json["codex"]["hooks_configured"], true);
-    assert_eq!(status_json["claude_code"]["hooks_configured"], true);
-
-    let output_text = String::from_utf8(output).unwrap();
-    assert!(!output_text.contains("fake npx install output"));
-    assert!(!output_text.contains("fake codex installer output"));
-    assert!(!output_text.contains("fake claude installer output"));
-
-    let log = fs::read_to_string(npx_log).unwrap();
-    assert!(log.contains("skills@1.5.6 add /tmp/keito-skill"));
-    assert!(log.contains("-a codex"));
-    assert!(log.contains("-a claude-code"));
-    assert!(temp_dir.path().join(".codex/hooks.json").exists());
-    assert!(temp_dir.path().join(".claude/settings.json").exists());
+        .failure()
+        .stderr(predicate::str::contains(
+            "official keito / keito-capture-guard release pair",
+        ));
+    assert!(!log.exists());
+    assert!(!home.join(".codex").exists());
+    assert!(!home.join(".claude").exists());
 }
 
 #[test]
 #[cfg(unix)]
-fn skill_install_uses_bundled_skill_by_default() {
-    if StdCommand::new("jq").arg("--version").output().is_err() {
-        return;
-    }
-
+fn unqualified_source_build_refuses_bundled_install_without_touching_profiles() {
     let temp_dir = tempfile::tempdir().unwrap();
-
-    let output = Command::cargo_bin("keito")
-        .unwrap()
-        .env("HOME", temp_dir.path())
-        .env("XDG_CONFIG_HOME", temp_dir.path().join("config"))
-        .env("APPDATA", temp_dir.path().join("AppData").join("Roaming"))
-        .env("KEITO_API_KEY", "kto_test_key")
-        .env("KEITO_ACCOUNT_ID", "co_test")
+    let case = temp_dir.path().canonicalize().unwrap();
+    let home = case.join("home");
+    fs::create_dir(&home).unwrap();
+    let capture = home.join("capture");
+    fs::create_dir(&capture).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&capture, fs::Permissions::from_mode(0o700)).unwrap();
+    let core = case.join("keito");
+    fs::copy(assert_cmd::cargo::cargo_bin!("keito"), &core).unwrap();
+    let environment =
+        mutation_isolation::checked(&case, &case, Some(&home), Some(&capture), Some(&core))
+            .unwrap();
+    let bin = write_fake_skill_tools(&home);
+    Command::new(&environment.core)
+        .env_clear()
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("AppData"))
+        .env("PATH", &bin)
+        .env("HOME", &environment.home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("KEITO_CAPTURE_HOME", &environment.capture)
         .args([
-            "--json",
             "skill",
             "install",
             "--agent",
@@ -323,26 +265,12 @@ fn skill_install_uses_bundled_skill_by_default() {
             "claude-code",
         ])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    let status_json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(status_json["authenticated"], true);
-    assert_eq!(status_json["codex"]["skill_installed"], true);
-    assert_eq!(status_json["codex"]["hooks_configured"], true);
-    assert_eq!(status_json["claude_code"]["skill_installed"], true);
-    assert_eq!(status_json["claude_code"]["hooks_configured"], true);
-
-    assert!(temp_dir
-        .path()
-        .join(".codex/skills/keito-time-track/SKILL.md")
-        .exists());
-    assert!(temp_dir
-        .path()
-        .join(".claude/skills/keito-time-track/SKILL.md")
-        .exists());
+        .failure()
+        .stderr(predicate::str::contains(
+            "official keito / keito-capture-guard release pair",
+        ));
+    assert!(!home.join(".codex").exists());
+    assert!(!home.join(".claude").exists());
 }
 
 #[tokio::test]
@@ -397,6 +325,7 @@ fn whoami_without_auth_fails() {
         .unwrap()
         .args(["auth", "whoami"])
         .env("HOME", temp_dir.path())
+        .env("KEITO_CAPTURE_HOME", temp_dir.path().join("capture"))
         .env("XDG_CONFIG_HOME", temp_dir.path().join("config"))
         .env_remove("KEITO_API_KEY")
         .env_remove("KEITO_ACCOUNT_ID")

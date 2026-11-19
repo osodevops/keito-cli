@@ -1,0 +1,107 @@
+[
+  {
+    "expected": "╭────┬───────┬──────┬───────────┬──────────┬────────╮\n│ ID │ Name  │ Code │ Client    │ Billable │ Active │\n├────┼───────┼──────┼───────────┼──────────┼────────┤\n│ p1 │ Build │ K1   │ Synthetic │ Yes      │ No     │\n╰────┴───────┴──────┴───────────┴──────────┴────────╯",
+    "items": [
+      {
+        "client": {
+          "id": "c1",
+          "name": "Synthetic"
+        },
+        "code": "K1",
+        "id": "p1",
+        "is_active": false,
+        "is_billable": true,
+        "name": "Build"
+      }
+    ],
+    "name": "projects"
+  },
+  {
+    "expected": "╭────┬───────────┬──────────┬────────╮\n│ ID │ Name      │ Currency │ Active │\n├────┼───────────┼──────────┼────────┤\n│ c1 │ Synthetic │ GBP      │ Yes    │\n╰────┴───────────┴──────────┴────────╯",
+    "items": [
+      {
+        "currency": "GBP",
+        "id": "c1",
+        "is_active": true,
+        "name": "Synthetic"
+      }
+    ],
+    "name": "clients"
+  },
+  {
+    "expected": "╭────┬────────┬──────────╮\n│ ID │ Name   │ Billable │\n├────┼────────┼──────────┤\n│ t1 │ Design │ Yes      │\n╰────┴────────┴──────────╯",
+    "items": [
+      {
+        "billable_by_default": true,
+        "currency": "GBP",
+        "id": "t1",
+        "is_active": true,
+        "name": "Design"
+      }
+    ],
+    "name": "tasks"
+  },
+  {
+    "expected": "╭────┬────────────┬─────────┬────────┬────────────┬────────────────────────────────────────────────────┬─────────╮\n│ ID │ Date       │ Project │ Task   │ Duration   │ Notes                                              │ Running │\n├────┼────────────┼─────────┼────────┼────────────┼────────────────────────────────────────────────────┼─────────┤\n│ e1 │ 2026-11-08 │ Build   │ Design │ 2m         │ Synthetic                                          │         │\n│    │            │         │        │            │ second line                                        │         │\n│ e2 │            │         │        │ running... │ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx │ Yes     │\n╰────┴────────────┴─────────┴────────┴────────────┴────────────────────────────────────────────────────┴─────────╯",
+    "items": [
+      {
+        "duration_seconds": 90,
+        "id": "e1",
+        "is_running": false,
+        "notes": "Synthetic\nsecond line",
+        "project": {
+          "id": "p1",
+          "name": "Build"
+        },
+        "spent_date": "2026-11-08",
+        "task": {
+          "id": "t1",
+          "name": "Design"
+        }
+      },
+      {
+        "id": "e2",
+        "is_running": true,
+        "notes": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+    ],
+    "name": "entries"
+  },
+  {
+    "expected": "╭────────────────┬───────────────────────────╮\n│ key            │ value                     │\n├────────────────┼───────────────────────────┤\n│ User ID        │ u1                        │\n│ Name           │ Synthetic Person          │\n│ Email          │ synthetic@example.invalid │\n│ Credential     │ full access               │\n│ Company        │ Synthetic                 │\n│ Company ID     │ w1                        │\n│ Can track time │ Yes                       │\n╰────────────────┴───────────────────────────╯",
+    "items": [
+      {
+        "capabilities": {
+          "can_track_time": true
+        },
+        "company": {
+          "id": "w1",
+          "name": "Synthetic"
+        },
+        "email": "synthetic@example.invalid",
+        "first_name": "Synthetic",
+        "id": "u1",
+        "last_name": "Person",
+        "roles": [
+          "admin"
+        ]
+      }
+    ],
+    "name": "identity"
+  },
+  {
+    "expected": "╭───────┬───────╮\n│ key   │ value │\n├───────┼───────┤\n│ alpha │ Hello │\n│ count │ 2     │\n╰───────┴───────╯",
+    "items": [
+      {
+        "alpha": "Hello",
+        "count": 2
+      }
+    ],
+    "name": "fallback"
+  },
+  {
+    "expected": "No results.",
+    "items": [],
+    "name": "empty"
+  }
+]

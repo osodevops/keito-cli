@@ -41,7 +41,7 @@ Exit code `0` = ready. Exit code `1` = fix credentials.
 Install the packaged Keito skill into Claude Code and Codex:
 
 ```sh
-keito skill install
+keito skill install --agent claude-code --agent codex
 ```
 
 Install one host only when needed:
@@ -56,7 +56,7 @@ For source-checkout installs, use the gstack-style setup entrypoint:
 ```sh
 git clone --single-branch --depth 1 https://github.com/osodevops/keito-cli.git ~/.keito/keito-cli
 cd ~/.keito/keito-cli
-./setup
+./setup --host both
 ```
 
 From each client repository, invoke the skill once:
@@ -76,6 +76,9 @@ Check readiness:
 keito skill doctor
 keito skill status --json
 ```
+
+For private automatic capture, follow [capture setup and qualification](capture.md).
+The repository hint is not consent, and elapsed activity is not permission to bill.
 
 ## Discovery
 

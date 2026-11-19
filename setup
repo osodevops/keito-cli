@@ -57,6 +57,11 @@ case "$TEAM_MODE" in
   *) echo "Unknown --team value: $TEAM_MODE" >&2; exit 1 ;;
 esac
 
+if [ "$HOST" = "auto" ] && [ ! -t 0 ]; then
+  echo "Scripted setup requires --host claude, --host codex, or --host both; nothing installed." >&2
+  exit 2
+fi
+
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 if ! command -v keito >/dev/null 2>&1; then
@@ -76,20 +81,20 @@ if [ "$HOST" = "auto" ] && [ -t 0 ]; then
   echo "  2) Claude Code only"
   echo "  3) Codex only"
   echo ""
-  printf "Choice [1/2/3] (default: 1): "
+  printf "Choice [1/2/3]: "
   read -r choice
-  case "${choice:-1}" in
+  case "$choice" in
+    1) HOST="both" ;;
     2) HOST="claude" ;;
     3) HOST="codex" ;;
-    *) HOST="both" ;;
+    *) echo "Choose an explicit target; nothing configured." >&2; exit 2 ;;
   esac
-elif [ "$HOST" = "auto" ]; then
-  HOST="both"
 fi
 
 args=(skill install --source bundled)
 case "$HOST" in
   both)
+    args+=(--agent claude-code --agent codex)
     ;;
   claude)
     args+=(--agent claude-code)

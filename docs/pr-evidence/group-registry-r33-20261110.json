@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "scope": "developer same-session opaque-group registry, finite local public API acceptance on macOS",
+  "source_commit": "257f5c0cf30d2151428c397cead27f6aeacb39de",
+  "verdict": "APPROVE_COMPONENT_SOURCE_AND_INDEPENDENT_FINITE_PUBLIC_API_OS",
+  "required_new_findings": [],
+  "review_artifact_sha256": {
+    "review.md": "99c10110375c4e04d489a03ace72f6469443068396ab04d5553f544b24f6d5b9",
+    "verdict.json": "f749559f0f8c997b28334ca7aabfc225f9068bec505783f6743c7a72d4d25e4d",
+    "completion-audit.json": "236f65efe18401053385ba851ff872e6e1175e1bcdb1671fa1bd5c0d1778af31",
+    "independent-raw-verification.json": "d4f492c513a7f7ef1badac02a5e90031c9b05d54f9f6f6ef22f62629474127aa"
+  },
+  "executed": {
+    "independent_cases": 4,
+    "firsts_each": 1,
+    "retries": 0,
+    "clean_two": "CLEAN; two retained group proofs, successful actual waits and keeper EOF under reduced common end",
+    "publication_fault": "actual exclusive collision after slot insertion; failed owner retained both slots and applicable waits; timely QA physical EOF did not become clean group proof",
+    "edge_fault": "invalid repeat start retained both original workloads; failed owner and actual waits remained distinct from QA physical EOF",
+    "expired_bound": "expected sticky refusal; direct waits known at FIRST, QA EOF unknown; late natural N-marked EOF in FINAL never upgraded FIRST"
+  },
+  "resources": {
+    "tool_processes": 4,
+    "controllers": 4,
+    "keepers": 8,
+    "workloads": 7,
+    "all_actual_direct_waits_collected": true,
+    "orphan_members_reaped_by_controller": false,
+    "global_process_absence_claimed": false
+  },
+  "prior_outcomes": {
+    "R32_first": "NOT_ACCEPTED_UNEXPECTED_FIRST; controller1 before evidence; original reason unrecorded, never healed",
+    "root_diagnostics": "two distinct pre-repair diagnostic successors identify ENV_KEYS then sole known CF encoding extra; diagnostic only, not independent acceptance",
+    "R31": "source-only group registry approval",
+    "R30": "finite keeper-interface comparison, bypasses parent APIs",
+    "R29": "eight historical empty0644 sinks remain nonconforming and unchanged"
+  },
+  "parent_checks": {
+    "at_source_257": "three pure tests, selected dev examples build/Clippy-Dwarnings and fmt check pass",
+    "earlier_17_and_90": "prior scoped checks only; no exact257 rerun claim",
+    "full_default_and_hosted_CI": "not qualified by this record"
+  },
+  "environment": {
+    "operator_credentials_or_environment_values_copied": false,
+    "macos_scalar": "explicit UID-derived zero script/region encoding metadata; exact value and closed platform key set required",
+    "unknown_extra_keys": "refused",
+    "original_auth_proxy_profile_paths": "unchanged kernel denial",
+    "zero_OS_home_reads_claimed": false,
+    "running_OS_syscalls_traced": false
+  },
+  "limits": {
+    "output_eof_proven": false,
+    "raw_ESRCH_or_exact_syscall_order_independently_instrumented": false,
+    "whole_Scope_accepted": false,
+    "normal_reusable_command_settlement_accepted": false,
+    "cooperative_setsid_core_accepted": false,
+    "native_chain_Bash_Python_manager_integration_accepted": false,
+    "nested_LIVE_receipt_faults_accepted": false,
+    "default_FIRST_strict_p95_qualified": false,
+    "BOTH_real_full_numeric_P0B_qualified": false,
+    "images_platform_financial_browser_recovery_release_qualified": false
+  },
+  "remaining_required": [
+    "real cooperative core and opaque leaves inside its session",
+    "normal command completion and explicit stdin/output draining plus observed EOF",
+    "real manager/native/chain/Bash/guardian handles retained before receipts and forwarding",
+    "distinct nested LIVE control/start-receipt/result-write faults",
+    "short product deadline integration without increasing allowances",
+    "default paired artifact FIRST and strict p95<100ms",
+    "full numeric P0-B for both pinned real harnesses",
+    "remaining platform, recovery, rehearsals and guarded release gates"
+  ],
+  "publication_or_production_action": false
+}
