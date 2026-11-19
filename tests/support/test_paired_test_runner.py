@@ -35,7 +35,7 @@ class PairFixtures(unittest.TestCase):
                     self.assertEqual(call.kwargs["env"].get("RUSTC"), "fixture-rustc")
                     self.assertIn("--all-features", call.args[0])
                     for profile in ("DEV", "TEST"):
-                        for key, value in {"OPT_LEVEL": "3", "DEBUG": "0",
+                        for key, value in {"OPT_LEVEL": "s", "DEBUG": "0",
                                            "STRIP": "symbols", "LTO": "true",
                                            "CODEGEN_UNITS": "1", "DEBUG_ASSERTIONS": "true",
                                            "OVERFLOW_CHECKS": "true"}.items():
