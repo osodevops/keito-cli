@@ -86,6 +86,28 @@ installation; a plugin-only installation does not establish that pair and
 remains unqualified. All routes still need real trust/dispatch qualification.
 These scripts do not run a version-discovery subprocess on every hook.
 
+## Measure and review agent work
+
+Use captured runs as audit evidence. Lead project/task summaries with explicitly
+reviewed outcomes and available usage; a completed capture or approved time entry
+does not prove a deliverable was accepted. Project tasks may be billing categories.
+Review outcomes in the application's Agent work view when that qualified feature
+is enabled. Do not invent a CLI outcome command or mark success from model prose.
+
+Keep the observation window and summed observed run durations separate. Ten
+concurrent two-hour runs can mean a two-hour window and twenty summed run-hours;
+neither measures human labor or active compute. Log human steering and review
+separately. Missing usage is unknown, partial tokens are not complete expenditure,
+and tokens are not a productivity score. Keep model/cache semantics and provenance.
+
+An outcome judgment is revision-bound and separate from an agreed client charge.
+Neither duration nor usage automatically authorizes billing. Preserve existing
+review/pricing permissions and exact captured evidence. Demos must label synthetic
+data and show concurrent runs, explicit outcome review and unknown usage/costs;
+an animation or seeded expense is not proof of automatic capture.
+
+A request to update measurement code, processes or skills does not authorize marketing-site copy, visuals or public positioning. Keep controlled product demos separate; public claims need observed usage evidence and an explicit website request.
+
 ## Capture and privacy contract
 
 - `SessionStart` preserves session identity; `UserPromptSubmit` opens a turn;

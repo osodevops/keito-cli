@@ -94,6 +94,38 @@ fn number(value: &str) -> io::Result<u64> {
     }
     value.parse().map_err(|_| refused("GROUP_INTEGER"))
 }
+
+// The owning descriptor is retained through admission; invalid values close on refusal.
+fn keeper_fd_allowed(value: u64) -> bool {
+    (4..=1024).contains(&value)
+}
+
+fn admit_keeper_fd<T>(owned: T, value: u64) -> io::Result<T> {
+    if keeper_fd_allowed(value) {
+        Ok(owned)
+    } else {
+        Err(refused("GROUP_FD"))
+    }
+}
+
+fn fixed_ready_frame(
+    ready_end: u64,
+    hard_end: u64,
+    policy: CleanupPolicy,
+    mut clock: impl FnMut() -> io::Result<u64>,
+    wait: impl FnOnce(u64) -> io::Result<String>,
+) -> io::Result<String> {
+    let deadline = ready_end.min(hard_end.saturating_sub(policy.reserve_ns()));
+    if clock()? >= deadline {
+        return Err(refused("GROUP_DEADLINE"));
+    }
+    let body = wait(deadline)?;
+    if clock()? >= deadline {
+        return Err(refused("GROUP_DEADLINE"));
+    }
+    Ok(body)
+}
+
 fn nonce_valid(value: &str) -> bool {
     value.len() == 32
         && value
@@ -774,6 +806,7 @@ impl GroupLease {
         }
         let inherited = unsafe { OwnedFd::from_raw_fd(inherited) };
         let child_fd = inherited.as_raw_fd();
+        let inherited = admit_keeper_fd(inherited, child_fd as u64)?;
         let channel = Channel::new(parent, nonce.clone())?;
         let owner_pid = std::process::id();
         let owner_pgid = unsafe { libc::getpgrp() };
@@ -945,11 +978,13 @@ impl GroupLease {
             if self.settlement.progress.phase != Phase::AwaitReady {
                 return Err(refused("GROUP_STATE"));
             }
-            let deadline = self
-                .settlement
-                .policy
-                .setup_end(now()?, self.settlement.progress.deadline_ns);
-            let body = self.channel.wait_frame(deadline)?;
+            let body = fixed_ready_frame(
+                self.ready_end,
+                self.settlement.progress.deadline_ns,
+                self.settlement.policy,
+                now,
+                |deadline| self.channel.wait_frame(deadline),
+            )?;
             if body != format!("READY|{}|{}|{}", self.keeper_pid, self.keeper_pid, self.sid) {
                 return Err(refused("GROUP_READY"));
             }
@@ -1623,7 +1658,7 @@ pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io
     } else {
         Lifetime::with_policy(admitted_at, deadline, policy)?
     };
-    if !(4..=1024).contains(&fd)
+    if !keeper_fd_allowed(fd)
         || parent != unsafe { libc::getppid() } as u64
         || park == 0
         || park > i32::MAX as u64
@@ -1671,6 +1706,92 @@ pub fn keeper_main(arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod shipping_keeper_contract {
+        use super::*;
+        use std::{cell::Cell, rc::Rc};
+        struct Owner(Rc<Cell<usize>>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        #[test]
+        fn invalid_fd_refuses_and_closes_the_owned_duplicate() {
+            for fd in [0, 3, 1025, u64::MAX] {
+                let drops = Rc::new(Cell::new(0));
+                let result = admit_keeper_fd(Owner(drops.clone()), fd);
+                assert!(result.is_err(), "invalid inherited fd {fd} admitted");
+                assert_eq!(drops.get(), 1);
+            }
+        }
+        #[test]
+        fn valid_fd_retains_ownership_until_explicit_release() {
+            for fd in [4, 1024] {
+                let drops = Rc::new(Cell::new(0));
+                let owner = admit_keeper_fd(Owner(drops.clone()), fd).ok().unwrap();
+                assert_eq!(drops.get(), 0);
+                drop(owner);
+                assert_eq!(drops.get(), 1);
+            }
+        }
+        #[test]
+        fn delayed_await_cannot_renew_original_ready_interval() {
+            let called = Cell::new(false);
+            let result = fixed_ready_frame(
+                20,
+                1_000_000_000,
+                CleanupPolicy::HookShort,
+                || Ok(21),
+                |_| {
+                    called.set(true);
+                    Ok("READY".into())
+                },
+            );
+            assert!(result.is_err(), "late await renewed the fixed interval");
+            assert!(!called.get());
+        }
+        #[test]
+        fn returned_frame_at_original_deadline_is_refused() {
+            let mut clocks = [1, 20].into_iter();
+            let result = fixed_ready_frame(
+                20,
+                1_000_000_000,
+                CleanupPolicy::HookShort,
+                || Ok(clocks.next().unwrap()),
+                |_| Ok("READY".into()),
+            );
+            assert!(result.is_err(), "returned frame escaped deadline recheck");
+        }
+        #[test]
+        fn reduced_hard_end_intersects_original_ready_end() {
+            let mut clocks = [1, 19].into_iter();
+            let mut received_end = None;
+            let result = fixed_ready_frame(
+                100,
+                50_000_020,
+                CleanupPolicy::HookShort,
+                || Ok(clocks.next().unwrap()),
+                |end| {
+                    received_end = Some(end);
+                    Ok("READY".into())
+                },
+            );
+            assert_eq!(received_end, Some(20));
+            assert_eq!(result.unwrap(), "READY");
+        }
+        #[test]
+        fn receive_fault_remains_the_original_fault() {
+            let result = fixed_ready_frame(
+                20,
+                1_000_000_000,
+                CleanupPolicy::HookShort,
+                || Ok(1),
+                |_| Err(refused("GROUP_EOF")),
+            );
+            assert_eq!(result.unwrap_err().to_string(), "GROUP_EOF");
+        }
+    }
+
     #[test]
     fn no_group_operation_after_absence_or_release_or_fault() {
         let mut state = Progress::new(100);
