@@ -696,7 +696,16 @@ mod unix {
                 {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                if scope
+                    .wait_hook_core_progress(
+                        &child,
+                        (!eof).then(|| reader.as_raw_fd()),
+                        &mut || Duration::from_millis(600).checked_sub(started.elapsed()),
+                    )
+                    .is_err()
+                {
+                    break;
+                }
             }
             if !scope.slot_complete(&child) || !eof || bytes != ACK {
                 scope.begin_cancel(

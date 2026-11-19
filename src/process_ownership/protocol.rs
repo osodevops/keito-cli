@@ -146,6 +146,17 @@ pub struct Endpoint {
     pub last_poll: PollWork,
 }
 impl Endpoint {
+    // Readiness metadata only. The original receive() remains the sole parser
+    // and physical EOF observer; a known EOF cannot wake another Child wait.
+    pub(super) fn progress_wait_source(&self) -> Option<i32> {
+        (!self.eof).then(|| self.socket.as_raw_fd())
+    }
+    pub(super) fn progress_buffered_event(&self) -> bool {
+        !self.eof
+            && (self.pending.contains(&b'\n')
+                || self.last_poll.reads >= MAX_READS
+                || self.last_poll.parsed >= MAX_PARSE)
+    }
     /// Nonterminal metadata predicate only; never sends proof or closes a peer.
     pub(super) fn sent_resources_complete(&self) -> bool {
         self.sent_live
@@ -563,3 +574,52 @@ mod installer_metadata_tests {
 #[cfg(test)]
 #[path = "../../tests/unit/source_qa_protocol.rs"]
 mod tests;
+
+#[cfg(test)]
+mod readiness_metadata_tests {
+    use super::*;
+    #[test]
+    fn child_readiness_hints_do_not_parse_partial_frames_or_accept_budget_yield() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut endpoint = Endpoint::new(socket, "ab".repeat(16), None).unwrap();
+        let fd = endpoint.socket.as_raw_fd();
+        endpoint.pending = b"partial".to_vec();
+        assert_eq!(endpoint.progress_wait_source(), Some(fd));
+        assert!(!endpoint.progress_buffered_event());
+        let pending = endpoint.pending.clone();
+        endpoint.last_poll.reads = MAX_READS;
+        assert!(endpoint.progress_buffered_event());
+        endpoint.last_poll = PollWork {
+            reads: 0,
+            parsed: MAX_PARSE,
+        };
+        assert!(endpoint.progress_buffered_event());
+        assert_eq!(endpoint.pending, pending);
+        assert!(!endpoint.live && !endpoint.terminal && !endpoint.eof && !endpoint.is_settled());
+        endpoint.last_poll = PollWork::default();
+        endpoint.pending.push(b'\n');
+        assert!(endpoint.progress_buffered_event());
+        assert!(!endpoint.is_settled());
+    }
+    #[test]
+    fn child_readiness_omits_only_original_receive_eof_even_after_terminal_hup() {
+        let (socket, peer_socket) = UnixStream::pair().unwrap();
+        let mut endpoint = Endpoint::new(socket, "ab".repeat(16), None).unwrap();
+        let mut peer = Endpoint::new(peer_socket, "ab".repeat(16), None).unwrap();
+        peer.send_live().unwrap();
+        peer.send_terminal(true).unwrap();
+        assert!(endpoint.progress_wait_source().is_some());
+        assert!(!endpoint.eof && !endpoint.is_settled());
+        assert!(!endpoint.receive(false).unwrap());
+        assert!(endpoint.eof && endpoint.is_settled());
+        endpoint.last_poll = PollWork {
+            reads: MAX_READS,
+            parsed: MAX_PARSE,
+        };
+        assert_eq!(endpoint.progress_wait_source(), None);
+        assert!(
+            !endpoint.progress_buffered_event(),
+            "stale cap after EOF would spin on Child wait"
+        );
+    }
+}
