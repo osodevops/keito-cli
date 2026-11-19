@@ -813,6 +813,7 @@ pub struct Signal<'a> {
 struct CaptureTransaction<'a> {
     inner: Transaction<'a>,
     _authority: AuthorityGuard,
+    notification: Option<crate::capture_busy::ReleaseNotifier>,
     directory: PathBuf,
     invocation: Option<Permit>,
     #[cfg(feature = "dev-tools")]
@@ -845,6 +846,7 @@ impl CaptureTransaction<'_> {
         let Self {
             inner,
             _authority,
+            notification,
             directory,
             invocation,
             #[cfg(feature = "dev-tools")]
@@ -869,6 +871,9 @@ impl CaptureTransaction<'_> {
         timing.commit.set(Some(commit_started.elapsed()));
         committed.map_err(storage_error)?;
         drop(_authority);
+        if let Some(notification) = notification {
+            notification.released_after_authority();
+        }
         Ok(())
     }
 }
@@ -891,6 +896,7 @@ pub struct Store {
     #[cfg(feature = "dev-tools")]
     last_admission_timing: Option<AdmissionTiming>,
     connection: Connection,
+    notification: Option<crate::capture_busy::ReleaseNotifier>,
     directory: PathBuf,
     invocation: Option<Permit>,
 }
@@ -1083,7 +1089,9 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(storage_error)?;
         }
-        let mut connection = Connection::open(path).map_err(storage_error)?;
+        let mut connection = Connection::open(&path).map_err(storage_error)?;
+        let notification = crate::capture_busy::ReleaseNotifier::for_database(&path);
+        let busy_notification = notification.clone();
         let origin = std::time::Instant::now();
         let mut admission_budget = crate::capture_busy::BusyBudget::default();
         connection
@@ -1091,7 +1099,10 @@ impl Store {
                 admission_budget.retry(
                     count,
                     || std::time::Instant::now().checked_duration_since(origin),
-                    std::thread::sleep,
+                    |delay| match &busy_notification {
+                        Some(notification) => notification.wait(delay),
+                        None => std::thread::sleep(delay),
+                    },
                 )
             }))
             .map_err(storage_error)?;
@@ -1106,6 +1117,7 @@ impl Store {
                 PRIMARY KEY(binding_id,namespace));").map_err(storage_error)?;
         Ok(Self {
             connection,
+            notification,
             directory: directory.to_owned(),
             invocation: None,
             #[cfg(feature = "dev-tools")]
@@ -1191,6 +1203,7 @@ impl Store {
         let tx = CaptureTransaction {
             inner,
             _authority: authority,
+            notification: self.notification.clone(),
             directory,
             invocation,
             #[cfg(feature = "dev-tools")]
@@ -2805,7 +2818,10 @@ impl Store {
         // Hold authority through commit and exact snapshot removal. New fallback
         // publications have unique names and therefore cannot be removed here.
         let CaptureTransaction {
-            inner, _authority, ..
+            inner,
+            _authority,
+            notification,
+            ..
         } = tx;
         inner.commit().map_err(storage_error)?;
         capture_invocations::remove_dead(&directory, &invocations)?;
@@ -2823,6 +2839,9 @@ impl Store {
             ));
         }
         drop(_authority);
+        if let Some(notification) = notification {
+            notification.released_after_authority();
+        }
         Ok(())
     }
     /// Bounded worker maintenance also runs on empty, disabled and held queues.

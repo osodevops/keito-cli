@@ -78,6 +78,164 @@ impl BusyBudget {
     }
 }
 
+// Optional in-process wake hints only. Every wake returns to SQLite's ORIGINAL
+// busy callback/count; BusyBudget owns all500ms/14callback refusal decisions.
+#[derive(Clone)]
+pub(crate) struct ReleaseNotifier(std::sync::Arc<WakeQueue>);
+struct WakeQueue {
+    waiters: std::sync::Mutex<std::collections::VecDeque<std::sync::Weak<Waiter>>>,
+}
+struct Waiter {
+    state: std::sync::Mutex<WaitState>,
+    ready: std::sync::Condvar,
+    until: std::time::Instant,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitState {
+    Waiting,
+    Selected,
+    Retired,
+}
+#[cfg(unix)]
+#[derive(PartialEq, Eq)]
+struct DatabaseKey {
+    path: std::path::PathBuf,
+    device: u64,
+    inode: u64,
+}
+#[cfg(unix)]
+type Registry = Vec<(DatabaseKey, std::sync::Weak<WakeQueue>)>;
+#[cfg(unix)]
+const MAX_DATABASE_HINTS: usize = 256;
+const MAX_WAIT_HINTS: usize = 4096;
+#[cfg(unix)]
+static WAKE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<Registry>> = std::sync::OnceLock::new();
+impl ReleaseNotifier {
+    pub(crate) fn for_database(path: &std::path::Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            Self::for_registry(path, WAKE_REGISTRY.get_or_init(Default::default))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+    #[cfg(unix)]
+    fn for_registry(path: &std::path::Path, registry: &std::sync::Mutex<Registry>) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let path = path.canonicalize().ok()?;
+        let metadata = std::fs::metadata(&path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let key = DatabaseKey {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let mut registry = registry.try_lock().ok()?;
+        registry.retain(|(_, weak)| weak.strong_count() != 0);
+        if let Some(queue) = registry
+            .iter()
+            .find_map(|(candidate, weak)| (candidate == &key).then(|| weak.upgrade()).flatten())
+        {
+            return Some(Self(queue));
+        }
+        if registry.len() >= MAX_DATABASE_HINTS || registry.try_reserve(1).is_err() {
+            return None;
+        }
+        let queue = std::sync::Arc::new(WakeQueue {
+            waiters: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        });
+        registry.push((key, std::sync::Arc::downgrade(&queue)));
+        Some(Self(queue))
+    }
+    fn register(&self, until: std::time::Instant) -> Option<std::sync::Arc<Waiter>> {
+        let waiter = std::sync::Arc::new(Waiter {
+            state: std::sync::Mutex::new(WaitState::Waiting),
+            ready: std::sync::Condvar::new(),
+            until,
+        });
+        let mut queue = self.0.waiters.try_lock().ok()?;
+        queue.retain(|weak| weak.strong_count() != 0);
+        if queue.len() >= MAX_WAIT_HINTS || queue.try_reserve(1).is_err() {
+            return None;
+        }
+        queue.push_back(std::sync::Arc::downgrade(&waiter));
+        Some(waiter)
+    }
+    pub(crate) fn wait(&self, requested: Duration) {
+        let Some(until) = std::time::Instant::now().checked_add(requested) else {
+            std::thread::sleep(requested);
+            return;
+        };
+        let fallback =
+            || std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
+        let Some(waiter) = self.register(until) else {
+            fallback();
+            return;
+        };
+        let Ok(mut state) = waiter.state.try_lock() else {
+            fallback();
+            return;
+        };
+        loop {
+            if *state == WaitState::Selected || *state == WaitState::Retired {
+                *state = WaitState::Retired;
+                return;
+            }
+            let remaining = until.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                *state = WaitState::Retired;
+                return;
+            }
+            match waiter.ready.wait_timeout(state, remaining) {
+                Ok((next, _)) => state = next,
+                Err(error) => {
+                    let (mut next, _) = error.into_inner();
+                    *next = WaitState::Retired;
+                    drop(next);
+                    fallback();
+                    return;
+                }
+            }
+            // Spurious/cross-queue wakes cannot return this callback early:
+            // keep the SAME absolute timer unless this node was selected.
+        }
+    }
+    // Only successful writer commit + subsequent original AuthorityGuard drop
+    // call this. Error/rollback/unknown-release paths emit NO scheduling hint.
+    pub(crate) fn released_after_authority(&self) {
+        let Ok(mut queue) = self.0.waiters.try_lock() else {
+            return;
+        };
+        while let Some(weak) = queue.pop_front() {
+            let Some(waiter) = weak.upgrade() else {
+                continue;
+            };
+            let Ok(mut state) = waiter.state.try_lock() else {
+                continue;
+            };
+            if *state != WaitState::Waiting {
+                continue;
+            }
+            if std::time::Instant::now() >= waiter.until {
+                *state = WaitState::Retired;
+                continue;
+            }
+            *state = WaitState::Selected;
+            drop(state);
+            drop(queue);
+            // Per-node condition variable: never wake an arbitrary ticket.
+            waiter.ready.notify_one();
+            return;
+        }
+        // No already-waiting node: discard, never bank a future retry credit.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +461,122 @@ mod tests {
         let clock = Cell::new(20_000);
         assert!(tick(&mut policy, 0, &clock));
         assert_eq!(clock.get(), 20_001);
+    }
+}
+
+#[cfg(test)]
+mod notify_one_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    fn queue() -> ReleaseNotifier {
+        ReleaseNotifier(Arc::new(WakeQueue {
+            waiters: Mutex::new(Default::default()),
+        }))
+    }
+    fn future() -> std::time::Instant {
+        std::time::Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .unwrap()
+    }
+    #[test]
+    fn release_selects_one_current_waiter_and_never_banks_credit() {
+        let queue = queue();
+        queue.released_after_authority();
+        let a = queue.register(future()).unwrap();
+        let b = queue.register(future()).unwrap();
+        assert_eq!(*a.state.lock().unwrap() as u8, WaitState::Waiting as u8);
+        queue.released_after_authority();
+        assert_eq!(*a.state.lock().unwrap() as u8, WaitState::Selected as u8);
+        assert_eq!(*b.state.lock().unwrap() as u8, WaitState::Waiting as u8);
+        queue.released_after_authority();
+        assert_eq!(*b.state.lock().unwrap() as u8, WaitState::Selected as u8);
+        queue.released_after_authority();
+        let c = queue.register(future()).unwrap();
+        assert_eq!(*c.state.lock().unwrap() as u8, WaitState::Waiting as u8);
+    }
+    #[test]
+    fn spurious_and_other_database_wakes_cannot_select_a_ticket() {
+        let a = queue();
+        let b = queue();
+        let waiter = a.register(future()).unwrap();
+        waiter.ready.notify_one();
+        b.released_after_authority();
+        assert_eq!(
+            *waiter.state.lock().unwrap() as u8,
+            WaitState::Waiting as u8
+        );
+        a.released_after_authority();
+        assert_eq!(
+            *waiter.state.lock().unwrap() as u8,
+            WaitState::Selected as u8
+        );
+    }
+    #[test]
+    fn expired_and_retired_tickets_do_not_consume_the_next_release() {
+        let queue = queue();
+        let expired = queue.register(std::time::Instant::now()).unwrap();
+        let retired = queue.register(future()).unwrap();
+        *retired.state.lock().unwrap() = WaitState::Retired;
+        let live = queue.register(future()).unwrap();
+        queue.released_after_authority();
+        assert_eq!(
+            *expired.state.lock().unwrap() as u8,
+            WaitState::Retired as u8
+        );
+        assert_eq!(*live.state.lock().unwrap() as u8, WaitState::Selected as u8);
+    }
+    #[test]
+    fn queue_contention_and_capacity_fall_back_without_selecting_or_blocking() {
+        let queue = queue();
+        let live = queue.register(future()).unwrap();
+        let mut locked = queue.0.waiters.lock().unwrap();
+        assert!(queue.register(future()).is_none());
+        queue.released_after_authority();
+        assert_eq!(*live.state.lock().unwrap() as u8, WaitState::Waiting as u8);
+        locked.clear();
+        for _ in 0..MAX_WAIT_HINTS {
+            locked.push_back(Arc::downgrade(&live));
+        }
+        drop(locked);
+        assert!(queue.register(future()).is_none());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn database_registry_shares_only_the_same_live_file_identity() {
+        let registry = Mutex::new(Vec::new());
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let a_path = root.join("a.sqlite3");
+        let b_path = root.join("b.sqlite3");
+        std::fs::write(&a_path, []).unwrap();
+        std::fs::write(&b_path, []).unwrap();
+        let a = ReleaseNotifier::for_registry(&a_path, &registry).unwrap();
+        let same = ReleaseNotifier::for_registry(&a_path, &registry).unwrap();
+        let b = ReleaseNotifier::for_registry(&b_path, &registry).unwrap();
+        let a_waiter = a.register(future()).unwrap();
+        let b_waiter = b.register(future()).unwrap();
+        b.released_after_authority();
+        assert!(*a_waiter.state.lock().unwrap() == WaitState::Waiting);
+        assert!(*b_waiter.state.lock().unwrap() == WaitState::Selected);
+        same.released_after_authority();
+        assert!(*a_waiter.state.lock().unwrap() == WaitState::Selected);
+        let old_waiter = a.register(future()).unwrap();
+        std::fs::rename(&a_path, root.join("retained-old.sqlite3")).unwrap();
+        std::fs::write(&a_path, []).unwrap();
+        let replaced = ReleaseNotifier::for_registry(&a_path, &registry).unwrap();
+        replaced.released_after_authority();
+        assert!(*old_waiter.state.lock().unwrap() == WaitState::Waiting);
+        a.released_after_authority();
+        assert!(*old_waiter.state.lock().unwrap() == WaitState::Selected);
+    }
+    #[test]
+    fn poisoned_queue_disables_hints_without_panic_or_new_authority() {
+        let queue = queue();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _locked = queue.0.waiters.lock().unwrap();
+            panic!("controlled poison");
+        }));
+        assert!(queue.register(future()).is_none());
+        queue.released_after_authority();
     }
 }
